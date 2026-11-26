@@ -50,6 +50,10 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 先对齐到远端分支顶端：本仓比上游多一个工作流提交，若 HEAD 落在旧提交上，
+          # 合并会退化成快进并丢掉该提交，随后的推送又会被判成 non-fast-forward。
+          git fetch origin "${TARGET_BRANCH}"
+          git reset --hard "origin/${TARGET_BRANCH}"
           git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
 
       - name: Push merge
