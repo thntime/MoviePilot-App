@@ -2,7 +2,13 @@
 
 MoviePilot 官方单仓三端全原生移动与大屏客户端，基于单一事实源（`shared/`）与 Rust 共享业务内核（`shared/core-rust/`），同时驱动 **iOS / iPadOS（SwiftUI + Liquid Glass）**、**Android（Jetpack Compose + Material 3 Expressive）** 与 **HarmonyOS NEXT（ArkTS / ArkUI + 动态光感材质）**，直接对接 MoviePilot V3 后端 REST/SSE API，拒绝跨端套壳与主流程 WebView。
 
-👉 **[查看三端实测界面图册（iOS 61 张 · Android 28 张 · HarmonyOS 41 张）](screenshots/README.md)**
+👉 **[查看三端实测界面图册](screenshots/README.md)**
+
+## 插件开发文档
+
+- **[App 插件开发者接入指南](docs/plugin-development-guide.md)**：JSON 表单与 Vue 联邦插件接入、宿主 SDK、鉴权请求、原生交互、返回键、最小化胶囊、录音、设备能力、原生播放及三端差异。
+- **[插件音频与系统播控接入指南](docs/plugin-audio-and-status-bar-guide.md)**：音频源选择、后台播放、锁屏与通知播控、歌词、收藏和自定义动作。
+- [内部设计与实现记录](docs/design/README.md)：运行时架构、播放器方案与 API 对接回归，供维护者追溯实现。
 
 ## 仓库目录结构
 
@@ -19,6 +25,8 @@ MoviePilot-App/
 ├── ios/                               # iOS 16+ / iPadOS / iOS 26+ 全原生 SwiftUI 客户端与 WidgetKit
 ├── android/                           # Android 10+（API 29~35）17 模块 Jetpack Compose 客户端与 Glance 微件
 ├── harmony/                           # HarmonyOS NEXT（API 12~26）16 模块纯血 ArkTS/ArkUI 客户端与服务卡片
+├── docs/                              # 面向插件开发者的接入文档
+│   └── design/                        # 内部设计方案与实现、回归记录
 ├── tools/                             # SSOT 同步器、Rust 跨端交叉编译、IPA/APK/HAP 打包校验工具链
 └── screenshots/                       # iOS / Android / HarmonyOS 真机与模拟器实测截图图册
 ```
@@ -29,7 +37,6 @@ MoviePilot-App/
   - **iOS / iPadOS**：默认「深色 · 极简石墨」原生色板、iOS 26+ Liquid Glass 4+1 悬浮导航（发现、订阅、我的、更多 + 独立搜索）、iPad `sidebarAdaptable` 工作台与多列 Bento 栅格、SceneKit 3D 挤压社区勋章与背面三遍凹雕、MobileVLCKit + AVKit 全格式播放器与画中画、WidgetKit 多尺寸小组件与 APNs 推送。
   - **Android**：Material 3 Expressive 视觉与 4+1 分体式悬浮/侧栏自适应导航（发现、订阅、我的、更多 + 独立搜索）、染色顶栏与统一大胶囊分页栏（`ExpressivePillTabRow`）、Material You 动态壁纸取色与 AMOLED 纯黑模式、OpenGL ES 3D 勋章实时网格挤压与背面雕刻、Media3 + FFmpeg 全格式音视频播放与 `MediaSessionService` 锁屏播控 / 自动画中画、Jetpack Glance 桌面微件。
   - **HarmonyOS NEXT**：HarmonyOS 动态光感材质（API 26 `ImmersiveMaterial` / 点光源自动分级回退）与 4+1 分体式悬浮导航、5 套鸿蒙色板、无遮挡渐进模糊沉浸顶栏、原生 `bindSheet` 多档半模态、一多自适应侧栏、3D 透视勋章与背面凹雕、`AVPlayer` + `PiPWindow` 画中画与 `AVSession` 后台长时音视频续播、`FormExtensionAbility` 桌面卡片。
-- **全场景品牌标识识别**：内置 36 枚高清品牌与服务 Logo（TMDB、豆瓣、Bangumi、MusicBrainz、Emby、Jellyfin、Plex、飞牛、绿联、极空间、qBittorrent、Transmission、rTorrent、微信、飞书、Telegram、钉钉、Slack、Discord、115、阿里云盘、Rclone、SMB 等），全面覆盖数据源、下载器、媒体服务器、通知渠道、存储目录及选择弹窗。
 - **Rust 共享核心（`shared/core-rust/`）**：
   - `mp-core-model`：实例地址规范化与同源边界校验、`moviepilot://` 全路由深度链接解析、音视频后缀判定、Agent Markdown AST 解析、订阅进度与 3D 勋章金属色板。
   - `mp-core-api`：复用各平台原生网络栈（`URLSession` / `OkHttp` / HarmonyOS 网络栈，兼容 NAS 自签名 HTTPS 与系统代理）、V3 端点安全编码、SSE 流式帧解析与 9 维站点资源筛选/同规格分组引擎。
@@ -101,4 +108,4 @@ hdc shell aa start -a EntryAbility -b com.moviepilot.app
 
 MoviePilot-App 采用 [GNU General Public License v3.0（GPL-3.0-only）](LICENSE)。
 
-特别说明：UI 设计风格参考了 [Rex iOS App](https://rexnow.tv)。
+特别说明：iOS UI 设计风格参考了 [Rex iOS App](https://rexnow.tv)。

@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -50,9 +51,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.BookmarkAdd
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.FolderSpecial
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.LocalFireDepartment
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Person
@@ -62,7 +65,10 @@ import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Switch
@@ -112,6 +118,7 @@ import com.moviepilot.designsystem.ExpressivePillTabRow
 import com.moviepilot.designsystem.ExpressiveTintedScaffold
 import com.moviepilot.designsystem.LocalBottomOverlayInset
 import com.moviepilot.designsystem.LocalMoviePilotColors
+import com.moviepilot.designsystem.LocalSnackbarHostState
 import com.moviepilot.designsystem.NativeAdaptiveBadge
 import com.moviepilot.designsystem.NativeAdaptivePill
 import com.moviepilot.designsystem.NativeBrandDrawable
@@ -132,18 +139,29 @@ import com.moviepilot.rustbridge.ContinueWatchingItem
 import com.moviepilot.rustbridge.DiscoverSessionSnapshot
 import com.moviepilot.rustbridge.ExploreSessionSnapshot
 import com.moviepilot.rustbridge.MediaCardItem
+import com.moviepilot.rustbridge.MediaSearchSourceDto
 import com.moviepilot.rustbridge.MediaServerLibraryDto
 import com.moviepilot.rustbridge.MoviePilotRepository
 import com.moviepilot.rustbridge.MusicAlbumDto
+import com.moviepilot.rustbridge.RecommendSourceDto
 import com.moviepilot.rustbridge.SubscribeItemDto
-import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.hazeSource
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 
-/** 发现页可编排模块项（1:1 对齐 iOS 10 大发现模块）。 */
-data class DiscoverModuleToggle(val id: String, val title: String, val enabled: Boolean)
+/** 发现页可编排模块项（覆盖内置 10 大发现模块 + 插件通过 `RecommendSource` 动态注册的推荐榜单）。 */
+data class DiscoverModuleToggle(
+    val id: String,
+    val title: String,
+    val enabled: Boolean,
+    val subtitle: String = "",
+    val apiPath: String? = null,
+) {
+    val isPluginRecommend: Boolean
+        get() = id.startsWith(PLUGIN_RECOMMEND_PREFIX) && !apiPath.isNullOrBlank()
+}
+
+private const val PLUGIN_RECOMMEND_PREFIX = "plugin_recommend:"
 
 private fun defaultDiscoverModules(): List<DiscoverModuleToggle> = listOf(
     DiscoverModuleToggle("continue", "继续观看", true),
@@ -158,31 +176,78 @@ private fun defaultDiscoverModules(): List<DiscoverModuleToggle> = listOf(
     DiscoverModuleToggle("categories", "分类浏览", true),
 )
 
-private fun loadPersistedDiscoverModules(context: Context): List<DiscoverModuleToggle> {
-    val defaults = defaultDiscoverModules()
+private fun readRawDiscoverModulePrefs(context: Context): List<Pair<String, Boolean>> {
     val raw = context.getSharedPreferences("mp_discover_modules_v3", Context.MODE_PRIVATE)
         .getString("modules_spec", null)
-        ?.takeIf { it.isNotBlank() } ?: return defaults
-    val byId = defaults.associateBy { it.id }
+        ?.takeIf { it.isNotBlank() } ?: return emptyList()
+    return raw.split("\n", ",").mapNotNull { token ->
+        val sep = token.lastIndexOf('|').takeIf { it > 0 } ?: token.lastIndexOf(':')
+        if (sep <= 0) return@mapNotNull null
+        val id = token.substring(0, sep).trim()
+        val flag = token.substring(sep + 1).trim()
+        if (id.isEmpty()) null else id to (flag == "1")
+    }
+}
+
+private fun mergeDiscoverModules(
+    context: Context,
+    extraSources: List<RecommendSourceDto>,
+    forceResetDefaults: Boolean = false,
+): List<DiscoverModuleToggle> {
+    val defaults = defaultDiscoverModules()
+    val defaultById = defaults.associateBy { it.id }
+    val extraById = extraSources.associateBy { "$PLUGIN_RECOMMEND_PREFIX${it.apiPath}" }
+    val persisted = if (forceResetDefaults) emptyList() else readRawDiscoverModulePrefs(context)
+
     val seen = LinkedHashSet<String>()
     val result = mutableListOf<DiscoverModuleToggle>()
-    raw.split(",").forEach { token ->
-        val parts = token.split(":")
-        val id = parts.getOrNull(0)?.trim().orEmpty()
-        val def = byId[id] ?: return@forEach
-        if (seen.add(id)) {
-            val enabled = parts.getOrNull(1)?.equals("1") ?: def.enabled
+    for ((id, enabled) in persisted) {
+        val def = defaultById[id]
+        if (def != null && seen.add(id)) {
             result += def.copy(enabled = enabled)
+            continue
+        }
+        val extra = extraById[id]
+        if (extra != null && seen.add(id)) {
+            result += DiscoverModuleToggle(
+                id = id,
+                title = extra.name,
+                enabled = enabled,
+                subtitle = extra.type,
+                apiPath = extra.apiPath,
+            )
         }
     }
+
     defaults.forEach { def ->
         if (seen.add(def.id)) result += def
+    }
+
+    extraSources.forEach { src ->
+        val modId = "$PLUGIN_RECOMMEND_PREFIX${src.apiPath}"
+        if (seen.add(modId)) {
+            val newItem = DiscoverModuleToggle(
+                id = modId,
+                title = src.name,
+                enabled = true,
+                subtitle = src.type,
+                apiPath = src.apiPath,
+            )
+            val insertIdx = result.indexOfFirst { it.id == "libraries" || it.id == "categories" }
+            if (insertIdx >= 0) result.add(insertIdx, newItem) else result += newItem
+        }
     }
     return result
 }
 
+private fun loadPersistedDiscoverModules(
+    context: Context,
+    extraSources: List<RecommendSourceDto> = emptyList(),
+): List<DiscoverModuleToggle> = mergeDiscoverModules(context, extraSources)
+
 private fun savePersistedDiscoverModules(context: Context, list: List<DiscoverModuleToggle>) {
-    val encoded = list.joinToString(",") { "${it.id}:${if (it.enabled) "1" else "0"}" }
+    // 使用换行 + `|` 分隔，兼容插件 `api_path` 中可能出现的 `:` 或 `,` 字符
+    val encoded = list.joinToString("\n") { "${it.id}|${if (it.enabled) "1" else "0"}" }
     context.getSharedPreferences("mp_discover_modules_v3", Context.MODE_PRIVATE)
         .edit()
         .putString("modules_spec", encoded)
@@ -208,6 +273,7 @@ fun DiscoverScreen(
     onPlayMedia: (MediaPlaybackRequest) -> Unit,
 ) {
     val colors = LocalMoviePilotColors.current
+    val snackbar = LocalSnackbarHostState.current
     val bottomOverlayInset = LocalBottomOverlayInset.current
     val context = LocalContext.current
     val margin = AdaptiveDeviceLayout.horizontalMargin()
@@ -219,7 +285,6 @@ fun DiscoverScreen(
     val heroHeightPx = with(density) { heroHeight.toPx().coerceAtLeast(1f) }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
-    val localHaze = remember { HazeState() }
 
     val initialSnapshot = remember { repository.cachedDiscover }
     var trending by remember { mutableStateOf(initialSnapshot?.trending.orEmpty()) }
@@ -231,6 +296,12 @@ fun DiscoverScreen(
     var continueItems by remember { mutableStateOf(initialSnapshot?.continueWatching.orEmpty()) }
     var latestItems by remember { mutableStateOf(initialSnapshot?.latestItems.orEmpty()) }
     var mediaLibraries by remember { mutableStateOf(initialSnapshot?.libraries.orEmpty()) }
+    var extraRecommendSources by remember { mutableStateOf(initialSnapshot?.extraSources.orEmpty()) }
+    val pluginRailItems = remember {
+        mutableStateMapOf<String, List<MediaCardItem>>().apply {
+            initialSnapshot?.extraRails?.let { putAll(it) }
+        }
+    }
     var selectedAlbum by remember { mutableStateOf<MusicAlbumDto?>(null) }
     val heroLogos = remember {
         mutableStateMapOf<String, String>().apply {
@@ -243,7 +314,7 @@ fun DiscoverScreen(
 
     val modules = remember {
         mutableStateListOf<DiscoverModuleToggle>().apply {
-            addAll(loadPersistedDiscoverModules(context))
+            addAll(loadPersistedDiscoverModules(context, initialSnapshot?.extraSources.orEmpty()))
         }
     }
 
@@ -259,21 +330,57 @@ fun DiscoverScreen(
             latestItems = latestItems,
             libraries = mediaLibraries,
             heroLogos = heroLogos.toMap(),
+            extraSources = extraRecommendSources,
+            extraRails = pluginRailItems.toMap(),
+        )
+    }
+
+    @Composable
+    fun PosterQuickMenu(item: MediaCardItem, dismiss: () -> Unit) {
+        DropdownMenuItem(
+            text = { Text("查看影视详情") },
+            leadingIcon = { Icon(Icons.Rounded.ChevronRight, contentDescription = null) },
+            onClick = {
+                dismiss()
+                onOpenMedia(item)
+            },
+        )
+        DropdownMenuItem(
+            text = { Text("快捷添加订阅") },
+            leadingIcon = { Icon(Icons.Rounded.BookmarkAdd, contentDescription = null) },
+            onClick = {
+                dismiss()
+                scope.launch {
+                    val (_, msg) = repository.quickSubscribeMediaCard(item)
+                    snackbar?.showSnackbar(msg)
+                }
+            },
         )
     }
 
     suspend fun loadAll() {
         coroutineScope {
-            val enabledIds = modules.filter { it.enabled }.map { it.id }.toSet()
+            val extraSourcesDef = async { repository.fetchRecommendSources() }
             val trendingDef = async { repository.fetchDiscoverTrending(1) }
             val moviesDef = async { repository.fetchExplore("tmdb_movies", 1) }
             val tvsDef = async { repository.fetchExplore("tmdb_tvs", 1) }
             val continueDef = async { repository.fetchContinueWatching() }
             val latestDef = async { repository.fetchMediaServerLatest() }
             val libsDef = async { repository.fetchMediaServerLibraries() }
+
+            val loadedExtraSources = extraSourcesDef.await()
+            extraRecommendSources = loadedExtraSources
+            val mergedMods = mergeDiscoverModules(context, loadedExtraSources)
+            modules.clear()
+            modules.addAll(mergedMods)
+
+            val enabledIds = modules.filter { it.enabled }.map { it.id }.toSet()
             val musicDef = if ("douban_music" in enabledIds) async { repository.fetchMusicFeed("douban", 1) } else null
             val showingDef = if ("douban_showing" in enabledIds) async { repository.fetchDoubanShowing(1) } else null
             val top250Def = if ("douban_top250" in enabledIds) async { repository.fetchDoubanTop250(1) } else null
+            val pluginRailDefs = modules.filter { it.enabled && it.isPluginRecommend }.map { mod ->
+                mod.id to async { repository.fetchRecommendByApiPath(mod.apiPath.orEmpty(), page = 1) }
+            }
 
             val fetchedTrending = trendingDef.await()
             trending = fetchedTrending
@@ -285,6 +392,12 @@ fun DiscoverScreen(
             musicDef?.await()?.let { musicAlbums = it }
             showingDef?.await()?.let { doubanShowing = it }
             top250Def?.await()?.let { doubanTop250 = it }
+            pluginRailDefs.forEach { (modId, def) ->
+                val list = def.await()
+                if (list.isNotEmpty()) {
+                    pluginRailItems[modId] = list
+                }
+            }
             isInitialLoading = false
             isRefreshing = false
             syncDiscoverCache()
@@ -329,46 +442,61 @@ fun DiscoverScreen(
     LaunchedEffect(musicEnabled) {
         if (musicEnabled && musicAlbums.isEmpty()) musicAlbums = repository.fetchMusicFeed("douban", 1)
     }
+    val enabledPluginSpec = modules.filter { it.enabled && it.isPluginRecommend }.joinToString("|") { it.id }
+    LaunchedEffect(enabledPluginSpec) {
+        modules.filter { it.enabled && it.isPluginRecommend }.forEach { mod ->
+            if (pluginRailItems[mod.id].isNullOrEmpty() && !mod.apiPath.isNullOrBlank()) {
+                val loaded = repository.fetchRecommendByApiPath(mod.apiPath, page = 1)
+                if (loaded.isNotEmpty()) {
+                    pluginRailItems[mod.id] = loaded
+                    syncDiscoverCache()
+                }
+            }
+        }
+    }
 
     val heroItems = trending.take(6)
     val pagerState = rememberPagerState(pageCount = { heroItems.size.coerceAtLeast(1) })
 
-    // 1:1 复刻 iOS `NativeDiscoverPage` 滚动物理曲线：
-    // 背景固定于滚动层后方，上滚时 0.07x 轻视差 + smoothstep 18dp 渐进柔焦 + 6 段软边溶解 + 淡出；
-    // 前景透明 Logo/标题/评分以 1.0x 正常速度随列表上滚，离开首屏后顶部渐进状态栏模糊同步浮现。
-    val scrollUpPx by remember {
-        derivedStateOf {
-            if (listState.firstVisibleItemIndex == 0) {
-                listState.firstVisibleItemScrollOffset.toFloat().coerceAtLeast(0f)
-            } else {
-                heroHeightPx
-            }
+    // 1:1 复刻 iOS `NativeDiscoverPage` 滚动物理曲线（全部滚动偏移仅在绘制阶段读取，彻底消除滚动逐像素整页重组）：
+    // 背景固定于滚动层后方，上滚时 0.07x 轻视差 + 6 段软边溶解 + 平滑淡出；
+    // 前景透明 Logo/标题/评分以 1.0x 正常速度随列表上滚，离开首屏后顶部状态栏柔化罩同步浮现。
+    val scrollUpPxProvider: () -> Float = {
+        if (listState.firstVisibleItemIndex == 0) {
+            listState.firstVisibleItemScrollOffset.toFloat().coerceAtLeast(0f)
+        } else {
+            heroHeightPx
         }
     }
-    val progress = (scrollUpPx / (heroHeightPx * 0.62f)).coerceIn(0f, 1f)
-    val eased = progress * progress * (3f - 2f * progress)
+    val easedProvider: () -> Float = {
+        val p = (scrollUpPxProvider() / (heroHeightPx * 0.62f)).coerceIn(0f, 1f)
+        p * p * (3f - 2f * p)
+    }
+    val isHeroScrolledAway by remember(heroHeightPx) {
+        derivedStateOf {
+            listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset >= (heroHeightPx * 0.62f).toInt()
+        }
+    }
     val currentHero = heroItems.getOrNull(pagerState.currentPage)
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // 1. 底层固定沉浸 Hero 背景（与滚动正文分离，形成 0.07x 景深视差与渐进柔焦）
+        // 1. 底层固定沉浸 Hero 背景（与滚动正文分离，仅在绘制层更新视差与透明度）
         Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .hazeSource(localHaze),
+            modifier = Modifier.fillMaxSize(),
         ) {
-            if (colors.isDark) {
+            if (colors.isDark && !isHeroScrolledAway) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(Color(0xFF0A0A16).copy(alpha = ((1f - eased * 1.15f).coerceAtLeast(0f)) * 0.52f)),
+                        .graphicsLayer {
+                            alpha = ((1f - easedProvider() * 1.15f).coerceAtLeast(0f)) * 0.52f
+                        }
+                        .background(Color(0xFF0A0A16)),
                 )
             }
 
-            if (currentHero != null && progress < 0.99f) {
+            if (currentHero != null && !isHeroScrolledAway) {
                 val backdropHeight = heroHeight * 1.08f
-                val parallaxY = -scrollUpPx.coerceAtMost(heroHeightPx) * 0.07f
-                val maskShiftY = -scrollUpPx * 0.88f
-                val visibility = (1f - eased * 0.94f).coerceIn(0f, 1f)
                 val fadeBase = androidx.compose.material3.MaterialTheme.colorScheme.background
 
                 Box(
@@ -376,13 +504,16 @@ fun DiscoverScreen(
                         .fillMaxWidth()
                         .height(backdropHeight)
                         .graphicsLayer {
-                            translationY = parallaxY
-                            alpha = visibility
+                            val sPx = scrollUpPxProvider()
+                            val easedVal = easedProvider()
+                            translationY = -sPx.coerceAtMost(heroHeightPx) * 0.07f
+                            alpha = (1f - easedVal * 0.94f).coerceIn(0f, 1f)
                             compositingStrategy = CompositingStrategy.Offscreen
                         }
                         .drawWithContent {
                             drawContent()
-                            // 6 段动态软边溶解蒙版（随上滚同步上推，丝滑融进流光背景）
+                            val sPx = scrollUpPxProvider()
+                            val maskShiftY = -sPx * 0.88f
                             val h = size.height.coerceAtLeast(1f)
                             val shiftFraction = (maskShiftY / h).coerceIn(-0.95f, 0f)
                             val p1 = (0.44f + shiftFraction).coerceIn(0f, 1f)
@@ -406,7 +537,7 @@ fun DiscoverScreen(
                 ) {
                     Crossfade(
                         targetState = currentHero.backdropPath ?: currentHero.posterPath,
-                        animationSpec = tween(durationMillis = 360),
+                        animationSpec = tween(durationMillis = 320),
                         label = "discoverHeroBackdrop",
                     ) { backdropUrl ->
                         if (!backdropUrl.isNullOrBlank()) {
@@ -414,9 +545,7 @@ fun DiscoverScreen(
                                 model = backdropUrl,
                                 contentDescription = currentHero.title,
                                 contentScale = ContentScale.Crop,
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .blur((eased * 18f).dp),
+                                modifier = Modifier.fillMaxSize(),
                             )
                         } else {
                             Box(
@@ -434,22 +563,21 @@ fun DiscoverScreen(
                                 Brush.verticalGradient(
                                     0.0f to Color.Transparent,
                                     0.36f to Color.Transparent,
-                                    0.64f to fadeBase.copy(alpha = (if (colors.isDark) 0.45f else 0.56f) * (1f - eased * 0.4f)),
+                                    0.64f to fadeBase.copy(alpha = if (colors.isDark) 0.45f else 0.56f),
                                     0.86f to fadeBase.copy(alpha = if (colors.isDark) 0.86f else 0.92f),
                                     1.0f to fadeBase,
                                 ),
                             ),
                     )
-                    if (eased > 0.01f) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .background(
-                                    if (colors.isDark) Color.Black.copy(alpha = eased * 0.22f)
-                                    else fadeBase.copy(alpha = eased * 0.32f),
-                                ),
-                        )
-                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer {
+                                val easedVal = easedProvider()
+                                alpha = easedVal * (if (colors.isDark) 0.34f else 0.44f)
+                            }
+                            .background(if (colors.isDark) Color.Black else fadeBase),
+                    )
                 }
             }
 
@@ -656,7 +784,7 @@ fun DiscoverScreen(
                                             contentPadding = PaddingValues(horizontal = margin),
                                             horizontalArrangement = Arrangement.spacedBy(14.dp),
                                         ) {
-                                            items(continueItems) { cw ->
+                                            items(continueItems, key = { "cw_${it.server}_${it.id}_${it.title}" }, contentType = { "continue_card" }) { cw ->
                                                 Column(
                                                     modifier = Modifier
                                                         .width(238.dp)
@@ -806,7 +934,7 @@ fun DiscoverScreen(
                                             contentPadding = PaddingValues(horizontal = margin),
                                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                                         ) {
-                                            items(movies) { item ->
+                                            items(movies, key = { "mv_${it.resolvedId}_${it.title}" }, contentType = { "poster" }) { item ->
                                                 NativePosterCard(
                                                     title = item.title,
                                                     year = item.year,
@@ -814,6 +942,7 @@ fun DiscoverScreen(
                                                     voteAverage = item.voteAverage,
                                                     inLibrary = item.inLibrary,
                                                     onClick = { onOpenMedia(item) },
+                                                    contextMenuContent = { dismiss -> PosterQuickMenu(item, dismiss) },
                                                     modifier = Modifier.width(posterWidth),
                                                 )
                                             }
@@ -834,7 +963,7 @@ fun DiscoverScreen(
                                             contentPadding = PaddingValues(horizontal = margin),
                                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                                         ) {
-                                            items(tvs) { item ->
+                                            items(tvs, key = { "tv_${it.resolvedId}_${it.title}" }, contentType = { "poster" }) { item ->
                                                 NativePosterCard(
                                                     title = item.title,
                                                     year = item.year,
@@ -842,6 +971,7 @@ fun DiscoverScreen(
                                                     voteAverage = item.voteAverage,
                                                     inLibrary = item.inLibrary,
                                                     onClick = { onOpenMedia(item) },
+                                                    contextMenuContent = { dismiss -> PosterQuickMenu(item, dismiss) },
                                                     modifier = Modifier.width(posterWidth),
                                                 )
                                             }
@@ -980,7 +1110,7 @@ fun DiscoverScreen(
                                             contentPadding = PaddingValues(horizontal = margin),
                                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                                         ) {
-                                            items(doubanShowing) { item ->
+                                            items(doubanShowing, key = { "dbs_${it.resolvedId}_${it.title}" }, contentType = { "poster" }) { item ->
                                                 NativePosterCard(
                                                     title = item.title,
                                                     year = item.year,
@@ -988,6 +1118,7 @@ fun DiscoverScreen(
                                                     voteAverage = item.voteAverage,
                                                     inLibrary = item.inLibrary,
                                                     onClick = { onOpenMedia(item) },
+                                                    contextMenuContent = { dismiss -> PosterQuickMenu(item, dismiss) },
                                                     modifier = Modifier.width(posterWidth),
                                                 )
                                             }
@@ -1008,7 +1139,7 @@ fun DiscoverScreen(
                                             contentPadding = PaddingValues(horizontal = margin),
                                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                                         ) {
-                                            items(doubanTop250) { item ->
+                                            items(doubanTop250, key = { "dbt_${it.resolvedId}_${it.title}" }, contentType = { "poster" }) { item ->
                                                 NativePosterCard(
                                                     title = item.title,
                                                     year = item.year,
@@ -1016,6 +1147,7 @@ fun DiscoverScreen(
                                                     voteAverage = item.voteAverage,
                                                     inLibrary = item.inLibrary,
                                                     onClick = { onOpenMedia(item) },
+                                                    contextMenuContent = { dismiss -> PosterQuickMenu(item, dismiss) },
                                                     modifier = Modifier.width(posterWidth),
                                                 )
                                             }
@@ -1035,7 +1167,7 @@ fun DiscoverScreen(
                                             contentPadding = PaddingValues(horizontal = margin),
                                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                                         ) {
-                                            items(latestItems) { item ->
+                                            items(latestItems, key = { "lat_${it.serverName}_${it.serverItemId}_${it.resolvedId}_${it.title}" }, contentType = { "poster" }) { item ->
                                                 NativePosterCard(
                                                     title = item.title,
                                                     year = item.year,
@@ -1204,6 +1336,40 @@ fun DiscoverScreen(
                                     }
                                 }
                             }
+
+                            else -> if (mod.isPluginRecommend) {
+                                val railList = pluginRailItems[mod.id].orEmpty()
+                                if (railList.isNotEmpty()) {
+                                    item(key = "mod_${mod.id}") {
+                                        val exploreSpec = "$PLUGIN_RECOMMEND_PREFIX${mod.apiPath}|${mod.title}"
+                                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                            NativeSectionHeader(
+                                                title = mod.title,
+                                                subtitle = mod.subtitle.takeIf { it.isNotBlank() },
+                                                onClickMore = { onOpenExplore(exploreSpec) },
+                                                modifier = Modifier.padding(horizontal = margin),
+                                            )
+                                            LazyRow(
+                                                contentPadding = PaddingValues(horizontal = margin),
+                                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                            ) {
+                                                items(railList, key = { "${mod.id}_${it.resolvedId}_${it.title}" }) { item ->
+                                                    NativePosterCard(
+                                                        title = item.title,
+                                                        year = item.year,
+                                                        posterUrl = item.posterPath,
+                                                        voteAverage = item.voteAverage,
+                                                        inLibrary = item.inLibrary,
+                                                        onClick = { onOpenMedia(item) },
+                                                        contextMenuContent = { dismiss -> PosterQuickMenu(item, dismiss) },
+                                                        modifier = Modifier.width(posterWidth),
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -1236,11 +1402,10 @@ fun DiscoverScreen(
             }
         }
 
-        // 顶部状态栏渐进模糊（首屏 scroll=0 时 0% 透明保持海报无遮挡，上滚后平滑浮现防止内容与状态栏重叠）
+        // 顶部状态栏渐进柔化罩（首屏 scroll=0 时 0% 透明保持海报无遮挡，上滚后仅在绘制层平滑浮现防止内容与状态栏重叠）
         NativeTopStatusBarProgressiveBlur(
-            visibilityProgress = eased,
+            visibilityProgressProvider = easedProvider,
             extraHeight = 40.dp,
-            blurSourceState = localHaze,
             modifier = Modifier.align(Alignment.TopCenter),
         )
     }
@@ -1266,8 +1431,9 @@ fun DiscoverScreen(
                         title = "恢复默认",
                         selected = false,
                         onClick = {
+                            val reset = mergeDiscoverModules(context, extraRecommendSources, forceResetDefaults = true)
                             modules.clear()
-                            modules.addAll(defaultDiscoverModules())
+                            modules.addAll(reset)
                             savePersistedDiscoverModules(context, modules)
                         },
                     )
@@ -1284,13 +1450,24 @@ fun DiscoverScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
-                                Text(
-                                    mod.title,
-                                    color = colors.textPrimary,
-                                    fontSize = 15.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    modifier = Modifier.weight(1f),
-                                )
+                                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(
+                                        mod.title,
+                                        color = colors.textPrimary,
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    if (mod.isPluginRecommend) {
+                                        Text(
+                                            text = if (mod.subtitle.isNotBlank()) "插件推荐 · ${mod.subtitle}" else "插件推荐榜单",
+                                            color = colors.textMuted,
+                                            fontSize = 11.5.sp,
+                                            maxLines = 1,
+                                        )
+                                    }
+                                }
                                 IconButton(
                                     onClick = {
                                         if (idx > 0) {
@@ -1535,6 +1712,7 @@ fun ExploreScreen(
     onPlayAudio: (MediaPlaybackRequest) -> Unit = {},
 ) {
     val colors = LocalMoviePilotColors.current
+    val snackbar = LocalSnackbarHostState.current
     val bottomOverlayInset = LocalBottomOverlayInset.current
     val margin = AdaptiveDeviceLayout.horizontalMargin()
     val compactHeight = AdaptiveDeviceLayout.isCompactHeight()
@@ -1574,9 +1752,28 @@ fun ExploreScreen(
     var activeDoubanTag by rememberSaveable { mutableStateOf("全部") }
     var activeMusicFeed by rememberSaveable { mutableStateOf("douban") }
 
+    val isPluginRecommendSource = activeSource.startsWith(PLUGIN_RECOMMEND_PREFIX)
+    val pluginRecommendApiPath = remember(activeSource) {
+        if (isPluginRecommendSource) {
+            activeSource.removePrefix(PLUGIN_RECOMMEND_PREFIX).substringBefore('|')
+        } else {
+            ""
+        }
+    }
+    val pluginRecommendTitle = remember(activeSource) {
+        if (isPluginRecommendSource && '|' in activeSource) {
+            activeSource.substringAfter('|').ifBlank { "推荐榜单" }
+        } else {
+            "推荐榜单"
+        }
+    }
+
     val cacheKey = remember(activeSource, activeSort, activeGenre, activeLang, activeDoubanTag, activeMusicFeed) {
-        if (activeSource == "music") "music|$activeMusicFeed"
-        else "$activeSource|$activeSort|$activeGenre|$activeLang|$activeDoubanTag"
+        when {
+            isPluginRecommendSource -> activeSource
+            activeSource == "music" -> "music|$activeMusicFeed"
+            else -> "$activeSource|$activeSort|$activeGenre|$activeLang|$activeDoubanTag"
+        }
     }
     val initialCached = remember(cacheKey) { repository.cachedExplore[cacheKey] }
 
@@ -1592,7 +1789,16 @@ fun ExploreScreen(
         if (showMainLoader) isLoading = true
         page = 1
         canLoadMore = true
-        if (activeSource == "music") {
+        if (isPluginRecommendSource) {
+            val fetched = repository.fetchRecommendByApiPath(pluginRecommendApiPath, page = 1)
+            items = fetched
+            canLoadMore = fetched.isNotEmpty()
+            repository.cachedExplore[cacheKey] = ExploreSessionSnapshot(
+                items = fetched,
+                page = 1,
+                hasMore = canLoadMore,
+            )
+        } else if (activeSource == "music") {
             val fetchedMusic = repository.fetchMusicFeed(activeMusicFeed, 1)
             musicAlbums = fetchedMusic
             repository.cachedExplore[cacheKey] = ExploreSessionSnapshot(
@@ -1634,26 +1840,28 @@ fun ExploreScreen(
 
     val activeSourceIdx = sources.indexOfFirst { it.id == activeSource }.coerceAtLeast(0)
     ExpressiveTintedScaffold(
-        title = "分类探索",
+        title = if (isPluginRecommendSource) pluginRecommendTitle else "分类探索",
         onBack = onBack,
-        headerExtra = {
-            ExpressivePillTabRow(
-                tabs = sources.map { if (it.id == "music") "音乐" else "${it.brand} ${it.sub}" },
-                selectedIndex = activeSourceIdx,
-                onSelect = { idx -> activeSource = sources[idx].id },
-                scrollable = true,
-                onTintedHeader = true,
-                tabIcons = sources.map { src ->
-                    {
-                        NativeEntityLogo(
-                            kind = "datasource",
-                            value = src.id,
-                            size = 18.dp,
-                            cornerRadius = 5.dp,
-                        )
-                    }
-                },
-            )
+        headerExtra = if (isPluginRecommendSource) null else {
+            {
+                ExpressivePillTabRow(
+                    tabs = sources.map { if (it.id == "music") "音乐" else "${it.brand} ${it.sub}" },
+                    selectedIndex = activeSourceIdx,
+                    onSelect = { idx -> activeSource = sources[idx].id },
+                    scrollable = true,
+                    onTintedHeader = true,
+                    tabIcons = sources.map { src ->
+                        {
+                            NativeEntityLogo(
+                                kind = "datasource",
+                                value = src.id,
+                                size = 18.dp,
+                                cornerRadius = 5.dp,
+                            )
+                        }
+                    },
+                )
+            }
         },
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -1827,17 +2035,22 @@ fun ExploreScreen(
                                 LaunchedEffect(page) {
                                     isLoading = true
                                     val nextPage = page + 1
-                                    val more = repository.fetchExplore(
-                                        source = activeSource,
-                                        page = nextPage,
-                                        genre = activeGenre,
-                                        sort = activeSort,
-                                        language = activeLang,
-                                        doubanTag = activeDoubanTag,
-                                    )
-                                    if (more.isNotEmpty()) {
-                                        val seen = items.map { it.resolvedId }.toHashSet()
-                                        val merged = items + more.filter { seen.add(it.resolvedId) }
+                                    val more = if (isPluginRecommendSource) {
+                                        repository.fetchRecommendByApiPath(pluginRecommendApiPath, page = nextPage)
+                                    } else {
+                                        repository.fetchExplore(
+                                            source = activeSource,
+                                            page = nextPage,
+                                            genre = activeGenre,
+                                            sort = activeSort,
+                                            language = activeLang,
+                                            doubanTag = activeDoubanTag,
+                                        )
+                                    }
+                                    val seen = items.map { it.resolvedId }.toHashSet()
+                                    val uniqueMore = more.filter { seen.add(it.resolvedId) }
+                                    if (uniqueMore.isNotEmpty()) {
+                                        val merged = items + uniqueMore
                                         items = merged
                                         page = nextPage
                                         repository.cachedExplore[cacheKey] = ExploreSessionSnapshot(
@@ -1863,6 +2076,27 @@ fun ExploreScreen(
                                 voteAverage = item.voteAverage,
                                 inLibrary = item.inLibrary,
                                 onClick = { onOpenMedia(item) },
+                                contextMenuContent = { dismiss ->
+                                    DropdownMenuItem(
+                                        text = { Text("查看影视详情") },
+                                        leadingIcon = { Icon(Icons.Rounded.ChevronRight, contentDescription = null) },
+                                        onClick = {
+                                            dismiss()
+                                            onOpenMedia(item)
+                                        },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("快捷添加订阅") },
+                                        leadingIcon = { Icon(Icons.Rounded.BookmarkAdd, contentDescription = null) },
+                                        onClick = {
+                                            dismiss()
+                                            scope.launch {
+                                                val (_, msg) = repository.quickSubscribeMediaCard(item)
+                                                snackbar?.showSnackbar(msg)
+                                            }
+                                        },
+                                    )
+                                },
                             )
                         }
                         }
@@ -1998,6 +2232,7 @@ fun GlobalSearchScreen(
     onPlayLibraryItem: (MediaPlaybackRequest) -> Unit,
 ) {
     val colors = LocalMoviePilotColors.current
+    val snackbar = LocalSnackbarHostState.current
     val bottomOverlayInset = LocalBottomOverlayInset.current
     val margin = AdaptiveDeviceLayout.horizontalMargin()
     val columns = AdaptiveDeviceLayout.posterGridColumns()
@@ -2012,6 +2247,13 @@ fun GlobalSearchScreen(
     var seriesPickerTarget by remember { mutableStateOf<MediaCardItem?>(null) }
     var resolvingMusicId by remember { mutableStateOf<String?>(null) }
 
+    var mediaSources by remember { mutableStateOf<List<MediaSearchSourceDto>>(emptyList()) }
+    var isLoadingSources by remember { mutableStateOf(false) }
+    var selectedSourcesByKind by remember { mutableStateOf<Map<String, Set<String>>>(emptyMap()) }
+    var libraryTypeFilter by remember { mutableStateOf("全部") }
+    var showSourceMenu by remember { mutableStateOf(false) }
+    var showLibraryTypeMenu by remember { mutableStateOf(false) }
+
     val kinds = listOf(
         "media" to "媒体",
         "library" to "媒体库",
@@ -2019,13 +2261,40 @@ fun GlobalSearchScreen(
         "music" to "音乐",
         "collection" to "合集",
     )
+    val libraryFilterOptions = listOf("全部", "电影", "电视剧", "音乐")
     val quickTags = listOf("奥德赛", "钢铁侠", "超感神探", "庆余年", "星际穿越", "沙丘", "三体")
 
-    LaunchedEffect(query, kind) {
+    val availableSourcesForKind = remember(mediaSources, kind) {
+        mediaSources.filter { it.supports(kind) }
+    }
+    val activeSelectedSources = remember(selectedSourcesByKind, kind, availableSourcesForKind) {
+        val raw = selectedSourcesByKind[kind].orEmpty()
+        if (availableSourcesForKind.isEmpty()) raw else raw.intersect(availableSourcesForKind.map { it.id }.toSet())
+    }
+
+    LaunchedEffect(Unit) {
+        isLoadingSources = true
+        val loaded = repository.fetchMediaSearchSources()
+        mediaSources = loaded
+        isLoadingSources = false
+    }
+
+    LaunchedEffect(query, kind, activeSelectedSources, libraryTypeFilter) {
         playError = null
         if (query.isNotBlank()) {
             isSearching = true
-            results = repository.searchMedia(query, kind, 1)
+            val libTypes = if (kind == "library" && libraryTypeFilter != "全部") {
+                listOf(libraryTypeFilter)
+            } else {
+                emptyList()
+            }
+            results = repository.searchMedia(
+                keyword = query,
+                kind = kind,
+                page = 1,
+                sources = activeSelectedSources,
+                libraryTypes = libTypes,
+            )
             isSearching = false
         } else {
             results = emptyList()
@@ -2104,11 +2373,23 @@ fun GlobalSearchScreen(
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             Spacer(Modifier.height(14.dp))
-            CinematicPanel(padding = 13.dp, cornerRadius = 24.dp, modifier = Modifier.padding(horizontal = margin)) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            CinematicPanel(padding = 10.dp, cornerRadius = 24.dp, modifier = Modifier.padding(horizontal = margin)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.padding(start = 4.dp),
+                ) {
                     Icon(Icons.Rounded.Search, contentDescription = null, tint = colors.textSecondary)
                     Box(modifier = Modifier.weight(1f)) {
-                        if (query.isEmpty()) Text("搜索电影、剧集、媒体库、人物或音乐...", color = colors.textMuted, fontSize = 15.sp)
+                        if (query.isEmpty()) {
+                            Text(
+                                "搜索电影、剧集、媒体库、人物或音乐...",
+                                color = colors.textMuted,
+                                fontSize = 15.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                         BasicTextField(
                             value = query,
                             onValueChange = { query = it },
@@ -2121,6 +2402,155 @@ fun GlobalSearchScreen(
                     if (query.isNotEmpty()) {
                         IconButton(onClick = { query = "" }, modifier = Modifier.size(24.dp)) {
                             Icon(Icons.Rounded.Close, contentDescription = "清除", tint = colors.textMuted, modifier = Modifier.size(16.dp))
+                        }
+                    }
+                    if (kind == "library") {
+                        val hasLibFilter = libraryTypeFilter != "全部"
+                        Box {
+                            Row(
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(if (hasLibFilter) colors.activeIndicator else colors.chipFill)
+                                    .border(0.7.dp, if (hasLibFilter) colors.accent else colors.chipBorder, CircleShape)
+                                    .clickable { showLibraryTypeMenu = true }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp),
+                            ) {
+                                Text(
+                                    text = if (hasLibFilter) libraryTypeFilter else "类型",
+                                    color = colors.textPrimary,
+                                    fontSize = 12.sp,
+                                    fontWeight = if (hasLibFilter) FontWeight.SemiBold else FontWeight.Medium,
+                                    maxLines = 1,
+                                )
+                                Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "媒体库类型筛选", tint = colors.textSecondary, modifier = Modifier.size(15.dp))
+                            }
+                            DropdownMenu(
+                                expanded = showLibraryTypeMenu,
+                                onDismissRequest = { showLibraryTypeMenu = false },
+                            ) {
+                                libraryFilterOptions.forEach { opt ->
+                                    val chosen = libraryTypeFilter == opt
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                opt,
+                                                fontWeight = if (chosen) FontWeight.Bold else FontWeight.Normal,
+                                            )
+                                        },
+                                        trailingIcon = if (chosen) {
+                                            { Icon(Icons.Rounded.Check, contentDescription = null, tint = colors.accent, modifier = Modifier.size(17.dp)) }
+                                        } else null,
+                                        onClick = {
+                                            libraryTypeFilter = opt
+                                            showLibraryTypeMenu = false
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        val selectedCount = activeSelectedSources.size
+                        Box {
+                            Row(
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(if (selectedCount > 0) colors.activeIndicator else colors.chipFill)
+                                    .border(0.7.dp, if (selectedCount > 0) colors.accent else colors.chipBorder, CircleShape)
+                                    .clickable { showSourceMenu = true }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp),
+                            ) {
+                                Text(
+                                    text = if (selectedCount == 0) "来源" else "来源 $selectedCount",
+                                    color = colors.textPrimary,
+                                    fontSize = 12.sp,
+                                    fontWeight = if (selectedCount > 0) FontWeight.SemiBold else FontWeight.Medium,
+                                    maxLines = 1,
+                                )
+                                Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "选择搜索来源", tint = colors.textSecondary, modifier = Modifier.size(15.dp))
+                            }
+                            DropdownMenu(
+                                expanded = showSourceMenu,
+                                onDismissRequest = { showSourceMenu = false },
+                                modifier = Modifier.heightIn(max = 360.dp),
+                            ) {
+                                // 互斥默认项：点击重置系统默认并收起菜单
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            "默认（系统设置）",
+                                            fontWeight = if (selectedCount == 0) FontWeight.Bold else FontWeight.Normal,
+                                        )
+                                    },
+                                    trailingIcon = if (selectedCount == 0) {
+                                        { Icon(Icons.Rounded.Check, contentDescription = null, tint = colors.accent, modifier = Modifier.size(17.dp)) }
+                                    } else null,
+                                    onClick = {
+                                        selectedSourcesByKind = selectedSourcesByKind - kind
+                                        showSourceMenu = false
+                                    },
+                                )
+                                if (availableSourcesForKind.isEmpty()) {
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                if (isLoadingSources) "正在加载来源…" else "暂无可用来源",
+                                                color = colors.textMuted,
+                                                fontSize = 13.sp,
+                                            )
+                                        },
+                                        enabled = false,
+                                        onClick = {},
+                                    )
+                                } else {
+                                    HorizontalDivider()
+                                    // 多选具体来源：勾选后保持菜单展开，支持连续多选（对齐 #67）
+                                    availableSourcesForKind.forEach { src ->
+                                        val picked = src.id in activeSelectedSources
+                                        DropdownMenuItem(
+                                            leadingIcon = {
+                                                NativeEntityLogo(
+                                                    kind = "media_source",
+                                                    value = src.id,
+                                                    size = 18.dp,
+                                                    cornerRadius = 4.dp,
+                                                )
+                                            },
+                                            text = {
+                                                Text(
+                                                    src.displayName,
+                                                    fontWeight = if (picked) FontWeight.SemiBold else FontWeight.Normal,
+                                                )
+                                            },
+                                            trailingIcon = if (picked) {
+                                                { Icon(Icons.Rounded.Check, contentDescription = null, tint = colors.accent, modifier = Modifier.size(17.dp)) }
+                                            } else null,
+                                            onClick = {
+                                                val current = activeSelectedSources
+                                                val updated = if (picked) current - src.id else current + src.id
+                                                selectedSourcesByKind = if (updated.isEmpty()) {
+                                                    selectedSourcesByKind - kind
+                                                } else {
+                                                    selectedSourcesByKind + (kind to updated)
+                                                }
+                                            },
+                                        )
+                                    }
+                                    if (selectedCount > 0) {
+                                        HorizontalDivider()
+                                        DropdownMenuItem(
+                                            text = { Text("清除来源筛选", color = colors.danger) },
+                                            onClick = {
+                                                selectedSourcesByKind = selectedSourcesByKind - kind
+                                                showSourceMenu = false
+                                            },
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2445,6 +2875,7 @@ fun MusicDiscoveryScreen(
     repository: MoviePilotRepository? = null,
 ) {
     val colors = LocalMoviePilotColors.current
+    val snackbar = LocalSnackbarHostState.current
     val bottomOverlayInset = LocalBottomOverlayInset.current
     val margin = AdaptiveDeviceLayout.horizontalMargin()
     val cols = AdaptiveDeviceLayout.squareGridColumns()

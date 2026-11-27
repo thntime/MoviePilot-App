@@ -31,18 +31,67 @@ class NativeFixtureTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join()
 
-    def request(self, path, body=None, content="application/json", token=None):
+    def request(self, path, body=None, content="application/json", token=None, method=None):
         """只收集状态和 JSON；不将认证输入输出到日志。"""
         headers = {"Content-Type": content}
         if token:
             headers["Authorization"] = "Bearer " + token
-        request = Request(self.base + path, data=body, headers=headers)
+        request = Request(self.base + path, data=body, headers=headers, method=method)
         try:
             response = urlopen(request, timeout=5)
         except HTTPError as error:
             response = error
         with response:
             return response.status, json.load(response)
+
+    def test_agent_and_dashboard_use_current_routes(self):
+        """当前 Agent 命名空间和首页遥测均有显式夹具，旧接口不能悄悄继续成功。"""
+        for endpoint in ("message/agent/commands", "message/agent/sessions", "dashboard/cpu",
+                         "dashboard/memory", "dashboard/network", "dashboard/downloader",
+                         "dashboard/system", "dashboard/transfer", "github/community", "rule/groups"):
+            self.assertEqual(self.request("/a/api/v1/" + endpoint, token="synthetic-native-a")[0], 200)
+        self.assertEqual(self.request("/a/api/v1/agent/commands", token="synthetic-native-a")[0], 404)
+
+    def test_calendar_requires_window_and_search_only_has_no_subscription(self):
+        """夹具保持真实日期必填合同，搜索专用账号不隐式授予订阅。"""
+        path = "/a/api/v1/subscribe/calendar"
+        self.assertEqual(self.request(path, token="synthetic-native-a")[0], 422)
+        status, result = self.request(path + "?start=2026-11-01&end=2026-11-08", token="synthetic-native-a")
+        self.assertEqual(status, 200)
+        self.assertEqual(result["data"]["items"][0]["date"], "2026-11-01")
+        with self.server.lock:
+            self.server.profiles["b"]["mode"] = "resource-search-only"
+        _, result = self.request("/b/api/v1/user/current", token="synthetic-native-b")
+        self.assertTrue(result["data"]["permissions"]["search"])
+        self.assertFalse(result["data"]["permissions"]["subscribe"])
+        self.assertFalse(result["data"]["permissions"]["discovery"])
+
+    def test_agent_display_snapshot_round_trips_and_checks_token(self):
+        """展示快照更新必须实际保存且保持实例鉴权，不能用成功空响应掩盖陈旧夹具。"""
+        path = "/a/api/v1/message/agent/sessions/sess-1/display"
+        payload = {"title": "合成展示", "messages": [{"role": "user", "content": "合成消息"}]}
+        body = json.dumps(payload).encode()
+        self.assertEqual(self.request(path, body, token="synthetic-native-b", method="PUT")[0], 401)
+        status, summary = self.request(path, body, token="synthetic-native-a", method="PUT")
+        self.assertEqual(status, 200)
+        self.assertEqual(summary["data"]["message_count"], 1)
+        _, detail = self.request(path.removesuffix("/display"), token="synthetic-native-a")
+        self.assertEqual(detail["data"]["messages"], payload["messages"])
+        self.assertEqual(detail["data"]["title"], payload["title"])
+        _, stats = self.request("/__native/stats")
+        self.assertEqual(stats["unexpected"], {})
+
+    def test_user_fixture_does_not_preserve_omitted_fields_for_client(self):
+        """完整替换语义与后端一致，禁止夹具替客户端保留 OTP 而掩盖丢字段回归。"""
+        status, _ = self.request("/a/api/v1/user/", body=json.dumps({
+            "id": 20, "name": "native-b", "email": "edited@example.test"
+        }).encode(), token="synthetic-native-a", method="PUT")
+        self.assertEqual(status, 200)
+        _, result = self.request("/a/api/v1/user/", token="synthetic-native-a")
+        member = next(row for row in result["data"] if row["id"] == 20)
+        self.assertFalse(member["is_otp"])
+        self.assertIsNone(member["avatar"])
+        self.assertEqual(member["settings"], {})
 
     def test_frontend_is_unavailable_and_recorded(self):
         """HTML、JS 和未声明路径只能返回 404，不能靠假前端使 UI 测试通过。"""
@@ -113,6 +162,45 @@ class NativeFixtureTests(unittest.TestCase):
         _, dashboard = self.request("/a/api/v1/dashboard/statistic", token="synthetic-native-a")
         self.assertIsNone(dashboard["data"]["episode_count"])
         self.assertEqual(dashboard["data"]["episode_count_month"], 4)
+
+    def test_log_snapshot_is_finite_newest_first_and_resource_authenticated(self):
+        """有限日志文本必须使用资源 Cookie，并保持后端倒序与管理员边界。"""
+        path = self.base + "/a/api/v1/system/logging?length=-1&logfile=plugins/demoplugin.log"
+        with self.assertRaises(HTTPError) as rejected:
+            urlopen(Request(path, headers={"Authorization": "Bearer synthetic-native-a"}), timeout=2)
+        self.assertEqual(rejected.exception.code, 401)
+        rejected.exception.close()
+        cookie = "MoviePilot=" + MODULE.NativeHandler.resource_token("a")
+        with urlopen(Request(path, headers={"Cookie": cookie}), timeout=2) as response:
+            self.assertEqual(response.headers.get_content_type(), "text/plain")
+            lines = [line for line in response.read().decode().splitlines() if line.strip()]
+        self.assertEqual(len(lines), 450)
+        self.assertTrue(lines[0].endswith("合成插件日志 450"))
+        self.assertTrue(lines[-1].endswith("合成插件日志 001"))
+        member_cookie = "MoviePilot=" + MODULE.NativeHandler.resource_token("b")
+        with self.assertRaises(HTTPError) as forbidden:
+            urlopen(Request(path.replace("/a/", "/b/"), headers={"Cookie": member_cookie}), timeout=2)
+        self.assertEqual(forbidden.exception.code, 403)
+        forbidden.exception.close()
+
+    def test_log_stream_empty_failure_and_explicit_retry(self):
+        """正数仍为带心跳的 SSE；空日志、暂时失败和显式重试均有独立真实响应。"""
+        path = self.base + "/a/api/v1/system/logging?length="
+        headers = {"Cookie": "MoviePilot=" + MODULE.NativeHandler.resource_token("a")}
+        with urlopen(Request(path + "200", headers=headers), timeout=2) as response:
+            self.assertEqual(response.headers.get_content_type(), "text/event-stream")
+            self.assertTrue(response.readline().startswith(b"data: "))
+        self.request("/__native/config", b'{"profile":"a","mode":"logs-empty"}')
+        with urlopen(Request(path + "-1", headers=headers), timeout=2) as response:
+            self.assertEqual(response.read(), b"")
+        self.request("/__native/config", b'{"profile":"a","mode":"logs-failed"}')
+        with self.assertRaises(HTTPError) as failed:
+            urlopen(Request(path + "-1", headers=headers), timeout=2)
+        self.assertEqual(failed.exception.code, 503)
+        failed.exception.close()
+        self.request("/__native/config", b'{"profile":"a","mode":"ready"}')
+        with urlopen(Request(path + "-1", headers=headers), timeout=2) as response:
+            self.assertIn("合成系统日志 450", response.read().decode())
 
     def test_initialization_needs_confirmation_and_never_returns_token(self):
         """创建、重复创建与普通登录分开，完整确认字段不可缺少。"""
@@ -222,6 +310,8 @@ class NativeFixtureTests(unittest.TestCase):
             self.assertIn("javascript", js_resp.headers.get("Content-Type", ""))
             js_body = js_resp.read().decode("utf-8")
             self.assertIn("export async function get(", js_body)
+            self.assertIn("emit('close')", js_body)
+            self.assertIn("关闭插件", js_body)
 
         status_code, payload = self.request(
             "/a/api/v1/plugin/VueCompatDemo/status",

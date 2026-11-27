@@ -235,20 +235,23 @@ private struct MediaPlaybackLyricCue: Sendable {
 final class MediaPlaybackClient {
   private let address: ServerAddress
   private let accessToken: String
+  /// 离线终态仅能由同一实例、同一账号的客户端补报。
+  let progressStorageKey: String
   private let session: URLSession
   private var resourceCookie: HTTPCookie?
   private var selectedServer: String?
 
   /// 以短生命周期、无 Cookie 的网络会话访问当前实例播放接口。
-  init(address: ServerAddress, accessToken: String) {
+  init(address: ServerAddress, accessToken: String, accountID: Int) {
     self.address = address
     self.accessToken = accessToken
+    progressStorageKey = PlaybackQueueScope.storageKey(address: address, accountID: accountID)
     let configuration = URLSessionConfiguration.ephemeral
     configuration.httpCookieStorage = nil
     configuration.httpShouldSetCookies = false
     configuration.urlCache = nil
     configuration.timeoutIntervalForRequest = 20
-    configuration.timeoutIntervalForResource = 60
+    configuration.timeoutIntervalForResource = 120
     session = URLSession(configuration: configuration)
   }
 
@@ -382,35 +385,153 @@ final class MediaPlaybackClient {
     return (200..<300).contains(http.statusCode)
   }
 
-  /// 下载所选外挂字幕到 App 临时目录，避免把账号令牌放进播放器 URL。
+  /// 下载所选外挂字幕到 App 临时目录（兼容实时字体子集化慢响应、64MB 上限与真实格式嗅探），避免把账号令牌放进播放器 URL。
   func download(_ subtitle: MediaPlaybackSubtitle, itemId: String) async throws -> URL {
     guard isTrustedSubtitleURL(subtitle.url, itemId: itemId, server: selectedServer) else {
       throw MediaPlaybackError.unavailable
     }
     var request = URLRequest(url: subtitle.url)
+    request.timeoutInterval = 90
+    request.setValue(nil, forHTTPHeaderField: "Range")
+    request.setValue(nil, forHTTPHeaderField: "If-Range")
     request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
     request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
     CloudflareAccessCredentialRegistry.shared.applyHeaders(to: &request, for: address)
-    let (bytes, response) = try await session.bytes(for: request)
-    guard let response = response as? HTTPURLResponse, response.statusCode == 200,
-      response.expectedContentLength <= 16 * 1024 * 1024
-    else { throw MediaPlaybackError.subtitleUnavailable }
-    var data = Data()
-    data.reserveCapacity(Int(max(0, response.expectedContentLength)))
-    for try await byte in bytes {
-      guard data.count < 16 * 1024 * 1024 else { throw MediaPlaybackError.subtitleUnavailable }
-      data.append(byte)
-    }
-    guard !data.isEmpty else { throw MediaPlaybackError.subtitleUnavailable }
+
+    let maxSubtitleBytes = 64 * 1024 * 1024
+    let (data, contentType) = try await Self.fetchBoundedSubtitlePayload(
+      session: session,
+      request: request,
+      maxBytes: maxSubtitleBytes
+    )
     let idExt = (subtitle.subtitleId as NSString).pathExtension.lowercased()
     let urlExt = subtitle.url.pathExtension.lowercased()
-    let allowedExts: Set<String> = ["srt", "ass", "ssa", "vtt", "smi", "sub"]
-    let ext = allowedExts.contains(idExt) ? idExt : (allowedExts.contains(urlExt) ? urlExt : "srt")
+    let ext = Self.sniffSubtitleExtension(
+      data: data,
+      contentType: contentType,
+      idExt: idExt,
+      urlExt: urlExt
+    )
     let fileURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("moviepilot-\(UUID().uuidString)")
       .appendingPathExtension(ext)
     try data.write(to: fileURL, options: .atomic)
     return fileURL
+  }
+
+  /// 在后台并发执行器中流式读取有界外挂字幕响应（兼容分块未知长度 `-1` 与最高 64MB 内嵌子集化字体，避免阻塞主线程）。
+  nonisolated private static func fetchBoundedSubtitlePayload(
+    session: URLSession,
+    request: URLRequest,
+    maxBytes: Int
+  ) async throws -> (data: Data, contentType: String?) {
+    let (bytes, response) = try await session.bytes(for: request)
+    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+      throw MediaPlaybackError.subtitleUnavailable
+    }
+    let expectedLength = http.expectedContentLength
+    guard
+      expectedLength == NSURLSessionTransferSizeUnknown
+        || (expectedLength >= 0 && expectedLength <= Int64(maxBytes))
+    else {
+      throw MediaPlaybackError.subtitleUnavailable
+    }
+    var data = Data()
+    if expectedLength > 0 {
+      data.reserveCapacity(Int(min(expectedLength, 4 * 1024 * 1024)))
+    }
+    for try await byte in bytes {
+      if (data.count & 0xFFFF) == 0 {
+        try Task.checkCancellation()
+      }
+      guard data.count < maxBytes else {
+        throw MediaPlaybackError.subtitleUnavailable
+      }
+      data.append(byte)
+    }
+    guard !data.isEmpty else {
+      throw MediaPlaybackError.subtitleUnavailable
+    }
+    return (data, http.value(forHTTPHeaderField: "Content-Type"))
+  }
+
+  /// 综合 `Content-Type` 与前 4KB UTF-8/UTF-16 文本头嗅探外挂字幕真实扩展名（解决无后缀 URL 与 SRT 实时转带内嵌字体 ASS）。
+  nonisolated static func sniffSubtitleExtension(
+    data: Data,
+    contentType: String?,
+    idExt: String,
+    urlExt: String
+  ) -> String {
+    let headerSample = decodeSubtitleHeaderSample(data.prefix(4_096))
+      .trimmingCharacters(in: CharacterSet(charactersIn: "\u{FEFF} \t\r\n"))
+      .lowercased()
+    if headerSample.contains("[script info]")
+      || headerSample.contains("[v4+ styles]")
+      || headerSample.contains("[v4 styles]")
+      || headerSample.contains("scripttype:")
+    {
+      return "ass"
+    }
+    if headerSample.hasPrefix("webvtt") {
+      return "vtt"
+    }
+
+    if let rawMime = contentType?.split(separator: ";", maxSplits: 1).first?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    {
+      switch rawMime {
+      case "text/x-ssa", "text/x-ass", "application/x-ssa", "application/x-ass":
+        return "ass"
+      case "text/vtt":
+        return "vtt"
+      case "application/x-subrip", "text/srt":
+        return "srt"
+      default:
+        break
+      }
+    }
+
+    let allowedExts: Set<String> = ["srt", "ass", "ssa", "vtt", "smi", "sub"]
+    if allowedExts.contains(idExt) {
+      return idExt
+    }
+    if allowedExts.contains(urlExt) {
+      return urlExt
+    }
+    return "srt"
+  }
+
+  /// 解码外挂字幕前部采样字节（兼容 UTF-8 BOM、UTF-16 LE/BE 及截断边界安全的 UTF-8 解码）。
+  nonisolated private static func decodeSubtitleHeaderSample(_ prefix: Data) -> String {
+    guard !prefix.isEmpty else { return "" }
+    let bytes = [UInt8](prefix)
+    if bytes.count >= 3, bytes[0] == 0xEF, bytes[1] == 0xBB, bytes[2] == 0xBF {
+      return String(decoding: bytes.dropFirst(3), as: UTF8.self)
+    }
+    if bytes.count >= 2, bytes[0] == 0xFF, bytes[1] == 0xFE {
+      let evenCount = (bytes.count - 2) & ~1
+      if evenCount > 0,
+        let decoded = String(
+          data: Data(bytes[2..<(2 + evenCount)]),
+          encoding: .utf16LittleEndian
+        )
+      {
+        return decoded
+      }
+    }
+    if bytes.count >= 2, bytes[0] == 0xFE, bytes[1] == 0xFF {
+      let evenCount = (bytes.count - 2) & ~1
+      if evenCount > 0,
+        let decoded = String(
+          data: Data(bytes[2..<(2 + evenCount)]),
+          encoding: .utf16BigEndian
+        )
+      {
+        return decoded
+      }
+    }
+    return String(decoding: bytes, as: UTF8.self)
   }
 
   /// 下载当前音频的同源 LRC 文本，并限制大小和字符集以控制内存使用。
@@ -681,8 +802,9 @@ final class MediaPlaybackClient {
   }
 
   /// 加载本地或云盘存储音视频播放清单：
-  /// - 所有非 `.strm` 存储文件均优先通过 `stream-ticket` + `stream-info` 获取 HTTP Range 流地址与同名 LRC 歌词，实现边加载边播放；
-  /// - 仅当 `.strm` 指针文件、存储不支持 Range 流式读取或旧版后端无票据能力时，回退至 `POST /api/v1/storage/download` 缓存临时文件播放。
+  /// - 所有非 `.strm` 音视频文件严格通过 `stream-ticket` + `stream-info` 获取 HTTP Range 流地址与同名 LRC 歌词，边加载边播放，
+  ///   严禁回退 `POST /api/v1/storage/download` 下载整部媒体文件（避免在服务端 `TEMP_PATH` 与本机临时目录产生大体积副本）；
+  /// - 仅远端 `.strm` 轻量文本指针文件（`<= 64 KB`）在无流票据时读取直链。
   func loadStorageFileManifest(
     storage: String, path: String, fileName: String, isAudio: Bool
   ) async throws -> MediaPlaybackManifest {
@@ -691,10 +813,10 @@ final class MediaPlaybackClient {
       (fileName as NSString).pathExtension.isEmpty
       ? (path as NSString).pathExtension
       : (fileName as NSString).pathExtension
+    let isStrm = PlayableMediaFormat.isStrmExtension(extForTicket)
     let shouldTryStreamTicket =
       !normalizedStorage.isEmpty
-      && (normalizedStorage.lowercased() == "local"
-        || !PlayableMediaFormat.isStrmExtension(extForTicket))
+      && (normalizedStorage.lowercased() == "local" || !isStrm)
     if shouldTryStreamTicket {
       if let ticketId = try await createStorageStreamTicket(
         storage: normalizedStorage, path: path, fileName: fileName, isAudio: isAudio)
@@ -706,9 +828,15 @@ final class MediaPlaybackClient {
         } catch MediaPlaybackError.unauthorized {
           throw MediaPlaybackError.unauthorized
         } catch {
-          // 票据拉流失败时平滑降级到兼容下载路径
+          if !isStrm {
+            throw MediaPlaybackError.streamingUnsupported
+          }
         }
+      } else if !isStrm {
+        throw MediaPlaybackError.streamingUnsupported
       }
+    } else if !isStrm {
+      throw MediaPlaybackError.streamingUnsupported
     }
 
     let url = endpoint(["api", "v1", "storage", "download"])
@@ -726,61 +854,49 @@ final class MediaPlaybackClient {
     request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
     CloudflareAccessCredentialRegistry.shared.applyHeaders(to: &request, for: address)
     request.httpBody = try JSONEncoder().encode(payload)
-    let (tempURL, response) = try await session.download(for: request)
+    let (bytes, response) = try await session.bytes(for: request)
     guard let response = response as? HTTPURLResponse else {
       throw MediaPlaybackError.unavailable
     }
     if response.statusCode == 401 {
-      try? FileManager.default.removeItem(at: tempURL)
       throw MediaPlaybackError.unauthorized
     }
     if response.statusCode == 403 {
-      let sample = (try? Data(contentsOf: tempURL, options: .mappedIfSafe).prefix(4_096)) ?? Data()
-      try? FileManager.default.removeItem(at: tempURL)
-      if APIClient.isTokenInvalidForbiddenBody(Data(sample)) {
+      var sample = Data()
+      for try await byte in bytes.prefix(4_096) {
+        sample.append(byte)
+      }
+      if APIClient.isTokenInvalidForbiddenBody(sample) {
         throw MediaPlaybackError.unauthorized
       }
       throw MediaPlaybackError.unavailable
     }
     guard response.statusCode == 200 else {
-      try? FileManager.default.removeItem(at: tempURL)
       throw MediaPlaybackError.unavailable
     }
-    let resolvedExt = ext.isEmpty ? (path as NSString).pathExtension : ext
-    if PlayableMediaFormat.isStrmExtension(resolvedExt) {
-      defer { try? FileManager.default.removeItem(at: tempURL) }
-      guard
-        let strmData = try? Data(contentsOf: tempURL, options: .mappedIfSafe),
-        let spec = PlayableMediaFormat.parseStrmData(strmData, fallbackFileName: fileName)
-      else {
+    if response.expectedContentLength > 65_536 {
+      throw MediaPlaybackError.unavailable
+    }
+    var strmData = Data()
+    strmData.reserveCapacity(1_024)
+    for try await byte in bytes {
+      strmData.append(byte)
+      if strmData.count > 65_536 {
         throw MediaPlaybackError.unavailable
       }
-      let cleanTitle = (fileName as NSString).deletingPathExtension
-      return MediaPlaybackManifest(
-        itemId: "file:\(storage):\(path)",
-        server: nil,
-        title: cleanTitle.isEmpty ? fileName : cleanTitle,
-        contentUrl: spec.url,
-        strmUrl: spec.url,
-        customHeaders: spec.headers,
-        mediaType: spec.kind.rawValue,
-        artist: nil,
-        album: nil,
-        subtitles: [],
-        lyricsUrl: nil
-      )
     }
-    let destination = FileManager.default.temporaryDirectory
-      .appendingPathComponent("moviepilot-play-\(UUID().uuidString)")
-      .appendingPathExtension(resolvedExt.isEmpty ? (isAudio ? "mp3" : "mp4") : resolvedExt)
-    try? FileManager.default.removeItem(at: destination)
-    try FileManager.default.moveItem(at: tempURL, to: destination)
+    guard let spec = PlayableMediaFormat.parseStrmData(strmData, fallbackFileName: fileName) else {
+      throw MediaPlaybackError.unavailable
+    }
+    let cleanTitle = (fileName as NSString).deletingPathExtension
     return MediaPlaybackManifest(
       itemId: "file:\(storage):\(path)",
       server: nil,
-      title: fileName,
-      contentUrl: destination,
-      mediaType: isAudio ? "audio" : "video",
+      title: cleanTitle.isEmpty ? fileName : cleanTitle,
+      contentUrl: spec.url,
+      strmUrl: spec.url,
+      customHeaders: spec.headers,
+      mediaType: spec.kind.rawValue,
       artist: nil,
       album: nil,
       subtitles: [],
@@ -903,16 +1019,30 @@ final class MediaPlaybackClient {
       && (server == nil || queryItems.first(where: { $0.name == "server" })?.value == server)
   }
 
-  /// 封面只能经当前实例图片代理；源站访问和 DNS 安全校验由后端负责。
+  /// 封面只能经当前实例图片代理或全局图片缓存端点；源站访问和 DNS 安全校验由后端负责。
   private func isTrustedArtworkURL(_ url: URL) -> Bool {
     guard address.contains(url), url.user == nil, url.password == nil, url.fragment == nil,
-      url.path == endpoint(["api", "v1", "system", "img", "0"]).path,
       let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
+      Set(queryItems.map(\.name)).count == queryItems.count
+    else { return false }
+    if url.path == endpoint(["api", "v1", "system", "cache", "image"]).path {
+      guard queryItems.count == 1,
+        let sourceValue = queryItems.first(where: { $0.name == "url" })?.value,
+        let source = URL(string: sourceValue),
+        ["http", "https"].contains(source.scheme?.lowercased() ?? ""),
+        source.host != nil, source.user == nil, source.password == nil, source.fragment == nil
+      else { return false }
+      return true
+    }
+    let allowedProxyPaths: Set<String> = [
+      endpoint(["api", "v1", "system", "img", "0"]).path,
+      endpoint(["api", "v1", "system", "img", "1"]).path,
+    ]
+    guard allowedProxyPaths.contains(url.path),
       (1...5).contains(queryItems.count),
       queryItems.allSatisfy({
         ["imgurl", "cache", "use_cookies", "maxWidth", "quality"].contains($0.name)
       }),
-      Set(queryItems.map(\.name)).count == queryItems.count,
       let sourceValue = queryItems.first(where: { $0.name == "imgurl" })?.value,
       let source = URL(string: sourceValue),
       ["http", "https"].contains(source.scheme?.lowercased() ?? ""),
@@ -926,6 +1056,7 @@ final class MediaPlaybackClient {
 enum MediaPlaybackError: LocalizedError {
   case unavailable
   case unauthorized
+  case streamingUnsupported
   case subtitleUnavailable
   case lyricsUnavailable
   case artworkUnavailable
@@ -935,6 +1066,8 @@ enum MediaPlaybackError: LocalizedError {
     switch self {
     case .unavailable: L10n.text("无法读取播放信息，请确认影片仍在媒体库中并检查后台连接。")
     case .unauthorized: L10n.text("登录已过期，请重新登录。")
+    case .streamingUnsupported:
+      L10n.text("当前存储或后端版本暂不支持在线流式播放，请升级 MoviePilot 后端或检查存储配置。")
     case .subtitleUnavailable: L10n.text("字幕读取失败，请选择其他字幕或检查后台连接。")
     case .lyricsUnavailable: L10n.text("无法读取本地歌词。")
     case .artworkUnavailable: L10n.text("无法读取专辑封面。")
@@ -1165,6 +1298,9 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
   private var nowPlayingArtwork: MPMediaItemArtwork?
   private var subtitleFiles: [URL] = []
   private var activeSubtitleFile: URL?
+  private var downloadedSubtitleCache: [String: URL] = [:]
+  private var loadingExternalSubtitleID: String?
+  private var failedExternalSubtitleIDs: Set<String> = []
   private var lyricCues: [MediaPlaybackLyricCue] = []
   private var hasPlainLyrics = false
   private var lyricButtons: [UIButton] = []
@@ -1690,8 +1826,10 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
           state: anySelected ? .off : .on
         ) { [weak self] _ in
           guard let self else { return }
+          self.cancelPendingExternalSubtitleLoad()
           self.activeExternalSubtitleID = nil
           self.engine?.deselectAllSubtitles()
+          self.videoMoreButton.menu = self.makePlaybackMenu()
           self.reportPlaybackEvent(.trackChange)
           self.showControls()
         }
@@ -1705,20 +1843,29 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
             state: selected ? .on : .off
           ) { [weak self] _ in
             guard let self else { return }
+            self.cancelPendingExternalSubtitleLoad()
             self.activeExternalSubtitleID = nil
             self.engine?.selectSubtitleTrack(id: track.id)
+            self.videoMoreButton.menu = self.makePlaybackMenu()
             self.reportPlaybackEvent(.trackChange)
             self.showControls()
           })
       }
       for subtitle in manifest.subtitles {
         let selected = activeExternalSubtitleID == subtitle.subtitleId
+        let isLoading = loadingExternalSubtitleID == subtitle.subtitleId
+        let isFailed = !isLoading && failedExternalSubtitleIDs.contains(subtitle.subtitleId)
+        let statusHint: String? =
+          isLoading
+          ? L10n.text("正在加载外挂字幕…")
+          : (isFailed ? L10n.text("加载失败，点击重试") : nil)
         subtitleItems.append(
           UIAction(
             title: "\(subtitle.language ?? L10n.text("外挂")) · \(subtitle.title)",
+            subtitle: statusHint,
             state: selected ? .on : .off
           ) { [weak self] _ in
-            self?.loadSubtitle(subtitle)
+            self?.loadSubtitle(subtitle, isAutoSelection: false)
           })
       }
       subtitleElement = UIMenu(
@@ -2127,7 +2274,7 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
       fixedSquareControl(
         skipForwardButton, diameter: 50, storingSizeConstraintsIn: &audioSkipSizeConstraints))
 
-    // 底部三联实用按钮：歌词视图切换、AirPlay 输出、队列/倍速
+    // 底部实用按钮：歌词视图切换、AirPlay 输出与多曲播放队列（播放倍速统一收纳于右上角菜单）
     configureMusicUtilityButton(
       lyricsToggleButton, symbol: "quote.bubble", accessibility: L10n.text("切换全屏歌词"))
     lyricsToggleButton.accessibilityIdentifier = "music-playback-lyrics-toggle"
@@ -2139,26 +2286,27 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
     routePicker.tintColor = UIColor.white.withAlphaComponent(0.78)
     routePicker.accessibilityIdentifier = "music-playback-output"
 
-    configureMusicUtilityButton(
-      musicQueueButton,
-      symbol: queue.count > 1 ? "list.bullet" : "speedometer",
-      accessibility: queue.count > 1 ? L10n.text("播放队列") : L10n.text("播放速度"))
-    musicQueueButton.addAction(
-      UIAction { [weak self] _ in
-        guard let self else { return }
-        if self.queue.count > 1 { self.showQueueMenu() } else { self.showSpeedMenu() }
-      }, for: .touchUpInside)
-
-    let utilityBar = UIStackView(arrangedSubviews: [
+    var utilityViews: [UIView] = [
       fixedSquareControl(
         lyricsToggleButton, diameter: 42, storingSizeConstraintsIn: &audioUtilitySizeConstraints),
       UIView(),
       fixedSquareControl(
         routePicker, diameter: 42, storingSizeConstraintsIn: &audioUtilitySizeConstraints),
-      UIView(),
-      fixedSquareControl(
-        musicQueueButton, diameter: 42, storingSizeConstraintsIn: &audioUtilitySizeConstraints),
-    ])
+    ]
+    if queue.count > 1 {
+      configureMusicUtilityButton(
+        musicQueueButton,
+        symbol: "list.bullet",
+        accessibility: L10n.text("播放队列"))
+      musicQueueButton.addAction(
+        UIAction { [weak self] _ in self?.showQueueMenu() }, for: .touchUpInside)
+      utilityViews.append(UIView())
+      utilityViews.append(
+        fixedSquareControl(
+          musicQueueButton, diameter: 42, storingSizeConstraintsIn: &audioUtilitySizeConstraints))
+    }
+
+    let utilityBar = UIStackView(arrangedSubviews: utilityViews)
     utilityBar.axis = .horizontal
     utilityBar.alignment = .center
 
@@ -3265,19 +3413,23 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
           let matchedSub = manifest.subtitles.first(where: { $0.subtitleId == extID })
         {
           appliedSubtitleSelection = true
-          loadSubtitle(matchedSub)
-        } else if !textTracks.isEmpty {
-          if let ordinal = selection.subtitleOrdinal, textTracks.indices.contains(ordinal) {
-            engine.selectSubtitleTrack(id: textTracks[ordinal].id)
-            appliedSubtitleSelection = true
-          } else if let lang = selection.subtitleLanguage?.lowercased(),
-            let matched = textTracks.first(where: { track in
-              let hay = "\(track.language ?? "") \(track.label)".lowercased()
-              return hay.contains(lang)
-            })
-          {
+          loadSubtitle(matchedSub, isAutoSelection: true)
+        } else if let ordinal = selection.subtitleOrdinal, textTracks.indices.contains(ordinal) {
+          engine.selectSubtitleTrack(id: textTracks[ordinal].id)
+          appliedSubtitleSelection = true
+        } else if let lang = selection.subtitleLanguage?.lowercased() {
+          if let matched = textTracks.first(where: { track in
+            let hay = "\(track.language ?? "") \(track.label)".lowercased()
+            return hay.contains(lang)
+          }) {
             engine.selectSubtitleTrack(id: matched.id)
             appliedSubtitleSelection = true
+          } else if let matchedExt = manifest.subtitles.first(where: { sub in
+            let hay = "\(sub.language ?? "") \(sub.title)".lowercased()
+            return hay.contains(lang)
+          }) {
+            appliedSubtitleSelection = true
+            loadSubtitle(matchedExt, isAutoSelection: true)
           }
         }
       } else {
@@ -3300,7 +3452,7 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
           return chineseKeywords.contains { hay.contains($0) }
         }) {
           appliedSubtitleSelection = true
-          loadSubtitle(matchedExternal)
+          loadSubtitle(matchedExternal, isAutoSelection: true)
         }
       }
     }
@@ -4317,15 +4469,42 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
     if !isAudioPlayback && !isLocked { showControls() }
   }
 
-  /// 展示短暂的快进/快退悬浮反馈胶囊。
-  private func presentSeekHud(_ text: String) {
+  /// 展示短暂的快进/快退或状态悬浮反馈胶囊（若外挂字幕仍在加载且本次提示结束，自动恢复加载胶囊）。
+  private func presentSeekHud(_ text: String, holdMilliseconds: Int = 900) {
     seekHudTask?.cancel()
     seekHudLabel.text = "  \(text)  "
     UIView.animate(withDuration: 0.14) { self.seekHudLabel.alpha = 1 }
     seekHudTask = Task { [weak self] in
-      try? await Task.sleep(for: .milliseconds(750))
+      try? await Task.sleep(for: .milliseconds(holdMilliseconds))
       guard !Task.isCancelled, let self else { return }
-      UIView.animate(withDuration: 0.25) { self.seekHudLabel.alpha = 0 }
+      if self.loadingExternalSubtitleID != nil && !self.isAudioPlayback {
+        self.seekHudLabel.text = "  \(L10n.text("正在加载外挂字幕…"))  "
+        UIView.animate(withDuration: 0.14) { self.seekHudLabel.alpha = 1 }
+      } else {
+        UIView.animate(withDuration: 0.25) { self.seekHudLabel.alpha = 0 }
+      }
+    }
+  }
+
+  /// 在慢速外挂字幕（如实时字体子集化）下载期间展示非阻塞悬浮提示。
+  private func presentSubtitleLoadingHud() {
+    guard !isAudioPlayback else { return }
+    seekHudTask?.cancel()
+    seekHudTask = nil
+    seekHudLabel.text = "  \(L10n.text("正在加载外挂字幕…"))  "
+    UIView.animate(withDuration: 0.14) { self.seekHudLabel.alpha = 1 }
+  }
+
+  /// 取消进行中的外挂字幕下载并收起加载提示。
+  private func cancelPendingExternalSubtitleLoad() {
+    subtitleTask?.cancel()
+    subtitleTask = nil
+    let wasLoading = loadingExternalSubtitleID != nil
+    loadingExternalSubtitleID = nil
+    if wasLoading {
+      seekHudTask?.cancel()
+      seekHudTask = nil
+      UIView.animate(withDuration: 0.2) { self.seekHudLabel.alpha = 0 }
     }
   }
 
@@ -4628,10 +4807,11 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
 
   /// 清理已下载的上一集外挂字幕临时文件，避免缓存堆积。
   private func cleanupTemporarySubtitles() {
-    subtitleTask?.cancel()
-    subtitleTask = nil
+    cancelPendingExternalSubtitleLoad()
     let oldFiles = subtitleFiles
     subtitleFiles.removeAll()
+    downloadedSubtitleCache.removeAll()
+    failedExternalSubtitleIDs.removeAll()
     activeSubtitleFile = nil
     activeExternalSubtitleID = nil
     guard !oldFiles.isEmpty else { return }
@@ -4924,8 +5104,10 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
       UIAlertAction(title: "\(anySelected ? "" : "✓ ")\(L10n.text("关闭字幕"))", style: .default) {
         [weak self] _ in
         guard let self else { return }
+        self.cancelPendingExternalSubtitleLoad()
         self.activeExternalSubtitleID = nil
         self.engine?.deselectAllSubtitles()
+        self.videoMoreButton.menu = self.makePlaybackMenu()
         self.reportPlaybackEvent(.trackChange)
       })
     for track in tracks {
@@ -4934,30 +5116,89 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
       alert.addAction(
         UIAlertAction(title: "\(prefix)\(L10n.format("内嵌 · %@", name))", style: .default) {
           [weak self] _ in
-          self?.activeExternalSubtitleID = nil
-          self?.engine?.selectSubtitleTrack(id: track.id)
-          self?.reportPlaybackEvent(.trackChange)
+          guard let self else { return }
+          self.cancelPendingExternalSubtitleLoad()
+          self.activeExternalSubtitleID = nil
+          self.engine?.selectSubtitleTrack(id: track.id)
+          self.videoMoreButton.menu = self.makePlaybackMenu()
+          self.reportPlaybackEvent(.trackChange)
         })
     }
     for subtitle in manifest.subtitles {
       let prefix = activeExternalSubtitleID == subtitle.subtitleId ? "✓ " : ""
+      let isLoading = loadingExternalSubtitleID == subtitle.subtitleId
+      let isFailed = !isLoading && failedExternalSubtitleIDs.contains(subtitle.subtitleId)
+      let suffix =
+        isLoading
+        ? " · \(L10n.text("加载中…"))"
+        : (isFailed ? " · \(L10n.text("加载失败，点击重试"))" : "")
       alert.addAction(
         UIAlertAction(
-          title: "\(prefix)\(subtitle.language ?? L10n.text("外挂")) · \(subtitle.title)",
+          title: "\(prefix)\(subtitle.language ?? L10n.text("外挂")) · \(subtitle.title)\(suffix)",
           style: .default
         ) { [weak self] _ in
-          self?.loadSubtitle(subtitle)
+          self?.loadSubtitle(subtitle, isAutoSelection: false)
         })
     }
     alert.addAction(UIAlertAction(title: L10n.text("取消"), style: .cancel))
     presentActionSheet(alert, from: playbackMenuButton ?? topBar)
   }
 
-  /// 通过当前授权下载用户所选外挂字幕并挂载到当前内核；若系统原生内核不支持则自动热切至全能内核挂载。
-  private func loadSubtitle(_ subtitle: MediaPlaybackSubtitle) {
+  /// 将已落盘的外挂字幕文件挂载到当前播放内核；若系统 `AVPlayer` 原生内核不支持外挂或特效内嵌字体，自动无缝热切至 `MPV` 全能内核。
+  private func attachDownloadedSubtitleFile(_ fileURL: URL, for subtitle: MediaPlaybackSubtitle) {
+    activeSubtitleFile = fileURL
+    activeExternalSubtitleID = subtitle.subtitleId
+    failedExternalSubtitleIDs.remove(subtitle.subtitleId)
+    let isAssSubtitle = ["ass", "ssa"].contains(fileURL.pathExtension.lowercased())
+    let shouldPreferMpvForAss =
+      isAssSubtitle
+      && !PlaybackEnginePreferences.ignoreAssStyle
+      && activeEngineKind == .native
+    let attached =
+      shouldPreferMpvForAss ? false : (engine?.addExternalSubtitle(fileURL: fileURL) ?? false)
+    if !attached && activeEngineKind != .enhanced {
+      let reason =
+        isAssSubtitle
+        ? L10n.text("检测到 ASS 特效字幕，已切换至 MPV 全能")
+        : L10n.format("已切换至 %@", engineDisplayName(.enhanced))
+      switchEngine(
+        to: .enhanced,
+        reasonMessage: reason,
+        pendingSubtitleFile: fileURL
+      )
+    } else {
+      videoMoreButton.menu = makePlaybackMenu()
+      presentSeekHud(L10n.format("字幕：%@", subtitle.title), holdMilliseconds: 1_200)
+      reportPlaybackEvent(.trackChange)
+      showControls()
+    }
+  }
+
+  /// 通过当前授权下载用户所选外挂字幕并挂载到当前内核；加载期间显示非阻塞提示，失败时标记可重试状态。
+  private func loadSubtitle(_ subtitle: MediaPlaybackSubtitle, isAutoSelection: Bool = false) {
     guard let client else { return }
-    guard activeExternalSubtitleID != subtitle.subtitleId else { return }
+    if activeExternalSubtitleID == subtitle.subtitleId && loadingExternalSubtitleID == nil {
+      return
+    }
+    if loadingExternalSubtitleID == subtitle.subtitleId {
+      return
+    }
+    if let cachedURL = downloadedSubtitleCache[subtitle.subtitleId],
+      FileManager.default.fileExists(atPath: cachedURL.path)
+    {
+      cancelPendingExternalSubtitleLoad()
+      attachDownloadedSubtitleFile(cachedURL, for: subtitle)
+      return
+    }
+
     subtitleTask?.cancel()
+    loadingExternalSubtitleID = subtitle.subtitleId
+    failedExternalSubtitleIDs.remove(subtitle.subtitleId)
+    if !isAudioPlayback {
+      videoMoreButton.menu = makePlaybackMenu()
+      presentSubtitleLoadingHud()
+    }
+
     subtitleTask = Task { [weak self] in
       guard let self else { return }
       do {
@@ -4966,22 +5207,25 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
           try? FileManager.default.removeItem(at: fileURL)
           return
         }
+        self.loadingExternalSubtitleID = nil
         self.subtitleFiles.append(fileURL)
-        self.activeSubtitleFile = fileURL
-        self.activeExternalSubtitleID = subtitle.subtitleId
-        let attached = self.engine?.addExternalSubtitle(fileURL: fileURL) ?? false
-        if !attached && self.activeEngineKind != .enhanced {
-          self.switchEngine(
-            to: .enhanced,
-            reasonMessage: L10n.format("已切换至 %@", self.engineDisplayName(.enhanced)),
-            pendingSubtitleFile: fileURL
-          )
-        } else {
-          self.showControls()
-        }
+        self.downloadedSubtitleCache[subtitle.subtitleId] = fileURL
+        self.attachDownloadedSubtitleFile(fileURL, for: subtitle)
       } catch {
-        guard !Task.isCancelled else { return }
-        self.showError(error.localizedDescription)
+        guard !Task.isCancelled, !self.closed else { return }
+        if self.loadingExternalSubtitleID == subtitle.subtitleId {
+          self.loadingExternalSubtitleID = nil
+        }
+        self.failedExternalSubtitleIDs.insert(subtitle.subtitleId)
+        if !self.isAudioPlayback {
+          self.videoMoreButton.menu = self.makePlaybackMenu()
+          self.presentSeekHud(
+            isAutoSelection
+              ? L10n.text("外挂字幕加载失败，可在菜单中点击重试")
+              : L10n.text("外挂字幕加载失败，请再次点击重试"),
+            holdMilliseconds: 2_000
+          )
+        }
       }
     }
   }
@@ -5106,6 +5350,9 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
     let filesSnapshot = filesToClean
     let leaseToRelease = securityScopeLease
     subtitleFiles.removeAll()
+    downloadedSubtitleCache.removeAll()
+    loadingExternalSubtitleID = nil
+    failedExternalSubtitleIDs.removeAll()
     activeSubtitleFile = nil
 
     let audioSessionLock = Self.activeAudioSessions

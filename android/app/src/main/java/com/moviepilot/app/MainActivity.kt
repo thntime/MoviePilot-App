@@ -21,9 +21,11 @@ import coil.Coil
 import coil.ImageLoader
 import coil.decode.DataSource
 import coil.decode.ImageSource
+import coil.disk.DiskCache
 import coil.fetch.FetchResult
 import coil.fetch.Fetcher
 import coil.fetch.SourceResult
+import coil.memory.MemoryCache
 import coil.request.Options
 import com.moviepilot.designsystem.LocalMoviePilotColors
 import com.moviepilot.designsystem.MoviePilotTheme
@@ -32,6 +34,7 @@ import com.moviepilot.designsystem.NativeAppearanceStore
 import com.moviepilot.media.LocalMediaMetadataExtractor
 import com.moviepilot.media.MediaPlaybackRequest
 import com.moviepilot.media.PlaybackPipBridge
+import com.moviepilot.pluginhost.runtime.AndroidPluginCapsuleManager
 import com.moviepilot.rustbridge.CloudflareAccessOAuthManager
 import com.moviepilot.rustbridge.MoviePilotRepository
 import com.moviepilot.rustbridge.SessionState
@@ -68,6 +71,7 @@ class MainActivity : ComponentActivity() {
                     repository.transport.buildImageClient(
                         serverUrlProvider = { (repository.session.value as? SessionState.Authenticated)?.serverUrl },
                         tokenProvider = { (repository.session.value as? SessionState.Authenticated)?.token },
+                        externalFallbackUrlProvider = { externalUrl -> repository.buildExternalImageFallbackUrl(externalUrl) },
                     )
                 }
                 .components {
@@ -83,7 +87,20 @@ class MainActivity : ComponentActivity() {
                         },
                     )
                 }
-                .crossfade(true)
+                .memoryCache {
+                    MemoryCache.Builder(applicationContext)
+                        .maxSizePercent(0.25)
+                        .build()
+                }
+                .diskCache {
+                    DiskCache.Builder()
+                        .directory(applicationContext.cacheDir.resolve("image_cache"))
+                        .maxSizeBytes(256L * 1024L * 1024L)
+                        .build()
+                }
+                .respectCacheHeaders(false)
+                .allowRgb565(true)
+                .crossfade(120)
                 .build(),
         )
         appearanceStore = NativeAppearanceStore(applicationContext)
@@ -123,6 +140,18 @@ class MainActivity : ComponentActivity() {
                     onConsumeExternalMedia = { pendingExternalMedia = null },
                 )
             }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        AndroidPluginCapsuleManager.onHostAppForegrounded(applicationContext)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (!isChangingConfigurations) {
+            AndroidPluginCapsuleManager.onHostAppBackgrounded(applicationContext)
         }
     }
 

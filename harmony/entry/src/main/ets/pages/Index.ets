@@ -32,6 +32,7 @@ import {
   MpImageLoader,
   MpMediaItem,
   MpCastMember,
+  MpSeasonInfo,
   MoviePilotRepository,
   HarmonyUsageReporter
 } from '@moviepilot/core_rust_bridge';
@@ -44,6 +45,7 @@ import {
 } from '@moviepilot/discover';
 import {
   HarmonyMediaDetailPage,
+  HarmonyMediaSeasonDetailPage,
   HarmonyMediaServerDetailPage,
   HarmonyPersonDetailPage
 } from '@moviepilot/media';
@@ -54,6 +56,11 @@ import { HarmonyDashboardPage, HarmonyDiagnosticsPage, HarmonyMoreHubPage } from
 import { HarmonyWorkflowCanvasPage, HarmonySitesPage } from '@moviepilot/automation';
 import { HarmonyAgentChatPage } from '@moviepilot/agent';
 import { HarmonySettingsHubPage, HarmonyPluginsPage } from '@moviepilot/settings';
+import {
+  HarmonyGlobalVuePluginOverlay,
+  HarmonyPluginCapsuleManager,
+  HarmonyPluginFloatingCapsule
+} from '@moviepilot/plugin_host';
 
 import EntryAbility from '../entryability/EntryAbility';
 
@@ -99,7 +106,14 @@ struct Index {
   @State private activeLibraryId: string = '';
   @State private activeLibraryServer: string = '';
   @State private resourceSearchKeyword: string = '';
+  @State private subscribeHistoryType: string = '电影';
   @State private selectedMedia: MpMediaItem | null = null;
+  @State private selectedSeasonSeries: MpMediaItem | null = null;
+  @State private selectedSeasonInfo: MpSeasonInfo = {
+    seasonNumber: 1, name: '第 1 季', episodeCount: 0, airDate: '', posterUrl: '', overview: ''
+  };
+  @State private selectedSeasonSeriesItemId: string = '';
+  @State private selectedSeasonServer: string = '';
   @State private selectedPerson: MpCastMember | null = null;
   @State private activePlayer: HarmonyPlaybackRequest | null = null;
   @State private miniMusic: HarmonyPlaybackRequest | null = null;
@@ -161,6 +175,7 @@ struct Index {
         repo.configureServer(activeSess.serverUrl, activeSess.allowSelfSigned);
         repo.setAuthToken(activeSess.token);
         repo.userLevel = this.userLevel;
+        repo.hydrateSession().catch(() => {});
         this.authStage = 'main';
         this.triggerUsageReportIfAdmin();
         this.consumePendingIntents();
@@ -309,6 +324,22 @@ struct Index {
         this.routeStack = ['sites'];
       } else if (kind === 'plugins') {
         this.routeStack = ['plugins'];
+      } else if (kind === 'pluginDetail') {
+        const pid = String(obj['plugin_id'] ?? '').trim();
+        const surf = String(obj['surface'] ?? '').toLowerCase() === 'config' ? 'config' : 'dataPage';
+        if (pid.length > 0) {
+          this.routeStack = ['plugins'];
+          MoviePilotRepository.shared().fetchPlugins('installed').then((list) => {
+            const found = list.find((p) => p.id.toLowerCase() === pid.toLowerCase());
+            if (found && found.renderMode.toLowerCase() === 'vue') {
+              HarmonyPluginCapsuleManager.shared().openPlugin(found.id, found.pluginName, surf, found.hasPage, found.iconUrl ?? '');
+            } else {
+              AppStorage.setOrCreate('mp_pending_open_plugin_id', `${pid}|${surf}`);
+            }
+          }).catch(() => {
+            AppStorage.setOrCreate('mp_pending_open_plugin_id', `${pid}|${surf}`);
+          });
+        }
       } else if (kind === 'agent') {
         this.routeStack = ['agent'];
       } else if (kind === 'music') {
@@ -498,7 +529,8 @@ struct Index {
     const repo = MoviePilotRepository.shared();
 
     try {
-      const shouldTryTicket = cleanStorage === 'local' || (!RustCoreBridge.isStrmPath(fileName) && !RustCoreBridge.isStrmPath(cleanPath));
+      const isStrm = RustCoreBridge.isStrmPath(fileName) || RustCoreBridge.isStrmPath(cleanPath);
+      const shouldTryTicket = cleanStorage === 'local' || !isStrm;
       if (shouldTryTicket) {
         const ticketId = await repo.createStorageStreamTicket(cleanStorage, cleanPath, fileName, kind === 'audio' ? 'audio' : 'video');
         if (ticketId.length > 0) {
@@ -510,6 +542,11 @@ struct Index {
         }
       }
 
+      // 严禁对真实音视频文件回退 storage/download 整文件下载，仅允许远端轻量 .strm 指针文件解析直链
+      if (!isStrm) {
+        return;
+      }
+
       const dotIdx = fileName.lastIndexOf('.');
       const ext = dotIdx >= 0 ? fileName.substring(dotIdx) : '';
       const hostCtx = this.getUIContext().getHostContext();
@@ -519,29 +556,17 @@ struct Index {
       }
       const cachedPath = await repo.downloadStorageFileToCache(cleanStorage, cleanPath, fileName, ext, cacheDir);
       if (cachedPath.length > 0) {
-        if (RustCoreBridge.isStrmPath(fileName) || RustCoreBridge.isStrmPath(cachedPath)) {
-          const strmSpec = resolveLocalStrmFile(cachedPath, true);
-          if (strmSpec) {
-            this.playMedia({
-              url: strmSpec.url,
-              headers: strmSpec.headers,
-              title: displayTitle.replace(/\.strm$/i, '') || displayTitle,
-              subtitle: cleanStorage,
-              isAudio: strmSpec.mediaKind === 'audio',
-              isSessionBound: false
-            });
-          }
-          return;
+        const strmSpec = resolveLocalStrmFile(cachedPath, true);
+        if (strmSpec) {
+          this.playMedia({
+            url: strmSpec.url,
+            headers: strmSpec.headers,
+            title: displayTitle.replace(/\.strm$/i, '') || displayTitle,
+            subtitle: cleanStorage,
+            isAudio: strmSpec.mediaKind === 'audio',
+            isSessionBound: false
+          });
         }
-        this.playMedia({
-          url: cachedPath,
-          fdPath: cachedPath,
-          cleanupTempOnClose: true,
-          title: displayTitle,
-          subtitle: cleanStorage,
-          isAudio: kind === 'audio',
-          isSessionBound: true
-        });
       }
     } catch {
       // ignore storage playback lookup error
@@ -573,6 +598,7 @@ struct Index {
     }
 
     if (returningFromMain && url !== this.serverUrl) {
+      HarmonyPluginCapsuleManager.shared().closeAndDestroy();
       if (HarmonyAudioSession.shared().stopIfSessionBound()) {
         this.miniMusic = null;
       }
@@ -609,6 +635,7 @@ struct Index {
       return;
     }
     this.serverSwitchReturnStage = '';
+    HarmonyPluginCapsuleManager.shared().closeAndDestroy();
     if (HarmonyAudioSession.shared().stopIfSessionBound()) {
       this.miniMusic = null;
     }
@@ -651,6 +678,9 @@ struct Index {
       } else {
         this.activePlayer = null;
       }
+      return true;
+    }
+    if (this.authStage === 'main' && HarmonyPluginCapsuleManager.shared().handleSystemBackPress()) {
       return true;
     }
     if (this.serverSwitchReturnStage.length > 0) {
@@ -716,6 +746,16 @@ struct Index {
         HarmonySubscriptionsPage({
           showBack: false,
           initialMode: 'mine',
+          onOpenCalendar: () => {
+            this.pushRoute('calendar');
+          },
+          onOpenSquare: () => {
+            this.pushRoute('subscribe_square');
+          },
+          onOpenHistory: (mtype: string) => {
+            this.subscribeHistoryType = mtype;
+            this.pushRoute('subscribe_history');
+          },
           onOpenMedia: (it: MpMediaItem) => this.openMediaSmart(it),
           onPlayServerItem: (itemId: string, server: string, title: string) => {
             this.playServerItemById(itemId, server, title);
@@ -818,6 +858,26 @@ struct Index {
             this.selectedPerson = person;
             this.pushRoute('person');
           },
+          onOpenSeasonDetail: (series: MpMediaItem, season: MpSeasonInfo, seriesItemId: string, srv: string) => {
+            this.selectedSeasonSeries = series;
+            this.selectedSeasonInfo = season;
+            this.selectedSeasonSeriesItemId = seriesItemId;
+            this.selectedSeasonServer = srv;
+            this.pushRoute('season_detail');
+          },
+          onPlayMedia: (req: HarmonyPlaybackRequest) => this.playMedia(req)
+        })
+      } else if (this.currentRoute() === 'season_detail' && this.selectedSeasonSeries) {
+        HarmonyMediaSeasonDetailPage({
+          seriesItem: this.selectedSeasonSeries,
+          initialSeason: this.selectedSeasonInfo,
+          initialSeriesItemId: this.selectedSeasonSeriesItemId,
+          initialServer: this.selectedSeasonServer,
+          onBack: () => this.popRoute(),
+          onSearchResource: (kw: string) => {
+            this.resourceSearchKeyword = kw;
+            this.pushRoute('resources');
+          },
           onPlayMedia: (req: HarmonyPlaybackRequest) => this.playMedia(req)
         })
       } else if (this.currentRoute() === 'person' && this.selectedPerson) {
@@ -826,11 +886,20 @@ struct Index {
           onBack: () => this.popRoute(),
           onOpenMedia: (it: MpMediaItem) => this.openMediaSmart(it)
         })
-      } else if (this.currentRoute() === 'calendar' || this.currentRoute() === 'subscribe_square') {
+      } else if (
+        this.currentRoute() === 'calendar' ||
+        this.currentRoute() === 'subscribe_square' ||
+        this.currentRoute() === 'subscribe_history'
+      ) {
         HarmonySubscriptionsPage({
           showBack: true,
-          initialTitle: this.currentRoute() === 'calendar' ? '追剧日历' : '订阅广场',
-          initialMode: this.currentRoute() === 'calendar' ? 'calendar' : 'square',
+          initialTitle: this.currentRoute() === 'calendar'
+            ? '追剧日历'
+            : (this.currentRoute() === 'subscribe_square' ? '订阅广场' : '订阅历史'),
+          initialMode: this.currentRoute() === 'calendar'
+            ? 'calendar'
+            : (this.currentRoute() === 'subscribe_square' ? 'square' : 'history'),
+          initialHistoryType: this.subscribeHistoryType,
           onBack: () => this.popRoute(),
           onOpenMedia: (it: MpMediaItem) => this.openMediaSmart(it),
           onPlayServerItem: (itemId: string, server: string, title: string) => {
@@ -1145,6 +1214,25 @@ struct Index {
           }
         })
           .margin({ bottom: Math.max(16, this.safeBottomVp + 8) })
+      }
+
+      if (!this.hydratingSession && this.authStage === 'main' && !this.activePlayer) {
+        HarmonyPluginFloatingCapsule()
+          .position({
+            right: 16 + this.safeRightVp,
+            bottom: (this.routeStack.length === 0 && !this.isWideLayout() ? 94 : 24) + Math.max(10, this.safeBottomVp)
+          })
+
+        HarmonyGlobalVuePluginOverlay({
+          serverUrl: this.serverUrl,
+          authToken: MoviePilotRepository.shared().token,
+          userName: this.userName,
+          userAvatar: this.userAvatar,
+          isSuperuser: this.isSuperuser,
+          onFallbackToLegacy: (_pid: string, _surf: string) => {
+            this.routeStack = ['plugins'];
+          }
+        })
       }
 
       if (this.activePlayer) {

@@ -114,8 +114,10 @@ class NativeFixture(ThreadingHTTPServer):
                     },
                     {
                         "id": 20, "name": "native-b", "email": "member@example.test",
-                        "is_active": True, "is_superuser": False, "is_otp": False,
-                        "permissions": {"discovery": True, "search": True, "subscribe": True, "manage": False},
+                        "is_active": True, "is_superuser": False, "is_otp": True,
+                        "avatar": "synthetic-avatar", "settings": {"theme": "dark"},
+                        "permissions": {"discovery": True, "search": True, "subscribe": True, "manage": False,
+                                        "features": {"plugin.demo.main": False}},
                     },
                 ],
                 "user_configs": {},
@@ -254,6 +256,7 @@ class NativeHandler(BaseHTTPRequestHandler):
                     "ready", "new", "otp", "expired", "unavailable", "slow",
                     "discovery-only", "resource-search-only", "search-failed", "storage-failed",
                     "partial-discovery-failed", "subscribe-failed", "mediaserver",
+                    "logs-empty", "logs-failed",
                 }:
                     raise ValueError()
             except (KeyError, ValueError, TypeError):
@@ -411,7 +414,7 @@ class NativeHandler(BaseHTTPRequestHandler):
                 or re.fullmatch(r"api/v1/subscribe/media/[A-Za-z0-9_-]+", endpoint)
                 or re.fullmatch(r"api/v1/music/album/[A-Za-z0-9_-]+", endpoint)
                 or re.fullmatch(r"api/v1/music/artist/[A-Za-z0-9_-]+(?:/albums)?", endpoint)
-                or re.fullmatch(r"api/v1/agent/sessions/[A-Za-z0-9_-]+", endpoint)
+                or re.fullmatch(r"api/v1/message/agent/sessions/[A-Za-z0-9_-]+", endpoint)
             ):
                 self.business_endpoint(name, endpoint)
                 return
@@ -448,17 +451,23 @@ class NativeHandler(BaseHTTPRequestHandler):
             if endpoint in {"api/v1/workflow/actions", "api/v1/workflow/shares"} or re.fullmatch(r"api/v1/workflow/[0-9]+", endpoint):
                 self.workflow_read_endpoint(name, endpoint)
                 return
+            if endpoint == "api/v1/system/logging":
+                self.logging_endpoint(name)
+                return
+            if endpoint == "api/v1/system/global":
+                self.system_global_endpoint(name)
+                return
             if endpoint in {
                 "api/v1/system/nettest/targets", "api/v1/system/nettest",
                 "api/v1/system/modulelist", "api/v1/system/ruletest",
-                "api/v1/system/logging", "api/v1/system/runscheduler",
+                "api/v1/system/runscheduler",
                 "api/v1/system/global/user",
                 "api/v1/media/recognize",
             } or re.fullmatch(r"api/v1/system/(?:setting|moduletest)/[A-Za-z0-9_]+", endpoint):
                 self.system_setting_read_endpoint(name, endpoint)
                 return
-            if endpoint == "api/v1/system/img/0":
-                self.image_endpoint(name)
+            if endpoint in {"api/v1/system/img/0", "api/v1/system/img/1", "api/v1/system/cache/image"}:
+                self.image_endpoint(name, endpoint)
                 return
         if name in self.server.profiles and self.command == "POST":
             if endpoint == "api/v1/media/status":
@@ -494,7 +503,7 @@ class NativeHandler(BaseHTTPRequestHandler):
             if endpoint == "api/v1/subscribe/fork":
                 self.subscribe_fork_endpoint(name, body)
                 return
-            if endpoint == "api/v1/agent/stream":
+            if endpoint == "api/v1/message/agent/stream":
                 self.agent_stream_endpoint(name, body)
                 return
             if endpoint == "api/v1/mediaserver/progress":
@@ -513,10 +522,13 @@ class NativeHandler(BaseHTTPRequestHandler):
                     },
                 })
                 return
-            if re.fullmatch(r"api/v1/agent/sessions/[A-Za-z0-9_-]+/stop", endpoint):
+            if re.fullmatch(r"api/v1/message/agent/sessions/[A-Za-z0-9_-]+/stop", endpoint):
                 self.agent_stop_endpoint(name, endpoint)
                 return
         if name in self.server.profiles and self.command == "PUT":
+            if re.fullmatch(r"api/v1/message/agent/sessions/[A-Za-z0-9_-]+/display", endpoint):
+                self.agent_display_endpoint(name, endpoint, body)
+                return
             if path == f"/{name}/api/v1/subscribe/":
                 self.subscribe_update_endpoint(name, body)
                 return
@@ -550,7 +562,7 @@ class NativeHandler(BaseHTTPRequestHandler):
             if re.fullmatch(r"api/v1/plugin/[A-Za-z][A-Za-z0-9_]*", endpoint):
                 self.plugin_delete_endpoint(name, endpoint)
                 return
-            if re.fullmatch(r"api/v1/agent/sessions/[A-Za-z0-9_-]+", endpoint):
+            if re.fullmatch(r"api/v1/message/agent/sessions/[A-Za-z0-9_-]+", endpoint):
                 self.agent_session_delete_endpoint(name, endpoint)
                 return
         allowed = {
@@ -584,6 +596,7 @@ class NativeHandler(BaseHTTPRequestHandler):
         """列出 smoke 验收允许的媒体、来源与管理员仪表盘只读端点。"""
         return {
             "api/v1/discover/source",
+            "api/v1/recommend/source",
             "api/v1/discover/tmdb_movies",
             "api/v1/discover/tmdb_tvs",
             "api/v1/discover/douban_movies",
@@ -609,6 +622,7 @@ class NativeHandler(BaseHTTPRequestHandler):
             "api/v1/danmaku/config",
             "api/v1/media/search",
             "api/v1/media/source",
+            "api/v1/rule/groups",
             "api/v1/download/clients",
             "api/v1/download/paths",
             "api/v1/search/last",
@@ -622,8 +636,15 @@ class NativeHandler(BaseHTTPRequestHandler):
             "api/v1/subscribe/calendar",
             "api/v1/subscribe/popular",
             "api/v1/subscribe/shares",
-            "api/v1/agent/commands",
-            "api/v1/agent/sessions",
+            "api/v1/message/agent/commands",
+            "api/v1/message/agent/sessions",
+            "api/v1/dashboard/cpu",
+            "api/v1/dashboard/network",
+            "api/v1/dashboard/memory",
+            "api/v1/dashboard/downloader",
+            "api/v1/dashboard/system",
+            "api/v1/dashboard/transfer",
+            "api/v1/github/community",
             "api/v1/dashboard/statistic",
             "api/v1/dashboard/storage",
             "api/v1/dashboard/schedule",
@@ -668,7 +689,9 @@ class NativeHandler(BaseHTTPRequestHandler):
         }:
             self.reply(503, {"success": False})
             return
-        if endpoint in {"api/v1/discover/tmdb_movies", "api/v1/discover/tmdb_tvs"}:
+        if endpoint == "api/v1/recommend/source":
+            value = []
+        elif endpoint in {"api/v1/discover/tmdb_movies", "api/v1/discover/tmdb_tvs"}:
             is_movie = endpoint.endswith("tmdb_movies")
             first_id = 101 if is_movie else 111
             ids = range(first_id, first_id + 12) if page == "1" else [first_id + 12] if page == "2" else []
@@ -724,18 +747,18 @@ class NativeHandler(BaseHTTPRequestHandler):
                 "image_url": "https://images.example.test/111/poster.png",
                 "overview": "专注于影视原声与器乐编排的合成艺人。",
             }
-        elif endpoint == "api/v1/agent/commands":
+        elif endpoint == "api/v1/message/agent/commands":
             value = [
                 {"command": "/search", "description": "搜索影视资源"},
                 {"command": "/subscribe", "description": "查看订阅列表"},
             ]
-        elif endpoint == "api/v1/agent/sessions":
+        elif endpoint == "api/v1/message/agent/sessions":
             with self.server.lock:
                 value = [
                     {k: v for k, v in row.items() if k != "messages"}
                     for row in self.server.profiles[name]["agent_sessions"]
                 ]
-        elif re.fullmatch(r"api/v1/agent/sessions/[A-Za-z0-9_-]+", endpoint):
+        elif re.fullmatch(r"api/v1/message/agent/sessions/[A-Za-z0-9_-]+", endpoint):
             sid = endpoint.rsplit("/", 1)[-1]
             with self.server.lock:
                 matched = next((row for row in self.server.profiles[name]["agent_sessions"] if row["session_id"] == sid), None)
@@ -767,6 +790,8 @@ class NativeHandler(BaseHTTPRequestHandler):
                 value = []
         elif endpoint == "api/v1/media/source":
             value = [{"name": "TMDB", "media_source": "themoviedb", "media_types": ["电影", "电视剧"]}]
+        elif endpoint == "api/v1/rule/groups":
+            value = {"rule_groups": [{"name": "4K 优先", "rule_string": "", "media_type": "电影"}]}
         elif endpoint == "api/v1/download/clients":
             value = [{"name": "Qbittorrent", "type": "qbittorrent"}]
         elif endpoint == "api/v1/download/paths":
@@ -885,7 +910,10 @@ class NativeHandler(BaseHTTPRequestHandler):
                 "include": "中字", "total_episode": 12, "count": 18,
             }]
         elif endpoint == "api/v1/subscribe/calendar":
-            start = query.get("start", ["2026-11-15"])[0]
+            if not query.get("start") or not query.get("end"):
+                self.reply(422, {"detail": "start/end required"})
+                return
+            start = query["start"][0]
             value = {
                 "items": [{
                     "date": start,
@@ -899,6 +927,20 @@ class NativeHandler(BaseHTTPRequestHandler):
                 }],
                 "total": 1,
             }
+        elif endpoint == "api/v1/dashboard/cpu":
+            value = 23.5
+        elif endpoint == "api/v1/dashboard/network":
+            value = [1024.0, 2048.0]
+        elif endpoint == "api/v1/dashboard/memory":
+            value = {"total": 8_589_934_592, "used": 4_294_967_296, "cached": 0, "available": 4_294_967_296}
+        elif endpoint == "api/v1/dashboard/downloader":
+            value = {"download_speed": 1024, "upload_speed": 512, "download_size": 4096, "upload_size": 8192, "free_space": 1_073_741_824}
+        elif endpoint == "api/v1/dashboard/system":
+            value = {"hostname": "synthetic", "operating_system": "Fixture", "runtime": 600, "version": "v3-synthetic"}
+        elif endpoint == "api/v1/dashboard/transfer":
+            value = [1, 2, 0, 3, 1, 4, 2]
+        elif endpoint == "api/v1/github/community":
+            value = {"login": "synthetic", "medals": []}
         elif endpoint == "api/v1/dashboard/statistic":
             value = {
                 "movie_count": 12, "tv_count": 8, "episode_count": None,
@@ -1435,17 +1477,6 @@ class NativeHandler(BaseHTTPRequestHandler):
                 },
             })
             return
-        if endpoint == "api/v1/system/logging":
-            raw = (
-                "INFO 2026-11-21 09:50:01 MoviePilot 合成日志服务已就绪\n"
-                "WARNING 2026-11-21 09:50:02 合成节点延迟略高\n"
-            ).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-            return
         if endpoint == "api/v1/system/runscheduler":
             self.reply(200, {"success": True, "message": "", "data": None})
             return
@@ -1524,9 +1555,12 @@ class NativeHandler(BaseHTTPRequestHandler):
                 uid = payload.get("id")
                 for row in users:
                     if row["id"] == uid:
-                        row["email"] = payload.get("email", row.get("email"))
-                        row["is_active"] = bool(payload.get("is_active", row["is_active"]))
-                        row["permissions"] = payload.get("permissions", row["permissions"])
+                        row["email"] = payload.get("email")
+                        row["is_active"] = bool(payload.get("is_active", True))
+                        row["is_otp"] = bool(payload.get("is_otp", False))
+                        row["avatar"] = payload.get("avatar")
+                        row["settings"] = payload.get("settings") or {}
+                        row["permissions"] = payload.get("permissions") or {}
         self.reply(200, {"success": True, "message": "", "data": None})
 
     def user_config_update_endpoint(self, name, endpoint, body):
@@ -1547,6 +1581,61 @@ class NativeHandler(BaseHTTPRequestHandler):
         with self.server.lock:
             self.server.profiles[name]["user_configs"][cfg_key] = payload
         self.reply(200, {"success": True, "message": "", "data": None})
+
+    def logging_endpoint(self, name):
+        """还原资源 Cookie、管理员、倒序快照与正数 length 持续 SSE 的真实日志协议。"""
+        with self.server.lock:
+            profile = self.server.profiles[name]
+            profile["counts"]["GET api/v1/system/logging"] += 1
+            mode = profile["mode"]
+        if mode == "expired" or self.headers.get("Cookie") != f"MoviePilot={self.resource_token(name)}":
+            return self.reply(401, {"detail": "Not authenticated"})
+        if name != "a":
+            return self.reply(403, {"detail": "用户权限不足"})
+        query = parse_qs(urlsplit(self.path).query)
+        logfile = query.get("logfile", ["moviepilot.log"])[0]
+        if logfile not in {"moviepilot.log", "plugins/demoplugin.log"}:
+            return self.reply(404, {"detail": "Not Found"})
+        if mode == "logs-failed":
+            return self.reply(503, {"detail": "合成日志服务暂不可用"})
+        title = "合成插件日志" if logfile.startswith("plugins/") else "合成系统日志"
+        lines = [] if mode == "logs-empty" else [
+            f"INFO 2026-11-21 09:50:01 {title} {number:03d}"
+            for number in range(450, 0, -1)
+        ]
+        if lines and logfile.startswith("plugins/"):
+            lines[:4] = [
+                "INFO:     [MoviePilot] 2026-11-21 09:50:01,123 [-] demoplugin.py - 合成插件日志 450",
+                "【WARNING】2026-11-21 09:50:01,123 demoplugin.py - 合成插件日志 449",
+                "2026-11-21 09:50:01,123 [ERROR] [-] - demoplugin.py - 合成插件日志 448",
+                "[DEBUG] 2026-11-21 09:50:01,123 [-] - demoplugin.py - 合成插件日志 447",
+            ]
+        if query.get("length") == ["-1"]:
+            with self.server.lock:
+                profile["counts"]["log-snapshot"] += 1
+            raw = ("\n" + "\n\n".join(lines) if lines else "").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        with self.server.lock:
+            profile["counts"]["log-stream"] += 1
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            for line in lines[:50][::-1]:
+                self.wfile.write(f"data: {line}\n\n".encode())
+            while True:
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                time.sleep(0.5)
+        except OSError:
+            pass  # 客户端主动取消流后结束本连接，不污染测试输出。
 
     def plugin_list_endpoint(self, name):
         """按管理员权限返回插件市场或已安装原始数组载荷。"""
@@ -1721,13 +1810,14 @@ function createDemoComponent(Vue, mode) {
   const { defineComponent, h, ref, onMounted, resolveComponent } = Vue;
   return defineComponent({
     name: mode === 'Config' ? 'VueCompatDemoConfig' : 'VueCompatDemoPage',
+    emits: ['close', 'switch', 'save', 'action'],
     props: {
       api: { type: Object, required: true },
       hostSdk: { type: Object, default: null },
       initialConfig: { type: Object, default: () => ({}) },
       pluginId: { type: String, default: 'VueCompatDemo' },
     },
-    setup(props) {
+    setup(props, { emit }) {
       const apiStatus = ref('正在经 Native Bridge 请求状态…');
       const tokenAudit = ref('校验中…');
       const confirmResult = ref('尚未触发确认框');
@@ -1880,7 +1970,47 @@ function createDemoComponent(Vue, mode) {
               { class: 'mb-4', variant: 'flat' },
               {
                 default: () => [
-                  h(VCardTitle, null, () => '合成联邦插件运行正常'),
+                  h(
+                    'div',
+                    {
+                      style: {
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        padding: '12px 16px 4px',
+                        gap: '8px',
+                      },
+                    },
+                    [
+                      h(VCardTitle, { class: 'pa-0' }, () => '合成联邦插件运行正常'),
+                      h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, [
+                        h(
+                          VBtn,
+                          {
+                            size: 'small',
+                            variant: 'tonal',
+                            color: 'primary',
+                            onClick: () => {
+                              refreshCount.value += 1;
+                              loadStatus();
+                            },
+                          },
+                          () => '刷新状态'
+                        ),
+                        h(
+                          VBtn,
+                          {
+                            size: 'small',
+                            variant: 'tonal',
+                            color: 'secondary',
+                            'aria-label': '关闭插件',
+                            onClick: () => emit('close'),
+                          },
+                          () => '关闭插件'
+                        ),
+                      ]),
+                    ]
+                  ),
                   h(VCardText, null, () => [
                     h('div', { style: { marginBottom: '10px', fontSize: '14px' } }, apiStatus.value),
                     h(
@@ -2120,7 +2250,7 @@ export async function get(moduleName) {
         """返回标准 text/event-stream SSE 合成回复帧，包含工具调用与文本增量。"""
         with self.server.lock:
             profile = self.server.profiles[name]
-            profile["counts"]["POST api/v1/agent/stream"] += 1
+            profile["counts"]["POST api/v1/message/agent/stream"] += 1
             mode = profile["mode"]
         if mode == "expired" or self.headers.get("Authorization") != f"Bearer synthetic-native-{name}":
             self.reply(401, {"success": False})
@@ -2148,6 +2278,38 @@ export async function get(moduleName) {
             self.wfile.write(raw)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def agent_display_endpoint(self, name, endpoint, body):
+        """保存真实 Agent 展示消息合同，后续详情必须返回客户端提交的完整快照。"""
+        with self.server.lock:
+            profile = self.server.profiles[name]
+            profile["counts"][f"PUT {endpoint}"] += 1
+            expired = profile["mode"] == "expired"
+        if expired or self.headers.get("Authorization") != f"Bearer synthetic-native-{name}":
+            self.reply(401, {"success": False})
+            return
+        try:
+            payload = json.loads(body)
+            messages = payload.get("messages", [])
+            if not isinstance(messages, list) or any(
+                not isinstance(message, dict) or message.get("role") not in {"user", "assistant", "system", "tool"}
+                for message in messages
+            ):
+                raise ValueError("invalid display messages")
+        except (ValueError, TypeError, AttributeError):
+            self.reply(422, {"success": False})
+            return
+        sid = endpoint.split("/")[-2]
+        with self.server.lock:
+            row = next((row for row in profile["agent_sessions"] if row["session_id"] == sid), None)
+            if row is None:
+                row = {"session_id": sid}
+                profile["agent_sessions"].append(row)
+            row["messages"] = messages
+            row["message_count"] = len(messages)
+            row["title"] = payload.get("title") or "新会话"
+            summary = {key: value for key, value in row.items() if key != "messages"}
+        self.reply(200, {"success": True, "message": "", "data": summary})
 
     def agent_stop_endpoint(self, name, endpoint):
         """单次响应停止 Agent 任务请求。"""
@@ -2178,14 +2340,41 @@ export async function get(moduleName) {
         """模拟当前后端在带主令牌请求上签发短效同源 HttpOnly Cookie。"""
         return {"Set-Cookie": f"MoviePilot={self.resource_token(name)}; Path=/; HttpOnly; SameSite=Lax"}
 
-    def image_endpoint(self, name):
+    def system_global_endpoint(self, name):
+        """返回客户端启动时查询的非敏感全局图片与域名开关（对齐 /api/v1/system/global?token=moviepilot）。"""
+        query = parse_qs(urlsplit(self.path).query)
+        with self.server.lock:
+            profile = self.server.profiles[name]
+            profile["counts"]["GET api/v1/system/global"] += 1
+            mode = profile["mode"]
+            env = dict(profile["env"])
+        if mode == "unavailable":
+            self.reply(503, {"success": False})
+            return
+        if query.get("token", [""])[0] != "moviepilot":
+            self.reply(403, {"success": False})
+            return
+        self.reply(200, {
+            "success": True,
+            "message": "",
+            "data": {
+                "GLOBAL_IMAGE_CACHE": bool(env.get("GLOBAL_IMAGE_CACHE", False)),
+                "TMDB_IMAGE_DOMAIN": env.get("TMDB_IMAGE_DOMAIN", "image.tmdb.org"),
+                "BANGUMI_PROXY_ENABLE": bool(env.get("BANGUMI_PROXY_ENABLE", False)),
+                "BANGUMI_IMAGE_DOMAIN": env.get("BANGUMI_IMAGE_DOMAIN", ""),
+            },
+        })
+
+    def image_endpoint(self, name, endpoint="api/v1/system/img/0"):
         """仅接受同一实例的资源 Cookie，并确认客户端没有转发主令牌。"""
         with self.server.lock:
             profile = self.server.profiles[name]
-            profile["counts"]["GET api/v1/system/img/0"] += 1
+            profile["counts"][f"GET {endpoint}"] += 1
+            if endpoint != "api/v1/system/img/0":
+                profile["counts"]["GET api/v1/system/img/0"] += 1
             mode = profile["mode"]
         query = parse_qs(urlsplit(self.path).query)
-        reference = query.get("imgurl", [""])[0]
+        reference = (query.get("imgurl") or query.get("url") or [""])[0]
         if (
             mode == "expired" or self.headers.get("Authorization") is not None
             or self.headers.get("Cookie") != f"MoviePilot={self.resource_token(name)}"
@@ -2688,6 +2877,7 @@ export async function get(moduleName) {
         }
         if mode == "resource-search-only":
             permissions["discovery"] = False
+            permissions["subscribe"] = False
         elif mode == "discovery-only":
             permissions["search"] = False
         return permissions

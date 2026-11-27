@@ -23,6 +23,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.ui.layout.layout
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.asPaddingValues
@@ -105,6 +108,7 @@ import com.moviepilot.feature.download.ResourceSearchScreen
 import com.moviepilot.feature.library.FileManagerScreen
 import com.moviepilot.feature.library.TransferHistoryScreen
 import com.moviepilot.feature.media.MediaDetailScreen
+import com.moviepilot.feature.media.MediaSeasonDetailScreen
 import com.moviepilot.feature.media.MediaServerDetailScreen
 import com.moviepilot.feature.media.PersonDetailScreen
 import com.moviepilot.feature.settings.AppearanceSettingsScreen
@@ -122,6 +126,7 @@ import com.moviepilot.feature.settings.SubscribeSearchSettingsScreen
 import com.moviepilot.feature.settings.UsersManagementScreen
 import com.moviepilot.feature.subscribe.CalendarScreen
 import com.moviepilot.feature.subscribe.SubscribeCommunityScreen
+import com.moviepilot.feature.subscribe.SubscribeHistoryScreen
 import com.moviepilot.feature.subscribe.SubscriptionsScreen
 import com.moviepilot.medal3d.CommunityProfile
 import com.moviepilot.medal3d.NativeCommunityMedalShowcaseOverlay
@@ -135,9 +140,13 @@ import com.moviepilot.media.QueueTrackSpec
 import com.moviepilot.media.SubtitleTrackItem
 import com.moviepilot.media.buildConfiguredExoPlayer
 import com.moviepilot.pluginhost.clearIsolatedPluginWebViewSession
+import com.moviepilot.pluginhost.VuePluginSurface
+import com.moviepilot.pluginhost.runtime.AndroidPluginCapsuleManager
 import com.moviepilot.pluginhost.runtime.AndroidPluginWebViewPool
+import com.moviepilot.pluginhost.runtime.PluginFloatingCapsuleOverlay
 import com.moviepilot.rustbridge.MediaCardItem
 import com.moviepilot.rustbridge.MediaPersonDto
+import com.moviepilot.rustbridge.MediaSeasonDto
 import com.moviepilot.rustbridge.MediaServerLibraryDto
 import com.moviepilot.rustbridge.MoviePilotRepository
 import com.moviepilot.rustbridge.MusicAlbumDto
@@ -147,8 +156,6 @@ import com.moviepilot.rustbridge.RustCoreBridge
 import com.moviepilot.rustbridge.SessionState
 import com.moviepilot.rustbridge.WorkflowItemDto
 import com.moviepilot.rustcore.PermissionsFfi
-import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.hazeSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -167,6 +174,12 @@ sealed interface AppRoute {
     data object SettingsHub : AppRoute
     data class GlobalSearch(val query: String = "", val kind: String = "media") : AppRoute
     data class MediaDetail(val item: MediaCardItem) : AppRoute
+    data class MediaSeasonDetail(
+        val seriesItem: MediaCardItem,
+        val season: MediaSeasonDto,
+        val seriesItemId: String = "",
+        val server: String = "",
+    ) : AppRoute
     data class MediaServerDetail(
         val itemId: String,
         val server: String,
@@ -186,6 +199,7 @@ sealed interface AppRoute {
     data class Subscriptions(val category: String? = null) : AppRoute
     data object Calendar : AppRoute
     data object SubscribeCommunity : AppRoute
+    data class SubscribeHistory(val initialType: String = "电影") : AppRoute
     data class Resources(val keyword: String = "") : AppRoute
     data object Downloads : AppRoute
     data class Files(val storage: String = "local", val path: String = "/") : AppRoute
@@ -203,7 +217,7 @@ sealed interface AppRoute {
     data object ChannelAuthorization : AppRoute
     data object PlaybackSettings : AppRoute
     data class Plugins(val installedOnly: Boolean = true) : AppRoute
-    data class PluginDetail(val plugin: PluginItemDto) : AppRoute
+    data class PluginDetail(val plugin: PluginItemDto, val openConfigFirst: Boolean = false) : AppRoute
     data class Diagnostics(val tab: String = "词表") : AppRoute
     data class Agent(val prompt: String = "") : AppRoute
     data object Appearance : AppRoute
@@ -217,10 +231,9 @@ private data class BackStackEntry(
 /**
  * 校验目标路由是否满足当前用户的 `PermissionsFfi` RBAC 权限；返回 `null` 代表放行，非空字符串代表拦截原因。
  */
-private fun checkRoutePermission(route: AppRoute, perms: PermissionsFfi): String? {
+internal fun checkRoutePermission(route: AppRoute, perms: PermissionsFfi): String? {
     if (perms.admin) return null
     return when (route) {
-        AppRoute.Sites,
         AppRoute.Users,
         AppRoute.SubscribeSearchSettings,
         AppRoute.MediaSourcesSettings,
@@ -228,13 +241,14 @@ private fun checkRoutePermission(route: AppRoute, perms: PermissionsFfi): String
         AppRoute.MediaServersSettings,
         AppRoute.DirectoriesSettings,
         AppRoute.NotificationsSettings,
-        AppRoute.Workflows,
-        is AppRoute.WorkflowCanvas,
         is AppRoute.Plugins,
         is AppRoute.PluginDetail,
         is AppRoute.Diagnostics,
         -> "当前账号无管理员权限"
 
+        AppRoute.Sites,
+        AppRoute.Workflows,
+        is AppRoute.WorkflowCanvas,
         AppRoute.Downloads,
         is AppRoute.Files,
         is AppRoute.History,
@@ -251,6 +265,7 @@ private fun checkRoutePermission(route: AppRoute, perms: PermissionsFfi): String
         is AppRoute.Subscriptions,
         AppRoute.Calendar,
         AppRoute.SubscribeCommunity,
+        is AppRoute.SubscribeHistory,
         -> if (perms.subscribe) null else "当前账号无订阅管理权限"
 
         else -> null
@@ -294,7 +309,6 @@ fun MoviePilotRootShell(
     val session by repository.session.collectAsState()
     val savedServers by repository.savedServers.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
-    val shellHazeState = remember { HazeState() }
     val saveableStateHolder = rememberSaveableStateHolder()
     val localHistoryStore = remember(context) { LocalPlaybackHistoryStore(context) }
     val medalJson = remember { Json { ignoreUnknownKeys = true; isLenient = true; coerceInputValues = true } }
@@ -303,6 +317,12 @@ fun MoviePilotRootShell(
     var isSwitchingServer by rememberSaveable { mutableStateOf(false) }
     var selectedTabId by rememberSaveable { mutableStateOf(MainTab.Discover.id) }
     val selectedTab = MainTab.entries.firstOrNull { it.id == selectedTabId } ?: MainTab.Discover
+    val visitedTabs = remember { mutableStateListOf(MainTab.Discover) }
+    LaunchedEffect(selectedTab) {
+        if (selectedTab !in visitedTabs) {
+            visitedTabs.add(selectedTab)
+        }
+    }
 
     var nextEntrySeq by rememberSaveable { mutableIntStateOf(1) }
     val tabStacks = remember {
@@ -395,6 +415,8 @@ fun MoviePilotRootShell(
             clearTabStack(tab)
             saveableStateHolder.removeState("tab_root_${tab.id}")
         }
+        visitedTabs.clear()
+        visitedTabs.add(MainTab.Discover)
         selectedTabId = MainTab.Discover.id
         clearIsolatedPluginWebViewSession(context)
     }
@@ -1255,6 +1277,34 @@ fun MoviePilotRootShell(
                     "workflows" -> pushRoute(AppRoute.Workflows, MainTab.Workspace)
                     "sites" -> pushRoute(AppRoute.Sites, MainTab.Workspace)
                     "plugins" -> pushRoute(AppRoute.Plugins(obj["installed_only"]?.jsonPrimitive?.booleanOrNull ?: true), MainTab.Workspace)
+                    "pluginDetail" -> {
+                        val targetId = obj["plugin_id"]?.jsonPrimitive?.content?.takeIf { it != "null" && it.isNotBlank() }.orEmpty()
+                        val surf = obj["surface"]?.jsonPrimitive?.content?.takeIf { it != "null" }?.lowercase().orEmpty()
+                        if (targetId.isNotBlank()) {
+                            val matched = runCatching { repository.fetchPlugins(true) }.getOrDefault(emptyList())
+                                .firstOrNull { it.id.equals(targetId, ignoreCase = true) }
+                            val pluginItem = matched ?: PluginItemDto(
+                                id = targetId,
+                                name = targetId,
+                                desc = "",
+                                version = "",
+                                author = "",
+                                icon = null,
+                                labels = emptyList(),
+                                installed = true,
+                                state = true,
+                                hasPage = true,
+                                hasUpdate = false,
+                            )
+                            pushRoute(
+                                AppRoute.PluginDetail(
+                                    plugin = pluginItem,
+                                    openConfigFirst = surf == "config",
+                                ),
+                                MainTab.Workspace,
+                            )
+                        }
+                    }
                     "agent" -> pushRoute(AppRoute.Agent(obj["prompt"]?.jsonPrimitive?.content?.takeIf { it != "null" }.orEmpty()))
                     "music" -> pushRoute(AppRoute.Music, MainTab.Discover)
                     "shortcuts" -> pushRoute(AppRoute.Diagnostics("词表"), MainTab.Workspace)
@@ -1292,7 +1342,6 @@ fun MoviePilotRootShell(
     CompositionLocalProvider(
         LocalSnackbarHostState provides snackbarHostState,
         LocalBottomOverlayInset provides bottomOverlayInset,
-        LocalHazeState provides shellHazeState,
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             Row(modifier = Modifier.fillMaxSize()) {
@@ -1320,9 +1369,7 @@ fun MoviePilotRootShell(
                         ),
                 ) {
                     Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .hazeSource(shellHazeState),
+                        modifier = Modifier.fillMaxSize(),
                     ) {
                         CinematicAmbientGradient()
 
@@ -1398,72 +1445,105 @@ fun MoviePilotRootShell(
                                 }
 
                                 is SessionState.Authenticated -> {
-                                    AnimatedContent(
-                                        targetState = Triple(selectedTab, currentRoute, currentStateKey),
-                                        transitionSpec = {
-                                            val sameTab = targetState.first == initialState.first
-                                            val enteringSub = sameTab && targetState.second != AppRoute.TabRoot && initialState.second == AppRoute.TabRoot
-                                            val returningRoot = sameTab && targetState.second == AppRoute.TabRoot && initialState.second != AppRoute.TabRoot
-                                            when {
-                                                enteringSub -> (slideInHorizontally(tween(220)) { it / 5 } + fadeIn(tween(220)))
-                                                    .togetherWith(fadeOut(tween(150)))
-                                                returningRoot -> fadeIn(tween(200))
-                                                    .togetherWith(slideOutHorizontally(tween(200)) { it / 5 } + fadeOut(tween(180)))
-                                                else -> fadeIn(tween(160)).togetherWith(fadeOut(tween(120)))
-                                            }
-                                        },
-                                        label = "mpMainRouter",
-                                    ) { (tabAtFrame, route, stateKey) ->
-                                        saveableStateHolder.SaveableStateProvider(stateKey) {
-                                            when (route) {
-                                                AppRoute.TabRoot -> when (tabAtFrame) {
-                                                    MainTab.Discover -> DiscoverScreen(
-                                                        repository = repository,
-                                                        onOpenMedia = ::openMediaSmart,
-                                                        onOpenExplore = { src -> pushRoute(AppRoute.Explore(src)) },
-                                                        onOpenMusic = { pushRoute(AppRoute.Music) },
-                                                        onOpenMusicAlbum = { album -> pushRoute(AppRoute.MusicAlbumDetail(album)) },
-                                                        onOpenMediaLibrary = { lib -> pushRoute(AppRoute.MediaServerLibrary(lib)) },
-                                                        onPlayMedia = ::startPlayback,
-                                                    )
-                                                    MainTab.Subscribe -> SubscriptionsScreen(
-                                                        repository = repository,
-                                                        initialCategory = null,
-                                                        onBack = null,
-                                                        onOpenCalendar = { pushRoute(AppRoute.Calendar) },
-                                                        onOpenCommunity = { pushRoute(AppRoute.SubscribeCommunity) },
-                                                        onOpenMedia = ::openMediaSmart,
-                                                        onPlayMedia = ::startPlayback,
-                                                        onOpenServerItem = { itemId, server, title ->
-                                                            pushRoute(AppRoute.MediaServerDetail(itemId, server, title))
+                                    Box(modifier = Modifier.fillMaxSize()) {
+                                        // 常驻保活已访问过的 4 个一级主 Tab：未激活或处于二级页面下层时置为 unplaced（零绘制、零点击命中、零无障碍冲突），切换与返回实现 0ms 秒开
+                                        visitedTabs.forEach { tab ->
+                                            key(tab.id) {
+                                                val isActiveRoot = isTopLevelTab && selectedTab == tab
+                                                Box(
+                                                    modifier = Modifier
+                                                        .fillMaxSize()
+                                                        .layout { measurable, constraints ->
+                                                            val placeable = measurable.measure(constraints)
+                                                            if (isActiveRoot) {
+                                                                layout(placeable.width, placeable.height) {
+                                                                    placeable.placeRelative(0, 0)
+                                                                }
+                                                            } else {
+                                                                layout(0, 0) {}
+                                                            }
                                                         },
-                                                    )
-                                                    MainTab.Dashboard -> DashboardScreen(
-                                                        repository = repository,
-                                                        onOpenMessages = { pushRoute(AppRoute.Messages) },
-                                                        onOpenDiagnosticTab = { tab -> pushRoute(AppRoute.Diagnostics(tab)) },
-                                                        onOpenMedalShowcase = { profile, key -> activeMedalShowcase = profile to key },
-                                                        permissions = s.permissions,
-                                                    )
-                                                    MainTab.Workspace -> WorkspaceHubScreen(
-                                                        repository = repository,
-                                                        onOpenSettings = { pushRoute(AppRoute.SettingsHub) },
-                                                        onOpenAgent = { pushRoute(AppRoute.Agent()) },
-                                                        onOpenMusic = { pushRoute(AppRoute.Music) },
-                                                        onOpenResources = { pushRoute(AppRoute.Resources()) },
-                                                        onOpenDownloads = { pushRoute(AppRoute.Downloads) },
-                                                        onOpenFiles = { pushRoute(AppRoute.Files()) },
-                                                        onOpenHistory = { pushRoute(AppRoute.History()) },
-                                                        onOpenWorkflows = { pushRoute(AppRoute.Workflows) },
-                                                        onOpenPlugins = { pushRoute(AppRoute.Plugins(installedOnly = true)) },
-                                                        onOpenSites = { pushRoute(AppRoute.Sites) },
-                                                        onOpenCalendar = { pushRoute(AppRoute.Calendar) },
-                                                        onOpenSubscribeCommunity = { pushRoute(AppRoute.SubscribeCommunity) },
-                                                        onOpenMediaLibrary = { lib -> pushRoute(AppRoute.MediaServerLibrary(lib)) },
-                                                        onOpenDiagnosticTab = { tab -> pushRoute(AppRoute.Diagnostics(tab)) },
-                                                        permissions = s.permissions,
-                                                    )
+                                                ) {
+                                                    saveableStateHolder.SaveableStateProvider("tab_root_${tab.id}") {
+                                                        when (tab) {
+                                                            MainTab.Discover -> DiscoverScreen(
+                                                                repository = repository,
+                                                                onOpenMedia = ::openMediaSmart,
+                                                                onOpenExplore = { src -> pushRoute(AppRoute.Explore(src)) },
+                                                                onOpenMusic = { pushRoute(AppRoute.Music) },
+                                                                onOpenMusicAlbum = { album -> pushRoute(AppRoute.MusicAlbumDetail(album)) },
+                                                                onOpenMediaLibrary = { lib -> pushRoute(AppRoute.MediaServerLibrary(lib)) },
+                                                                onPlayMedia = ::startPlayback,
+                                                            )
+                                                            MainTab.Subscribe -> SubscriptionsScreen(
+                                                                repository = repository,
+                                                                initialCategory = null,
+                                                                onBack = null,
+                                                                onOpenCalendar = { pushRoute(AppRoute.Calendar) },
+                                                                onOpenCommunity = { pushRoute(AppRoute.SubscribeCommunity) },
+                                                                onOpenSubscribeHistory = { mtype ->
+                                                                    pushRoute(AppRoute.SubscribeHistory(mtype))
+                                                                },
+                                                                onOpenMedia = ::openMediaSmart,
+                                                                onPlayMedia = ::startPlayback,
+                                                                onOpenServerItem = { itemId, server, title ->
+                                                                    pushRoute(AppRoute.MediaServerDetail(itemId, server, title))
+                                                                },
+                                                            )
+                                                            MainTab.Dashboard -> DashboardScreen(
+                                                                repository = repository,
+                                                                onOpenMessages = { pushRoute(AppRoute.Messages) },
+                                                                onOpenDiagnosticTab = { tabName -> pushRoute(AppRoute.Diagnostics(tabName)) },
+                                                                onOpenMedalShowcase = { profile, key -> activeMedalShowcase = profile to key },
+                                                                permissions = s.permissions,
+                                                            )
+                                                            MainTab.Workspace -> WorkspaceHubScreen(
+                                                                repository = repository,
+                                                                onOpenSettings = { pushRoute(AppRoute.SettingsHub) },
+                                                                onOpenAgent = { pushRoute(AppRoute.Agent()) },
+                                                                onOpenMusic = { pushRoute(AppRoute.Music) },
+                                                                onOpenResources = { pushRoute(AppRoute.Resources()) },
+                                                                onOpenDownloads = { pushRoute(AppRoute.Downloads) },
+                                                                onOpenFiles = { pushRoute(AppRoute.Files()) },
+                                                                onOpenHistory = { pushRoute(AppRoute.History()) },
+                                                                onOpenWorkflows = { pushRoute(AppRoute.Workflows) },
+                                                                onOpenPlugins = { pushRoute(AppRoute.Plugins(installedOnly = true)) },
+                                                                onOpenSites = { pushRoute(AppRoute.Sites) },
+                                                                onOpenCalendar = { pushRoute(AppRoute.Calendar) },
+                                                                onOpenSubscribeCommunity = { pushRoute(AppRoute.SubscribeCommunity) },
+                                                                onOpenMediaLibrary = { lib -> pushRoute(AppRoute.MediaServerLibrary(lib)) },
+                                                                onOpenDiagnosticTab = { tabName -> pushRoute(AppRoute.Diagnostics(tabName)) },
+                                                                permissions = s.permissions,
+                                                            )
+                                                        }
+                                                    }
                                                 }
+                                            }
+                                        }
+
+                                        AnimatedContent(
+                                            targetState = Pair(currentRoute, currentStateKey),
+                                            transitionSpec = {
+                                                val enteringSub = targetState.first != AppRoute.TabRoot && initialState.first == AppRoute.TabRoot
+                                                val returningRoot = targetState.first == AppRoute.TabRoot && initialState.first != AppRoute.TabRoot
+                                                when {
+                                                    enteringSub -> (slideInHorizontally(tween(200)) { it / 6 } + fadeIn(tween(180)))
+                                                        .togetherWith(fadeOut(tween(120)))
+                                                    returningRoot -> fadeIn(tween(140))
+                                                        .togetherWith(slideOutHorizontally(tween(180)) { it / 6 } + fadeOut(tween(150)))
+                                                    else -> fadeIn(tween(150)).togetherWith(fadeOut(tween(110)))
+                                                }
+                                            },
+                                            label = "mpMainRouter",
+                                        ) { (route, stateKey) ->
+                                            if (route == AppRoute.TabRoot) {
+                                                Spacer(Modifier.fillMaxSize())
+                                            } else {
+                                                Box(modifier = Modifier.fillMaxSize()) {
+                                                    CinematicAmbientGradient()
+                                                    saveableStateHolder.SaveableStateProvider(stateKey) {
+                                                        when (route) {
+                                                            AppRoute.TabRoot -> Unit
 
                                                 is AppRoute.Explore -> ExploreScreen(
                                                     repository = repository,
@@ -1523,6 +1603,19 @@ fun MoviePilotRootShell(
                                                     onOpenServerDetail = { itemId, server, title ->
                                                         pushRoute(AppRoute.MediaServerDetail(itemId, server, title))
                                                     },
+                                                    onOpenSeasonDetail = { seriesItem, season, seriesItemId, srv ->
+                                                        pushRoute(AppRoute.MediaSeasonDetail(seriesItem, season, seriesItemId, srv))
+                                                    },
+                                                )
+                                                is AppRoute.MediaSeasonDetail -> MediaSeasonDetailScreen(
+                                                    seriesItem = route.seriesItem,
+                                                    initialSeason = route.season,
+                                                    initialSeriesItemId = route.seriesItemId,
+                                                    initialServer = route.server,
+                                                    repository = repository,
+                                                    onBack = ::popRoute,
+                                                    onSearchResource = { kw -> pushRoute(AppRoute.Resources(kw)) },
+                                                    onPlayMedia = ::startPlayback,
                                                 )
                                                 is AppRoute.MediaServerDetail -> MediaServerDetailScreen(
                                                     itemId = route.itemId,
@@ -1589,6 +1682,9 @@ fun MoviePilotRootShell(
                                                     onBack = ::popRoute,
                                                     onOpenCalendar = { pushRoute(AppRoute.Calendar) },
                                                     onOpenCommunity = { pushRoute(AppRoute.SubscribeCommunity) },
+                                                    onOpenSubscribeHistory = { mtype ->
+                                                        pushRoute(AppRoute.SubscribeHistory(mtype))
+                                                    },
                                                     onOpenMedia = ::openMediaSmart,
                                                     onPlayMedia = ::startPlayback,
                                                     onOpenServerItem = { itemId, server, title ->
@@ -1604,6 +1700,12 @@ fun MoviePilotRootShell(
                                                     repository = repository,
                                                     onBack = ::popRoute,
                                                     onOpenMedia = { pushRoute(AppRoute.MediaDetail(it)) },
+                                                )
+                                                is AppRoute.SubscribeHistory -> SubscribeHistoryScreen(
+                                                    repository = repository,
+                                                    initialType = route.initialType,
+                                                    onBack = ::popRoute,
+                                                    onOpenMedia = ::openMediaSmart,
                                                 )
                                                 is AppRoute.Resources -> ResourceSearchScreen(repository, route.keyword, onBack = ::popRoute)
                                                 AppRoute.Downloads -> DownloadsScreen(repository, onBack = ::popRoute)
@@ -1640,11 +1742,12 @@ fun MoviePilotRootShell(
                                                     repository = repository,
                                                     initialInstalledOnly = route.installedOnly,
                                                     onBack = ::popRoute,
-                                                    onOpenPluginDetail = { p -> pushRoute(AppRoute.PluginDetail(p)) },
+                                                    onOpenPluginDetail = { p, configFirst -> pushRoute(AppRoute.PluginDetail(p, configFirst)) },
                                                 )
                                                 is AppRoute.PluginDetail -> PluginDetailScreen(
                                                     plugin = route.plugin,
                                                     repository = repository,
+                                                    openConfigFirst = route.openConfigFirst,
                                                     onBack = ::popRoute,
                                                 )
                                                 is AppRoute.Diagnostics -> ShortcutsDiagnosticsScreen(
@@ -1655,6 +1758,9 @@ fun MoviePilotRootShell(
                                                 )
                                                 is AppRoute.Agent -> AgentChatScreen(repository, route.prompt, onBack = ::popRoute)
                                                 AppRoute.Appearance -> AppearanceSettingsScreen(onBack = ::popRoute)
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1677,6 +1783,80 @@ fun MoviePilotRootShell(
                                 .align(Alignment.BottomEnd)
                                 .navigationBarsPadding()
                                 .padding(end = 16.dp, bottom = mascotBottom),
+                        )
+                    }
+
+                    // 3.5 联邦插件最小化悬浮胶囊与快捷操作小窗（跨一级 Tab 与子页面保活）
+                    val minimizedPluginSession = AndroidPluginCapsuleManager.currentSession
+                    val isViewingSameMinimizedPlugin = minimizedPluginSession != null &&
+                        (currentRoute as? AppRoute.PluginDetail)?.plugin?.id?.equals(minimizedPluginSession.pluginId, ignoreCase = true) == true
+                    LaunchedEffect(AndroidPluginCapsuleManager.restoreRequestNonce) {
+                        val targetId = AndroidPluginCapsuleManager.pendingRestorePluginId
+                        val parked = AndroidPluginCapsuleManager.currentSession
+                        if (!targetId.isNullOrBlank() && parked != null && parked.pluginId.equals(targetId, ignoreCase = true)) {
+                            AndroidPluginCapsuleManager.clearPendingRestoreRequest()
+                            pushRoute(
+                                AppRoute.PluginDetail(
+                                    plugin = PluginItemDto(
+                                        id = parked.pluginId,
+                                        name = parked.pluginName,
+                                        desc = parked.snapshot.subtitle,
+                                        version = "",
+                                        author = "",
+                                        icon = parked.snapshot.iconUrl,
+                                        labels = emptyList(),
+                                        installed = true,
+                                        state = true,
+                                        hasPage = parked.pluginHasPage,
+                                        hasUpdate = false,
+                                        renderMode = "vue",
+                                    ),
+                                    openConfigFirst = parked.surface == VuePluginSurface.Config,
+                                ),
+                                MainTab.Workspace,
+                            )
+                        }
+                    }
+                    if (authSession != null && !isSwitchingServer && minimizedPluginSession != null && !isViewingSameMinimizedPlugin && activeMedalShowcase == null && activePlayerRequest == null && !isInPipMode) {
+                        val capsuleBottom = when {
+                            showBottomNav && showMiniMusicBar -> 166.dp
+                            showBottomNav -> 96.dp
+                            showMiniMusicBar -> 92.dp
+                            else -> 24.dp
+                        }
+                        PluginFloatingCapsuleOverlay(
+                            session = minimizedPluginSession,
+                            isExpanded = AndroidPluginCapsuleManager.isMiniCardExpanded,
+                            onToggleExpanded = { AndroidPluginCapsuleManager.isMiniCardExpanded = it },
+                            onOpenPluginWindow = {
+                                AndroidPluginCapsuleManager.isMiniCardExpanded = false
+                                pushRoute(
+                                    AppRoute.PluginDetail(
+                                        plugin = PluginItemDto(
+                                            id = minimizedPluginSession.pluginId,
+                                            name = minimizedPluginSession.pluginName,
+                                            desc = minimizedPluginSession.snapshot.subtitle,
+                                            version = "",
+                                            author = "",
+                                            icon = minimizedPluginSession.snapshot.iconUrl,
+                                            labels = emptyList(),
+                                            installed = true,
+                                            state = true,
+                                            hasPage = minimizedPluginSession.pluginHasPage,
+                                            hasUpdate = false,
+                                            renderMode = "vue",
+                                        ),
+                                        openConfigFirst = minimizedPluginSession.surface == VuePluginSurface.Config,
+                                    ),
+                                    MainTab.Workspace,
+                                )
+                            },
+                            onDispatchAction = { actionId -> AndroidPluginCapsuleManager.dispatchAction(actionId) },
+                            onCloseCapsule = { AndroidPluginCapsuleManager.closeAndRelease(context) },
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .navigationBarsPadding()
+                                .padding(end = 16.dp, bottom = capsuleBottom),
                         )
                     }
 

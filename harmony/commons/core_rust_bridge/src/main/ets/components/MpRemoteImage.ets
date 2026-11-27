@@ -14,9 +14,31 @@ function resolveBucketMaxPx(maxSidePx: number): number {
  * - LRU 淘汰与退出登录清空缓存时主动调用 `PixelMap.release()` 释放底层像素缓冲。
  */
 export class MpImageLoader {
-  private static readonly MAX_ENTRIES: number = 160;
+  private static readonly MAX_ENTRIES: number = 240;
+  private static readonly MAX_CONCURRENT_LOADS: number = 10;
+  private static activeLoads: number = 0;
+  private static waitQueue: Array<() => void> = [];
   private static cache: Map<string, image.PixelMap> = new Map<string, image.PixelMap>();
   private static inflight: Map<string, Promise<image.PixelMap | null>> = new Map<string, Promise<image.PixelMap | null>>();
+
+  private static async acquireSlot(): Promise<void> {
+    if (MpImageLoader.activeLoads < MpImageLoader.MAX_CONCURRENT_LOADS) {
+      MpImageLoader.activeLoads += 1;
+      return;
+    }
+    await new Promise<void>((resolve: () => void) => {
+      MpImageLoader.waitQueue.push(resolve);
+    });
+  }
+
+  private static releaseSlot(): void {
+    const next = MpImageLoader.waitQueue.shift();
+    if (next) {
+      next();
+    } else {
+      MpImageLoader.activeLoads = Math.max(0, MpImageLoader.activeLoads - 1);
+    }
+  }
 
   private static makeKey(url: string, maxSidePx: number): string {
     return `${url.trim()}@${resolveBucketMaxPx(maxSidePx)}`;
@@ -70,9 +92,18 @@ export class MpImageLoader {
   }
 
   private static async fetchAndDecode(url: string, cacheKey: string, maxSidePx: number): Promise<image.PixelMap | null> {
+    await MpImageLoader.acquireSlot();
     try {
       const repo = MoviePilotRepository.shared();
-      const bytes = await repo.transport.fetchBinary(url, repo.token);
+      await repo.ensureImageContextReady();
+      const effectiveUrl = repo.upgradeImageUrlForCurrentConfig(url);
+      let bytes = await repo.transport.fetchBinary(effectiveUrl, repo.token);
+      if ((!bytes || bytes.byteLength === 0) && !repo.transport.isSameOriginUrl(effectiveUrl)) {
+        const fallbackUrl = repo.buildBackendProxyFallbackUrl(effectiveUrl);
+        if (fallbackUrl.length > 0) {
+          bytes = await repo.transport.fetchBinary(fallbackUrl, repo.token);
+        }
+      }
       if (!bytes || bytes.byteLength === 0) {
         return null;
       }
@@ -133,6 +164,8 @@ export class MpImageLoader {
       return pm;
     } catch {
       return null;
+    } finally {
+      MpImageLoader.releaseSlot();
     }
   }
 }

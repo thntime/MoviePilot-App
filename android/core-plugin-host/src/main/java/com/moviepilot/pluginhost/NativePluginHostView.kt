@@ -113,6 +113,7 @@ private fun JsonObject.safeStr(key: String): String? = this[key].safePrim()?.con
  * 必须在用户主动退出登录或 401 令牌失效自动退登时调用，杜绝跨账号残留。
  */
 fun clearIsolatedPluginWebViewSession(context: Context) {
+    com.moviepilot.pluginhost.runtime.AndroidPluginCapsuleManager.resetForSessionChange(context)
     AndroidPluginWebViewPool.resetForSessionChange()
     PluginRemoteDiskCache.clearAll(context)
     runCatching {
@@ -1725,6 +1726,8 @@ fun IsolatedVuePluginWebView(
     surface: VuePluginSurface = VuePluginSurface.DataPage,
     chromeController: VuePluginChromeController? = null,
     pluginHasPage: Boolean = false,
+    onLegacyFallbackChanged: ((Boolean) -> Unit)? = null,
+    onRequestExit: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     var fallbackToLegacy by remember(pluginId, surface) { mutableStateOf(false) }
@@ -1735,7 +1738,11 @@ fun IsolatedVuePluginWebView(
             surface = surface,
             chromeController = chromeController,
             pluginHasPage = pluginHasPage,
-            onFallbackToLegacy = { fallbackToLegacy = true },
+            onFallbackToLegacy = {
+                fallbackToLegacy = true
+                onLegacyFallbackChanged?.invoke(true)
+            },
+            onRequestExit = onRequestExit,
             modifier = modifier,
         )
         return

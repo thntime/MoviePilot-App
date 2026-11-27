@@ -83,6 +83,7 @@ import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.Lyrics
 import androidx.compose.material.icons.rounded.Memory
+import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Pause
@@ -117,6 +118,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -191,10 +193,14 @@ import com.moviepilot.rustbridge.NativeSecretStore
 import com.moviepilot.rustbridge.PlaybackRouteDto
 import com.moviepilot.rustbridge.PlaybackSyncSessionTracker
 import com.moviepilot.rustbridge.RustCoreBridge
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
@@ -346,6 +352,8 @@ private fun formatPlaybackRouteSummary(routeKind: String): String? = when (route
     else -> null
 }
 
+private const val EXO_EXT_SUB_ID_PREFIX = "mp_ext:"
+
 private fun subtitleMimeTypeForUrl(url: String): String {
     val lower = url.substringBefore('?').lowercase()
     return when {
@@ -356,10 +364,114 @@ private fun subtitleMimeTypeForUrl(url: String): String {
 }
 
 /**
+ * 从播放清单挑选起播阶段需要自动预取并挂载的首选外挂字幕（遵循 `preferredSubtitleId` -> `preferredSubtitleLang` -> `preferChineseSub` 优先级）。
+ */
+private fun pickInitialExternalSubtitle(
+    request: MediaPlaybackRequest,
+    prefs: PlaybackPreferencesStore,
+): SubtitleTrackItem? {
+    if (request.isAudio || request.disableSubtitles || request.subtitles.isEmpty()) return null
+    val validSubs = request.subtitles.filter { it.url.isNotBlank() }
+    if (validSubs.isEmpty()) return null
+
+    if (!request.preferredSubtitleId.isNullOrBlank()) {
+        val targetId = request.preferredSubtitleId.trim()
+        validSubs.firstOrNull { it.id == targetId || it.title == targetId }?.let { return it }
+    }
+    if (!request.preferredSubtitleLang.isNullOrBlank()) {
+        val targetLang = request.preferredSubtitleLang.trim().lowercase()
+        validSubs.firstOrNull {
+            it.language.trim().lowercase() == targetLang ||
+                it.title.lowercase().contains(targetLang)
+        }?.let { return it }
+    }
+    if (prefs.preferChineseSub) {
+        return validSubs
+            .map { sub ->
+                sub to ChineseSubtitleMatcher.scoreChineseSubtitle(
+                    language = sub.language,
+                    label = sub.title,
+                    isExternal = true,
+                )
+            }
+            .filter { it.second > 0 }
+            .maxByOrNull { it.second }
+            ?.first
+    }
+    return null
+}
+
+/**
+ * 判断已嗅探落盘的外挂字幕是否需要从 Media3 原生内核智能升级至 MPV 全能内核：
+ * - 含 `[Fonts]` 内嵌子集化字体的 ASS/SSA（且未忽略特效样式）必须使用 MPV `libass` 渲染；
+ * - 用户处于默认自动选核（非强制固定原生内核）且真实格式为 ASS/SSA（如无后缀 URL 或 SRT 实时转 ASS）时自动切 MPV。
+ */
+private fun shouldUpgradeToMpvForPrefetchedSubtitle(
+    prefetched: PrefetchedSubtitle,
+    prefs: PlaybackPreferencesStore,
+): Boolean {
+    if (!prefetched.isAssOrSsa || prefs.ignoreAssStyle) return false
+    if (prefetched.hasEmbeddedFonts) return true
+    return prefs.videoEngine != "native"
+}
+
+private fun upgradeReasonForSubtitle(prefetched: PrefetchedSubtitle): String =
+    if (prefetched.hasEmbeddedFonts) {
+        "检测到内嵌字体特效字幕，已切换至 MPV 渲染"
+    } else {
+        "检测到 ASS 特效字幕，已切换至 MPV 渲染"
+    }
+
+/**
+ * 构建 Media3 `ExoPlayer` 外挂字幕配置：优先采用已预取的本地文件 `Uri` 与嗅探出的真实 `MimeTypes`，
+ * 当开启延迟挂载远端字幕时跳过未预取的远端 HTTP URL，杜绝无后缀 MIME 误判与 `Range` 请求触发上游 `501`。
+ */
+@OptIn(UnstableApi::class)
+private fun buildExoSubtitleConfigurations(
+    request: MediaPlaybackRequest,
+    prefetchedMap: Map<String, PrefetchedSubtitle>,
+    deferRemoteSubtitles: Boolean,
+): List<MediaItem.SubtitleConfiguration> {
+    if (request.isAudio || request.subtitles.isEmpty()) return emptyList()
+    val configs = mutableListOf<MediaItem.SubtitleConfiguration>()
+    for (sub in request.subtitles) {
+        val rawUrl = sub.url.trim()
+        if (rawUrl.isBlank()) continue
+        val subKey = SubtitlePrefetcher.subtitleKey(sub)
+        val prefetched = prefetchedMap[subKey]
+        val resolvedUriAndMime: Pair<Uri, String>? = when {
+            prefetched != null && prefetched.file.exists() ->
+                prefetched.localUri to prefetched.mimeType
+            rawUrl.startsWith("file://", ignoreCase = true) ->
+                Uri.parse(rawUrl) to subtitleMimeTypeForUrl(rawUrl)
+            rawUrl.startsWith("/") ->
+                Uri.fromFile(File(rawUrl)) to subtitleMimeTypeForUrl(rawUrl)
+            deferRemoteSubtitles -> null
+            else -> Uri.parse(rawUrl) to subtitleMimeTypeForUrl(rawUrl)
+        }
+        if (resolvedUriAndMime != null) {
+            val label = sub.title.ifBlank { sub.language.ifBlank { "外挂字幕" } }
+            val cfgId = if (deferRemoteSubtitles || prefetched != null) {
+                "$EXO_EXT_SUB_ID_PREFIX$subKey"
+            } else {
+                sub.id.ifBlank { "$EXO_EXT_SUB_ID_PREFIX$subKey" }
+            }
+            configs += MediaItem.SubtitleConfiguration.Builder(resolvedUriAndMime.first)
+                .setMimeType(resolvedUriAndMime.second)
+                .setLanguage(sub.language.ifBlank { "und" })
+                .setLabel(label)
+                .setId(cfgId)
+                .build()
+        }
+    }
+    return configs
+}
+
+/**
  * 根据播放清单构建完整配置的 `ExoPlayer`：
  * - 使用 `OkHttpDataSource.Factory` 支持自签名 TLS 与跨源重定向自动剥离敏感凭据；
  * - 启用 Media3 音频焦点托管（来电自动闪避/暂停）与拔出耳机自动暂停（`HandleAudioBecomingNoisy`）；
- * - 注入系统锁屏/通知栏/蓝牙媒体元数据与外挂字幕；
+ * - 注入系统锁屏/通知栏/蓝牙媒体元数据与真实嗅探后的本地外挂字幕；
  * - 音频固定以 `1.0x` 原速启动，视频应用用户默认倍速与清晰度上限。
  */
 @OptIn(UnstableApi::class)
@@ -368,6 +480,8 @@ fun buildConfiguredExoPlayer(
     request: MediaPlaybackRequest,
     resumePositionOverrideMs: Long? = null,
     activeStreamProvider: (() -> Pair<String, Map<String, String>>)? = null,
+    prefetchedSubtitles: Map<String, PrefetchedSubtitle> = emptyMap(),
+    deferRemoteSubtitles: Boolean = false,
 ): ExoPlayer {
     val prefs = PlaybackPreferencesStore(context)
     val allowInsecureTls = request.allowSelfSignedTls ||
@@ -413,17 +527,14 @@ fun buildConfiguredExoPlayer(
         .setMediaMetadata(metadataBuilder.build())
 
     if (request.subtitles.isNotEmpty()) {
-        val subConfigs = request.subtitles.map { sub ->
-            val builder = MediaItem.SubtitleConfiguration.Builder(Uri.parse(sub.url))
-                .setMimeType(subtitleMimeTypeForUrl(sub.url))
-                .setLanguage(sub.language.ifBlank { "und" })
-                .setLabel(sub.title.ifBlank { sub.language.ifBlank { "外挂字幕" } })
-            if (sub.id.isNotBlank()) {
-                builder.setId(sub.id)
-            }
-            builder.build()
+        val subConfigs = buildExoSubtitleConfigurations(
+            request = request,
+            prefetchedMap = prefetchedSubtitles,
+            deferRemoteSubtitles = deferRemoteSubtitles,
+        )
+        if (subConfigs.isNotEmpty()) {
+            itemBuilder.setSubtitleConfigurations(subConfigs)
         }
-        itemBuilder.setSubtitleConfigurations(subConfigs)
     }
 
     val audioAttributes = AudioAttributes.Builder()
@@ -595,6 +706,9 @@ private data class ResolvedTrackChoice(
     val group: Tracks.Group?,
     val trackIndex: Int,
     val selected: Boolean,
+    val externalSub: SubtitleTrackItem? = null,
+    val isLoading: Boolean = false,
+    val isFailed: Boolean = false,
 )
 
 private val VIDEO_RESIZE_MODES: List<Pair<Int, String>> = listOf(
@@ -668,6 +782,7 @@ private class PlayerSessionState(
     ownsPlayer: Boolean,
     primaryEngineId: String,
     bestInitialResumeMs: Long,
+    initialExternalSubKey: String? = null,
 ) {
     var embeddedAudioMeta by mutableStateOf<ResolvedEmbeddedAudioMetadata?>(null)
     val activeStreamRouteRef: AtomicReference<Pair<String, Map<String, String>>> =
@@ -692,6 +807,12 @@ private class PlayerSessionState(
     var activePreferredSubtitleLang by mutableStateOf(request.preferredSubtitleLang)
     var activeDisableSubtitles by mutableStateOf(request.disableSubtitles)
     var appliedInitialTracks by mutableStateOf(false)
+    val prefetchedSubtitles = mutableStateMapOf<String, PrefetchedSubtitle>()
+    var selectedExternalSubKey by mutableStateOf(initialExternalSubKey)
+    var loadingExternalSubKey by mutableStateOf<String?>(null)
+    var failedExternalSubKey by mutableStateOf<String?>(null)
+    var startupSubtitleGateReady by mutableStateOf(initialExternalSubKey == null)
+    var activeSubtitleJob: Job? = null
     var resumeBannerPositionMs by mutableStateOf(
         bestInitialResumeMs.takeIf { it > LocalPlaybackHistoryStore.MIN_RESUME_POSITION_MS },
     )
@@ -753,6 +874,8 @@ private class PlayerRuntimeController(
     private val latestSwitchRequestState: State<((MediaPlaybackRequest) -> Unit)?>,
     private val latestCloseState: State<() -> Unit>,
     private val latestMetadataEnrichedState: State<((MediaPlaybackRequest) -> Unit)?>,
+    val subtitlePrefetcher: SubtitlePrefetcher? = null,
+    val playerScope: CoroutineScope,
 ) {
     var isPlaying: Boolean
         get() = isPlayingState.value
@@ -983,6 +1106,108 @@ private class PlayerRuntimeController(
         latestSwitchRequestState.value?.invoke(buildCarryOverEpisodeRequest(target, nextIdx))
     }
 
+    /** 当 Media3 轨道列表就绪或动态注入外挂字幕后，确保当前选中的预取外挂字幕被精确激活。 */
+    fun applySelectedExternalSubtitleToExoIfPresent(tracks: Tracks) {
+        val ep = exoPlayer ?: return
+        val targetSubKey = session.selectedExternalSubKey ?: return
+        if (request.isAudio || session.activeDisableSubtitles) return
+        val targetTrackId = "$EXO_EXT_SUB_ID_PREFIX$targetSubKey"
+        for (grp in tracks.groups) {
+            if (grp.type != C.TRACK_TYPE_TEXT) continue
+            for (i in 0 until grp.length) {
+                val fmt = grp.getTrackFormat(i)
+                if (fmt.id == targetTrackId || fmt.id?.endsWith(":$targetTrackId") == true) {
+                    val isTextDisabled = ep.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)
+                    if (isTextDisabled || !grp.isTrackSelected(i)) {
+                        ep.trackSelectionParameters = ep.trackSelectionParameters
+                            .buildUpon()
+                            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                            .setOverrideForType(TrackSelectionOverride(grp.mediaTrackGroup, i))
+                            .build()
+                        ui.tracksVersion++
+                    }
+                    return
+                }
+            }
+        }
+    }
+
+    /** 将新预取落盘的外挂字幕动态注入 Media3 当前播放项并保持当前播放进度无缝对齐。 */
+    private fun injectPrefetchedSubtitlesIntoExo(selectKey: String?) {
+        val ep = exoPlayer ?: return
+        val curItem = ep.currentMediaItem ?: return
+        val curUri = curItem.localConfiguration?.uri ?: Uri.parse(request.url)
+        val curMeta = curItem.mediaMetadata
+        val subConfigs = buildExoSubtitleConfigurations(
+            request = request,
+            prefetchedMap = session.prefetchedSubtitles.toMap(),
+            deferRemoteSubtitles = true,
+        )
+        val updatedItem = MediaItem.Builder()
+            .setUri(curUri)
+            .setMediaMetadata(curMeta)
+            .setSubtitleConfigurations(subConfigs)
+            .build()
+        val currentPos = ep.currentPosition.coerceAtLeast(0L)
+        val wasPlayWhenReady = ep.playWhenReady
+        if (selectKey != null) {
+            session.selectedExternalSubKey = selectKey
+            session.activeDisableSubtitles = false
+        }
+        ep.setMediaItem(updatedItem, currentPos)
+        ep.prepare()
+        ep.playWhenReady = wasPlayWhenReady
+    }
+
+    /**
+     * 应用预取成功的外挂字幕：
+     * - 若检测到内嵌 `[Fonts]` 字体或自动模式下嗅探出 ASS/SSA，自动热切至 MPV 渲染完整特效与子集化字体；
+     * - 否则挂载至当前活动内核（MPV `sub-add` 或 Media3 本地 `SubtitleConfiguration`），自动对齐当前时间轴。
+     */
+    fun applyPrefetchedExternalSubtitle(
+        sub: SubtitleTrackItem,
+        prefetched: PrefetchedSubtitle,
+        fromAutoStartup: Boolean,
+    ) {
+        val subKey = SubtitlePrefetcher.subtitleKey(sub)
+        session.prefetchedSubtitles[subKey] = prefetched
+        session.selectedExternalSubKey = subKey
+        session.activeDisableSubtitles = false
+        session.failedExternalSubKey = null
+        session.activePreferredSubtitleLang = sub.language.ifBlank { sub.title }
+
+        if (
+            !isMpvActive &&
+            ownsPlayer &&
+            !request.isAudio &&
+            shouldUpgradeToMpvForPrefetchedSubtitle(prefetched, playbackPrefs)
+        ) {
+            switchVideoEngine(
+                ResolvedAndroidEngine.ENHANCED,
+                upgradeReasonForSubtitle(prefetched),
+            )
+            return
+        }
+
+        val label = sub.title.ifBlank { sub.language.ifBlank { "外挂字幕" } }
+        if (isMpvActive) {
+            session.mpvEngineHolder?.addExternalSubtitleFile(
+                localFilePath = prefetched.file.absolutePath,
+                title = label,
+                language = sub.language,
+                select = true,
+            )
+        } else {
+            injectPrefetchedSubtitlesIntoExo(selectKey = subKey)
+            exoPlayer?.currentTracks?.let { applySelectedExternalSubtitleToExoIfPresent(it) }
+        }
+        ui.tracksVersion++
+        ui.hudMessage = if (fromAutoStartup) "已加载外挂字幕：$label" else "字幕：$label"
+        if (hasEmittedVideoStart) {
+            dispatchVideoSync("track_change")
+        }
+    }
+
     fun applyInitialTrackPreferencesIfReady(tracks: Tracks) {
         val ep = exoPlayer ?: return
         if (request.isAudio || session.appliedInitialTracks) return
@@ -1025,6 +1250,14 @@ private class PlayerRuntimeController(
         if (request.disableSubtitles) {
             paramsBuilder = paramsBuilder.setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
             changed = true
+        } else if (session.selectedExternalSubKey != null) {
+            // 已指定或正在后台预取首选外挂字幕：若已挂载则直接选中，否则保持等待预取完成注入
+            if (changed) {
+                ep.trackSelectionParameters = paramsBuilder.build()
+                ui.tracksVersion++
+            }
+            applySelectedExternalSubtitleToExoIfPresent(tracks)
+            return
         } else if (textGroups.isNotEmpty()) {
             val flattenedSubs = buildList {
                 textGroups.forEach { grp ->
@@ -1088,6 +1321,57 @@ private class PlayerRuntimeController(
     }
 
     fun selectSubtitleChoice(choice: ResolvedTrackChoice) {
+        val extSub = choice.externalSub
+        if (extSub != null) {
+            ui.showSubtitleSheet = false
+            val subKey = SubtitlePrefetcher.subtitleKey(extSub)
+            session.activeSubtitleJob?.cancel()
+            session.activeSubtitleJob = null
+            session.failedExternalSubKey = null
+            session.activeDisableSubtitles = false
+            session.selectedExternalSubKey = subKey
+            session.activePreferredSubtitleLang = extSub.language.ifBlank { extSub.title }
+
+            val cached = subtitlePrefetcher?.getCached(extSub) ?: session.prefetchedSubtitles[subKey]
+            if (cached != null && cached.file.exists()) {
+                session.loadingExternalSubKey = null
+                applyPrefetchedExternalSubtitle(extSub, cached, fromAutoStartup = false)
+                return
+            }
+            val prefetcher = subtitlePrefetcher
+            if (prefetcher == null) {
+                ui.hudMessage = "外挂字幕不可用"
+                return
+            }
+            session.loadingExternalSubKey = subKey
+            ui.tracksVersion++
+            session.activeSubtitleJob = playerScope.launch {
+                val res = prefetcher.prefetch(extSub)
+                if (session.loadingExternalSubKey == subKey) {
+                    session.loadingExternalSubKey = null
+                }
+                res.onSuccess { prefetched ->
+                    session.prefetchedSubtitles[subKey] = prefetched
+                    if (session.selectedExternalSubKey == subKey && !session.activeDisableSubtitles) {
+                        applyPrefetchedExternalSubtitle(extSub, prefetched, fromAutoStartup = false)
+                    }
+                }.onFailure {
+                    if (session.selectedExternalSubKey == subKey) {
+                        session.selectedExternalSubKey = null
+                    }
+                    session.failedExternalSubKey = subKey
+                    ui.tracksVersion++
+                    ui.hudMessage = "外挂字幕加载失败，请点击字幕菜单重试"
+                }
+            }
+            return
+        }
+
+        session.activeSubtitleJob?.cancel()
+        session.activeSubtitleJob = null
+        session.loadingExternalSubKey = null
+        session.selectedExternalSubKey = null
+
         if (isMpvActive) {
             if (choice.trackId == null) {
                 session.mpvEngineHolder?.disableSubtitles()
@@ -1147,47 +1431,136 @@ private class PlayerRuntimeController(
     }
 }
 
+@OptIn(UnstableApi::class)
 private fun resolveSubtitleChoices(
     isMpvActive: Boolean,
     exoPlayer: ExoPlayer?,
+    mpvEngine: MpvPlaybackEngine?,
     mpvSubtitleTracks: List<EngineTrackItem>,
+    externalSubtitles: List<SubtitleTrackItem>,
+    prefetchedSubtitles: Map<String, PrefetchedSubtitle>,
+    selectedExternalSubKey: String?,
+    loadingExternalSubKey: String?,
+    failedExternalSubKey: String?,
+    disableSubtitles: Boolean,
 ): List<ResolvedTrackChoice> {
     val list = mutableListOf<ResolvedTrackChoice>()
+    val validExtSubs = externalSubtitles.filter { it.url.isNotBlank() }
+
     if (isMpvActive) {
-        val anySelected = mpvSubtitleTracks.any { it.isSelected }
+        val extTrackIdBySubKey = HashMap<String, String>()
+        for (sub in validExtSubs) {
+            val subKey = SubtitlePrefetcher.subtitleKey(sub)
+            val localFile = prefetchedSubtitles[subKey]?.file
+            if (localFile != null) {
+                mpvEngine?.findTrackIdForExternalFile(localFile.absolutePath)?.let { tid ->
+                    extTrackIdBySubKey[subKey] = tid
+                }
+            }
+        }
+        val mappedExtIds = extTrackIdBySubKey.values.toSet()
+        val embeddedTracks = mpvSubtitleTracks.filter { it.id !in mappedExtIds }
+        val anySelected = !disableSubtitles && (
+            selectedExternalSubKey != null || embeddedTracks.any { it.isSelected }
+            )
         list += ResolvedTrackChoice("关闭字幕", null, null, null, -1, !anySelected)
-        mpvSubtitleTracks.forEachIndexed { idx, track ->
+        embeddedTracks.forEachIndexed { idx, track ->
             list += ResolvedTrackChoice(
-                label = track.label,
+                label = "内封 · ${track.label}",
                 language = track.language,
                 trackId = track.id,
                 group = null,
                 trackIndex = idx,
-                selected = track.isSelected,
+                selected = !disableSubtitles && selectedExternalSubKey == null && track.isSelected,
+            )
+        }
+        validExtSubs.forEachIndexed { idx, sub ->
+            val subKey = SubtitlePrefetcher.subtitleKey(sub)
+            val prefetched = prefetchedSubtitles[subKey]
+            val fmtTag = prefetched?.format?.extension?.uppercase()
+            val label = listOfNotNull(
+                "外挂",
+                sub.title.takeIf { it.isNotBlank() },
+                sub.language.takeIf { it.isNotBlank() && it != "und" },
+                fmtTag,
+            ).distinct().joinToString(" · ").ifBlank { "外挂字幕 ${idx + 1}" }
+            val loading = loadingExternalSubKey == subKey
+            val failed = failedExternalSubKey == subKey && !loading
+            list += ResolvedTrackChoice(
+                label = label,
+                language = sub.language,
+                trackId = extTrackIdBySubKey[subKey],
+                group = null,
+                trackIndex = idx,
+                selected = !disableSubtitles && selectedExternalSubKey == subKey,
+                externalSub = sub,
+                isLoading = loading,
+                isFailed = failed,
             )
         }
         return list
     }
-    val ep = exoPlayer ?: return list
-    val tracks = ep.currentTracks
-    val isTextDisabled = ep.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)
-    list += ResolvedTrackChoice("关闭字幕", null, null, null, -1, isTextDisabled)
-    tracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }.forEachIndexed { gIdx, grp ->
+
+    val ep = exoPlayer
+    val tracks = ep?.currentTracks
+    val isTextDisabled = ep?.trackSelectionParameters?.disabledTrackTypes?.contains(C.TRACK_TYPE_TEXT) == true
+
+    val exoExtMatch = HashMap<String, Pair<Tracks.Group, Int>>()
+    val embeddedExoItems = mutableListOf<ResolvedTrackChoice>()
+    tracks?.groups?.filter { it.type == C.TRACK_TYPE_TEXT }?.forEachIndexed { gIdx, grp ->
         for (i in 0 until grp.length) {
             val fmt = grp.getTrackFormat(i)
-            val label = listOfNotNull(
-                fmt.label?.takeIf { it.isNotBlank() },
-                fmt.language?.takeIf { it.isNotBlank() && it != "und" },
-            ).joinToString(" · ").ifBlank { "字幕轨道 ${gIdx + 1}" }
-            list += ResolvedTrackChoice(
-                label = label,
-                language = fmt.language,
-                trackId = fmt.id,
-                group = grp,
-                trackIndex = i,
-                selected = !isTextDisabled && grp.isTrackSelected(i),
-            )
+            val rawId = fmt.id.orEmpty()
+            val markerIdx = rawId.indexOf(EXO_EXT_SUB_ID_PREFIX)
+            if (markerIdx >= 0) {
+                val subKey = rawId.substring(markerIdx + EXO_EXT_SUB_ID_PREFIX.length)
+                exoExtMatch[subKey] = grp to i
+            } else {
+                val baseLabel = listOfNotNull(
+                    fmt.label?.takeIf { it.isNotBlank() },
+                    fmt.language?.takeIf { it.isNotBlank() && it != "und" },
+                ).joinToString(" · ").ifBlank { "字幕轨道 ${gIdx + 1}" }
+                embeddedExoItems += ResolvedTrackChoice(
+                    label = "内封 · $baseLabel",
+                    language = fmt.language,
+                    trackId = fmt.id,
+                    group = grp,
+                    trackIndex = i,
+                    selected = !disableSubtitles && !isTextDisabled && selectedExternalSubKey == null && grp.isTrackSelected(i),
+                )
+            }
         }
+    }
+
+    val anySelected = !disableSubtitles && (
+        selectedExternalSubKey != null || embeddedExoItems.any { it.selected }
+        )
+    list += ResolvedTrackChoice("关闭字幕", null, null, null, -1, !anySelected)
+    list += embeddedExoItems
+    validExtSubs.forEachIndexed { idx, sub ->
+        val subKey = SubtitlePrefetcher.subtitleKey(sub)
+        val prefetched = prefetchedSubtitles[subKey]
+        val fmtTag = prefetched?.format?.extension?.uppercase()
+        val label = listOfNotNull(
+            "外挂",
+            sub.title.takeIf { it.isNotBlank() },
+            sub.language.takeIf { it.isNotBlank() && it != "und" },
+            fmtTag,
+        ).distinct().joinToString(" · ").ifBlank { "外挂字幕 ${idx + 1}" }
+        val exoPair = exoExtMatch[subKey]
+        val loading = loadingExternalSubKey == subKey
+        val failed = failedExternalSubKey == subKey && !loading
+        list += ResolvedTrackChoice(
+            label = label,
+            language = sub.language,
+            trackId = sub.id,
+            group = exoPair?.first,
+            trackIndex = exoPair?.second ?: idx,
+            selected = !disableSubtitles && selectedExternalSubKey == subKey,
+            externalSub = sub,
+            isLoading = loading,
+            isFailed = failed,
+        )
     }
     return list
 }
@@ -1287,6 +1660,22 @@ fun NativeMediaPlayerOverlay(
     }
 
     val ownsPlayer = sharedPlayer == null
+    val playerScope = rememberCoroutineScope()
+    val initialExternalSub = remember(
+        request.url,
+        request.itemId,
+        request.subtitles,
+        request.preferredSubtitleId,
+        request.preferredSubtitleLang,
+        request.disableSubtitles,
+        ownsPlayer,
+    ) {
+        if (ownsPlayer && !request.isAudio) {
+            pickInitialExternalSubtitle(request, playbackPrefs)
+        } else {
+            null
+        }
+    }
     val enginePlan = remember(
         request.url,
         request.isAudio,
@@ -1302,12 +1691,30 @@ fun NativeMediaPlayerOverlay(
             ownsPlayer = ownsPlayer,
             primaryEngineId = enginePlan.primary,
             bestInitialResumeMs = bestInitialResumeMs,
+            initialExternalSubKey = initialExternalSub?.let { SubtitlePrefetcher.subtitleKey(it) },
         )
+    }
+    val subtitlePrefetcher = remember(request.url, request.itemId, ownsPlayer) {
+        if (ownsPlayer && !request.isAudio && request.subtitles.isNotEmpty()) {
+            SubtitlePrefetcher(
+                context = context,
+                request = request,
+                activeStreamProvider = { session.activeStreamRouteRef.get() },
+            )
+        } else {
+            null
+        }
+    }
+    DisposableEffect(subtitlePrefetcher) {
+        onDispose {
+            session.activeSubtitleJob?.cancel()
+            subtitlePrefetcher?.close()
+        }
     }
 
     val isMpvActive = ownsPlayer && !request.isAudio && session.activeEngineKind == ResolvedAndroidEngine.ENHANCED
-    val exoPlayer: ExoPlayer? = remember(request.url, sharedPlayer, isMpvActive) {
-        if (isMpvActive) {
+    val exoPlayer: ExoPlayer? = remember(request.url, sharedPlayer, isMpvActive, session.startupSubtitleGateReady) {
+        if (isMpvActive || (!session.startupSubtitleGateReady && ownsPlayer && !request.isAudio)) {
             null
         } else {
             val built = sharedPlayer ?: buildConfiguredExoPlayer(
@@ -1315,6 +1722,8 @@ fun NativeMediaPlayerOverlay(
                 request = request,
                 resumePositionOverrideMs = session.engineCarryPositionMs,
                 activeStreamProvider = { session.activeStreamRouteRef.get() },
+                prefetchedSubtitles = session.prefetchedSubtitles.toMap(),
+                deferRemoteSubtitles = ownsPlayer && !request.isAudio,
             )
             session.positionMs = session.positionMs.coerceAtLeast(built.currentPosition.coerceAtLeast(0L))
             session.durationMs = (built.duration).coerceAtLeast(1L)
@@ -1346,7 +1755,17 @@ fun NativeMediaPlayerOverlay(
     val latestCloseState = rememberUpdatedState(onClose)
     val latestMetadataEnrichedState = rememberUpdatedState(onMetadataEnriched)
 
-    val controller = remember(request, ownsPlayer, exoPlayer, isMpvActive, videoSyncTracker, instanceUrl, repository) {
+    val controller = remember(
+        request,
+        ownsPlayer,
+        exoPlayer,
+        isMpvActive,
+        videoSyncTracker,
+        instanceUrl,
+        repository,
+        subtitlePrefetcher,
+        playerScope,
+    ) {
         PlayerRuntimeController(
             context = context,
             request = request,
@@ -1368,6 +1787,8 @@ fun NativeMediaPlayerOverlay(
             latestSwitchRequestState = latestSwitchRequestState,
             latestCloseState = latestCloseState,
             latestMetadataEnrichedState = latestMetadataEnrichedState,
+            subtitlePrefetcher = subtitlePrefetcher,
+            playerScope = playerScope,
         )
     }
 
@@ -1377,6 +1798,10 @@ fun NativeMediaPlayerOverlay(
         canMinimizeAudio = canMinimizeAudio,
         onMinimizeToMiniBar = onMinimizeToMiniBar,
         onCloseAudio = onClose,
+    )
+    PlayerInitialSubtitlePrefetchEffect(
+        controller = controller,
+        initialExternalSub = initialExternalSub,
     )
     PlayerMpvEngineEffect(controller = controller)
     PlayerExoEngineEffect(controller = controller)
@@ -1472,13 +1897,94 @@ private fun PlayerBackAndCommonTimersEffect(
     }
 }
 
+/**
+ * 起播阶段首选外挂字幕受控预取协调器：
+ * - 启动后台无 Range 预取并在顶部展示非阻塞「正在加载外挂字幕…」提示；
+ * - 最多等待 2500ms：若已完成则零延迟带真实嗅探格式与最优内核（含内嵌字体自动切 MPV）起播；
+ * - 若超过 2500ms 仍在实时子集化，则立即放行画面起播，并在预取完成瞬间动态注入/热切对齐当前进度。
+ */
+@Composable
+private fun PlayerInitialSubtitlePrefetchEffect(
+    controller: PlayerRuntimeController,
+    initialExternalSub: SubtitleTrackItem?,
+) {
+    val latestController by rememberUpdatedState(controller)
+    val session = controller.session
+    val ui = controller.ui
+    val prefetcher = controller.subtitlePrefetcher
+    val request = controller.request
+
+    LaunchedEffect(request.url, request.itemId, controller.ownsPlayer) {
+        if (!controller.ownsPlayer || request.isAudio || initialExternalSub == null || prefetcher == null) {
+            session.startupSubtitleGateReady = true
+            return@LaunchedEffect
+        }
+        val targetKey = SubtitlePrefetcher.subtitleKey(initialExternalSub)
+        session.loadingExternalSubKey = targetKey
+        session.failedExternalSubKey = null
+
+        val fastResult = withTimeoutOrNull(2_500L) {
+            prefetcher.prefetch(initialExternalSub)
+        }
+        if (fastResult != null) {
+            if (session.loadingExternalSubKey == targetKey) {
+                session.loadingExternalSubKey = null
+            }
+            fastResult.onSuccess { prefetched ->
+                session.prefetchedSubtitles[targetKey] = prefetched
+                if (
+                    session.activeEngineKind != ResolvedAndroidEngine.ENHANCED &&
+                    shouldUpgradeToMpvForPrefetchedSubtitle(prefetched, latestController.playbackPrefs)
+                ) {
+                    session.activeEngineKind = ResolvedAndroidEngine.ENHANCED
+                    ui.hudMessage = upgradeReasonForSubtitle(prefetched)
+                }
+            }.onFailure {
+                if (session.selectedExternalSubKey == targetKey) {
+                    session.selectedExternalSubKey = null
+                }
+                session.failedExternalSubKey = targetKey
+                ui.hudMessage = "外挂字幕加载失败，可在字幕菜单点击重试"
+            }
+            session.startupSubtitleGateReady = true
+            return@LaunchedEffect
+        }
+
+        // 子集化超过 2.5s 仍在进行中：先放行视频起播，后台继续等待同一预取任务完成并实时对齐注入
+        session.startupSubtitleGateReady = true
+        val slowResult = prefetcher.prefetch(initialExternalSub)
+        if (session.loadingExternalSubKey == targetKey) {
+            session.loadingExternalSubKey = null
+        }
+        slowResult.onSuccess { prefetched ->
+            session.prefetchedSubtitles[targetKey] = prefetched
+            if (session.selectedExternalSubKey == targetKey && !session.activeDisableSubtitles) {
+                latestController.applyPrefetchedExternalSubtitle(
+                    sub = initialExternalSub,
+                    prefetched = prefetched,
+                    fromAutoStartup = true,
+                )
+            } else {
+                ui.tracksVersion++
+            }
+        }.onFailure {
+            if (session.selectedExternalSubKey == targetKey) {
+                session.selectedExternalSubKey = null
+            }
+            session.failedExternalSubKey = targetKey
+            ui.tracksVersion++
+            ui.hudMessage = "外挂字幕加载失败，可在字幕菜单点击重试"
+        }
+    }
+}
+
 @Composable
 private fun PlayerMpvEngineEffect(controller: PlayerRuntimeController) {
     val request = controller.request
     val session = controller.session
     val ui = controller.ui
-    DisposableEffect(request.url, controller.isMpvActive) {
-        if (!controller.isMpvActive) {
+    DisposableEffect(request.url, controller.isMpvActive, session.startupSubtitleGateReady) {
+        if (!controller.isMpvActive || !session.startupSubtitleGateReady) {
             session.mpvEngineHolder = null
             return@DisposableEffect onDispose {}
         }
@@ -1538,6 +2044,11 @@ private fun PlayerMpvEngineEffect(controller: PlayerRuntimeController) {
                 controller.isPlaying = false
                 ui.hudMessage = "无法加载当前媒体流，请检查网络或在右上角菜单切换内核重试"
             },
+            prefetchedSubtitlesProvider = { session.prefetchedSubtitles.toMap() },
+            selectedExternalSubKeyProvider = {
+                if (session.activeDisableSubtitles) null else session.selectedExternalSubKey
+            },
+            deferRemoteSubtitlesToPrefetcher = true,
         )
         engine.setResizeMode(ui.resizeModeIndex)
         session.mpvEngineHolder = engine
@@ -1708,6 +2219,7 @@ private fun createExoOverlayListener(
             val hadInitial = session.appliedInitialTracks
             ui.tracksVersion++
             controller.applyInitialTrackPreferencesIfReady(tracks)
+            controller.applySelectedExternalSubtitleToExoIfPresent(tracks)
             extractLiveAudioMetaIfNeeded()
             if (controller.ownsPlayer && !request.isAudio && hadInitial && controller.hasEmittedVideoStart) {
                 controller.dispatchVideoSync("track_change")
@@ -2172,44 +2684,61 @@ private fun NativeAudioPlayerStage(
     val effectiveShuffle = if (onUpdateAudioShuffle != null) audioShuffleEnabled else ui.localShuffle
     val effectiveRepeatMode = if (onUpdateAudioRepeatMode != null) audioRepeatMode else ui.localRepeatMode
     val defaultAudioSpeedIdx = controller.speeds.indexOf(1.0f).coerceAtLeast(0)
-    val audioDockActions = listOf(
-        ExpressiveDockAction(
-            icon = Icons.Rounded.Shuffle,
-            contentDescription = "随机播放",
-            active = effectiveShuffle,
-            onClick = {
-                val nextVal = !effectiveShuffle
-                if (onUpdateAudioShuffle != null) onUpdateAudioShuffle(nextVal) else ui.localShuffle = nextVal
-                controller.exoPlayer?.shuffleModeEnabled = nextVal
-                ui.hudMessage = if (nextVal) "已开启随机播放" else "已关闭随机播放"
-            },
-        ),
-        ExpressiveDockAction(
-            icon = if (effectiveRepeatMode == Player.REPEAT_MODE_ONE) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
-            contentDescription = "循环模式",
-            active = effectiveRepeatMode != Player.REPEAT_MODE_OFF,
-            onClick = {
-                val nextMode = when (effectiveRepeatMode) {
-                    Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
-                    Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
-                    else -> Player.REPEAT_MODE_OFF
-                }
-                if (onUpdateAudioRepeatMode != null) onUpdateAudioRepeatMode(nextMode) else ui.localRepeatMode = nextMode
-                controller.exoPlayer?.repeatMode = if (nextMode == Player.REPEAT_MODE_ONE) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
-                ui.hudMessage = when (nextMode) {
-                    Player.REPEAT_MODE_ALL -> "列表循环"
-                    Player.REPEAT_MODE_ONE -> "单曲循环"
-                    else -> "顺序播放"
-                }
-            },
-        ),
-        ExpressiveDockAction(
-            icon = Icons.Rounded.Speed,
-            contentDescription = "播放倍速",
-            active = controller.speedIndex != defaultAudioSpeedIdx,
-            onClick = { ui.showSpeedSheet = true },
-        ),
-    )
+    val currentAudioSpeedLabel = "${controller.speeds.getOrElse(controller.speedIndex) { 1.0f }}x"
+    val audioDockActions = buildList {
+        add(
+            ExpressiveDockAction(
+                icon = Icons.Rounded.Lyrics,
+                contentDescription = "同步歌词",
+                active = ui.showLyricsView,
+                onClick = { ui.showLyricsView = !ui.showLyricsView },
+            ),
+        )
+        add(
+            ExpressiveDockAction(
+                icon = Icons.Rounded.Shuffle,
+                contentDescription = "随机播放",
+                active = effectiveShuffle,
+                onClick = {
+                    val nextVal = !effectiveShuffle
+                    if (onUpdateAudioShuffle != null) onUpdateAudioShuffle(nextVal) else ui.localShuffle = nextVal
+                    controller.exoPlayer?.shuffleModeEnabled = nextVal
+                    ui.hudMessage = if (nextVal) "已开启随机播放" else "已关闭随机播放"
+                },
+            ),
+        )
+        add(
+            ExpressiveDockAction(
+                icon = if (effectiveRepeatMode == Player.REPEAT_MODE_ONE) Icons.Rounded.RepeatOne else Icons.Rounded.Repeat,
+                contentDescription = "循环模式",
+                active = effectiveRepeatMode != Player.REPEAT_MODE_OFF,
+                onClick = {
+                    val nextMode = when (effectiveRepeatMode) {
+                        Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+                        Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+                        else -> Player.REPEAT_MODE_OFF
+                    }
+                    if (onUpdateAudioRepeatMode != null) onUpdateAudioRepeatMode(nextMode) else ui.localRepeatMode = nextMode
+                    controller.exoPlayer?.repeatMode = if (nextMode == Player.REPEAT_MODE_ONE) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+                    ui.hudMessage = when (nextMode) {
+                        Player.REPEAT_MODE_ALL -> "列表循环"
+                        Player.REPEAT_MODE_ONE -> "单曲循环"
+                        else -> "顺序播放"
+                    }
+                },
+            ),
+        )
+        if (request.queue.size > 1) {
+            add(
+                ExpressiveDockAction(
+                    icon = Icons.AutoMirrored.Rounded.QueueMusic,
+                    contentDescription = "播放队列",
+                    active = ui.showQueueSheet,
+                    onClick = { ui.showQueueSheet = true },
+                ),
+            )
+        }
+    }
 
     val onPreviousTrack = {
         if (controller.activeCurrentPositionMs() > 3_000L) {
@@ -2258,7 +2787,10 @@ private fun NativeAudioPlayerStage(
                 lrcListState = lrcListState,
                 activeLrcIdx = activeLrcIdx,
                 audioDockActions = audioDockActions,
+                currentSpeedLabel = currentAudioSpeedLabel,
+                speedActive = controller.speedIndex != defaultAudioSpeedIdx,
                 onBackOrMinimize = onBackOrMinimize,
+                onStopAndClose = onClose,
                 onPreviousTrack = onPreviousTrack,
                 onNextTrack = onNextTrack,
             )
@@ -2274,7 +2806,10 @@ private fun NativeAudioPlayerStage(
                 lrcListState = lrcListState,
                 activeLrcIdx = activeLrcIdx,
                 audioDockActions = audioDockActions,
+                currentSpeedLabel = currentAudioSpeedLabel,
+                speedActive = controller.speedIndex != defaultAudioSpeedIdx,
                 onBackOrMinimize = onBackOrMinimize,
+                onStopAndClose = onClose,
                 onPreviousTrack = onPreviousTrack,
                 onNextTrack = onNextTrack,
             )
@@ -2340,12 +2875,19 @@ private fun AudioTopBar(
     compact: Boolean,
     canMinimizeAudio: Boolean,
     showLyricsView: Boolean,
-    showQueueSheet: Boolean,
+    hasQueue: Boolean,
+    currentSpeedLabel: String,
+    speedActive: Boolean,
     playerPalette: PlayerExpressivePalette,
     onBackOrMinimize: () -> Unit,
     onToggleLyrics: () -> Unit,
     onOpenQueue: () -> Unit,
+    onOpenSpeed: () -> Unit,
+    onStopAndClose: () -> Unit,
 ) {
+    var showMenu by remember { mutableStateOf(false) }
+    val btnSz = if (compact) 38.dp else 44.dp
+    val iconSz = if (compact) 22.dp else 24.dp
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -2355,14 +2897,14 @@ private fun AudioTopBar(
             onClick = onBackOrMinimize,
             shape = CircleShape,
             color = playerPalette.dock,
-            modifier = Modifier.size(if (compact) 38.dp else 44.dp),
+            modifier = Modifier.size(btnSz),
         ) {
             Box(contentAlignment = Alignment.Center) {
                 Icon(
                     imageVector = if (canMinimizeAudio) Icons.Rounded.KeyboardArrowDown else Icons.AutoMirrored.Rounded.ArrowBack,
                     contentDescription = if (canMinimizeAudio) "收起至迷你播放条" else "关闭播放器",
                     tint = Color.White,
-                    modifier = Modifier.size(if (compact) 22.dp else 24.dp),
+                    modifier = Modifier.size(iconSz),
                 )
             }
         }
@@ -2374,20 +2916,63 @@ private fun AudioTopBar(
             fontWeight = FontWeight.Medium,
         )
 
-        ExpressiveSplitIconPair(
-            firstIcon = Icons.Rounded.Lyrics,
-            firstDesc = "同步歌词",
-            firstActive = showLyricsView,
-            onFirstClick = onToggleLyrics,
-            secondIcon = Icons.AutoMirrored.Rounded.QueueMusic,
-            secondDesc = "播放队列",
-            secondActive = showQueueSheet,
-            onSecondClick = onOpenQueue,
-            containerColor = playerPalette.dock,
-            activeContainerColor = playerPalette.accent,
-            contentColor = Color.White.copy(alpha = 0.90f),
-            activeContentColor = playerPalette.onAccent,
-        )
+        Box {
+            Surface(
+                onClick = { showMenu = true },
+                shape = CircleShape,
+                color = if (speedActive) playerPalette.accent else playerPalette.dock,
+                modifier = Modifier.size(btnSz),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Rounded.MoreHoriz,
+                        contentDescription = "更多选项",
+                        tint = if (speedActive) playerPalette.onAccent else Color.White,
+                        modifier = Modifier.size(iconSz),
+                    )
+                }
+            }
+            DropdownMenu(
+                expanded = showMenu,
+                onDismissRequest = { showMenu = false },
+            ) {
+                DropdownMenuItem(
+                    text = { Text(if (showLyricsView) "返回封面视图" else "全屏歌词视图") },
+                    leadingIcon = { Icon(Icons.Rounded.Lyrics, contentDescription = null) },
+                    onClick = {
+                        showMenu = false
+                        onToggleLyrics()
+                    },
+                )
+                if (hasQueue) {
+                    DropdownMenuItem(
+                        text = { Text("播放队列") },
+                        leadingIcon = { Icon(Icons.AutoMirrored.Rounded.QueueMusic, contentDescription = null) },
+                        onClick = {
+                            showMenu = false
+                            onOpenQueue()
+                        },
+                    )
+                }
+                DropdownMenuItem(
+                    text = { Text("播放速度 ($currentSpeedLabel)") },
+                    leadingIcon = { Icon(Icons.Rounded.Speed, contentDescription = null) },
+                    onClick = {
+                        showMenu = false
+                        onOpenSpeed()
+                    },
+                )
+                HorizontalDivider()
+                DropdownMenuItem(
+                    text = { Text("停止并关闭") },
+                    leadingIcon = { Icon(Icons.Rounded.Close, contentDescription = null) },
+                    onClick = {
+                        showMenu = false
+                        onStopAndClose()
+                    },
+                )
+            }
+        }
     }
 }
 
@@ -2468,7 +3053,10 @@ private fun AudioLandscapeBody(
     lrcListState: LazyListState,
     activeLrcIdx: Int,
     audioDockActions: List<ExpressiveDockAction>,
+    currentSpeedLabel: String,
+    speedActive: Boolean,
     onBackOrMinimize: () -> Unit,
+    onStopAndClose: () -> Unit,
     onPreviousTrack: () -> Unit,
     onNextTrack: () -> Unit,
 ) {
@@ -2534,11 +3122,15 @@ private fun AudioLandscapeBody(
                 compact = compactHeight,
                 canMinimizeAudio = canMinimizeAudio,
                 showLyricsView = ui.showLyricsView,
-                showQueueSheet = ui.showQueueSheet,
+                hasQueue = controller.request.queue.size > 1,
+                currentSpeedLabel = currentSpeedLabel,
+                speedActive = speedActive,
                 playerPalette = playerPalette,
                 onBackOrMinimize = onBackOrMinimize,
                 onToggleLyrics = { ui.showLyricsView = !ui.showLyricsView },
                 onOpenQueue = { ui.showQueueSheet = true },
+                onOpenSpeed = { ui.showSpeedSheet = true },
+                onStopAndClose = onStopAndClose,
             )
 
             AnimatedContent(
@@ -2679,7 +3271,10 @@ private fun AudioPortraitBody(
     lrcListState: LazyListState,
     activeLrcIdx: Int,
     audioDockActions: List<ExpressiveDockAction>,
+    currentSpeedLabel: String,
+    speedActive: Boolean,
     onBackOrMinimize: () -> Unit,
+    onStopAndClose: () -> Unit,
     onPreviousTrack: () -> Unit,
     onNextTrack: () -> Unit,
 ) {
@@ -2704,11 +3299,15 @@ private fun AudioPortraitBody(
             compact = false,
             canMinimizeAudio = canMinimizeAudio,
             showLyricsView = ui.showLyricsView,
-            showQueueSheet = ui.showQueueSheet,
+            hasQueue = controller.request.queue.size > 1,
+            currentSpeedLabel = currentSpeedLabel,
+            speedActive = speedActive,
             playerPalette = playerPalette,
             onBackOrMinimize = onBackOrMinimize,
             onToggleLyrics = { ui.showLyricsView = !ui.showLyricsView },
             onOpenQueue = { ui.showQueueSheet = true },
+            onOpenSpeed = { ui.showSpeedSheet = true },
+            onStopAndClose = onStopAndClose,
         )
 
         Spacer(Modifier.height(22.dp))
@@ -3036,8 +3635,32 @@ private fun NativeVideoPlayerStage(
     val audioManager = remember { controller.context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager }
     var dragSeekDeltaMs by remember { mutableLongStateOf(0L) }
 
-    val subtitleChoices = remember(ui.tracksVersion, controller.exoPlayer, session.mpvSubtitleTracks, controller.isMpvActive) {
-        resolveSubtitleChoices(controller.isMpvActive, controller.exoPlayer, session.mpvSubtitleTracks)
+    val prefetchedSnapshot = session.prefetchedSubtitles.toMap()
+    val subtitleChoices = remember(
+        ui.tracksVersion,
+        controller.exoPlayer,
+        session.mpvEngineHolder,
+        session.mpvSubtitleTracks,
+        controller.isMpvActive,
+        request.subtitles,
+        prefetchedSnapshot,
+        session.selectedExternalSubKey,
+        session.loadingExternalSubKey,
+        session.failedExternalSubKey,
+        session.activeDisableSubtitles,
+    ) {
+        resolveSubtitleChoices(
+            isMpvActive = controller.isMpvActive,
+            exoPlayer = controller.exoPlayer,
+            mpvEngine = session.mpvEngineHolder,
+            mpvSubtitleTracks = session.mpvSubtitleTracks,
+            externalSubtitles = request.subtitles,
+            prefetchedSubtitles = prefetchedSnapshot,
+            selectedExternalSubKey = session.selectedExternalSubKey,
+            loadingExternalSubKey = session.loadingExternalSubKey,
+            failedExternalSubKey = session.failedExternalSubKey,
+            disableSubtitles = session.activeDisableSubtitles,
+        )
     }
     val audioChoices = remember(ui.tracksVersion, controller.exoPlayer, session.mpvAudioTracks, controller.isMpvActive) {
         resolveAudioChoices(controller.isMpvActive, controller.exoPlayer, session.mpvAudioTracks)
@@ -3225,6 +3848,18 @@ private fun NativeVideoPlayerStage(
                 ) {
                     Text(ui.hudMessage.orEmpty(), color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 }
+            } else if (session.loadingExternalSubKey != null) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .windowInsetsPadding(safePlayerInsets.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
+                        .padding(top = if (compactVideoHeight) 52.dp else 66.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.74f))
+                        .padding(horizontal = 16.dp, vertical = 7.dp),
+                ) {
+                    Text("正在加载外挂字幕…", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                }
             } else if (session.resumeBannerPositionMs != null) {
                 ResumeFromHistoryBanner(
                     savedMs = session.resumeBannerPositionMs,
@@ -3373,20 +4008,26 @@ private fun VideoSurfaceCanvas(controller: PlayerRuntimeController) {
     if (controller.isMpvActive) {
         val activeMpv = session.mpvEngineHolder
         if (activeMpv != null) {
-            AndroidView(
-                factory = { ctx ->
-                    SurfaceView(ctx).apply {
-                        keepScreenOn = true
-                        layoutParams = ViewGroup.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                        )
-                        holder.addCallback(activeMpv.createSurfaceCallback())
-                    }
-                },
-                update = { _ -> activeMpv.setResizeMode(ui.resizeModeIndex) },
-                modifier = Modifier.fillMaxSize(),
-            )
+            androidx.compose.runtime.key(activeMpv) {
+                AndroidView(
+                    factory = { ctx ->
+                        SurfaceView(ctx).apply {
+                            keepScreenOn = true
+                            layoutParams = ViewGroup.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                            )
+                            holder.addCallback(activeMpv.createSurfaceCallback())
+                            activeMpv.attachExistingSurfaceIfReady(holder)
+                        }
+                    },
+                    update = { sv ->
+                        activeMpv.attachExistingSurfaceIfReady(sv.holder)
+                        activeMpv.setResizeMode(ui.resizeModeIndex)
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
         }
     } else {
         val useTexture = controller.playbackPrefs.surfaceType == "texture"
@@ -4089,7 +4730,32 @@ private fun VideoSubtitleSelectorBottomSheet(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        Text(choice.label, color = colors.textPrimary, fontSize = 15.sp, fontWeight = if (choice.selected) FontWeight.Bold else FontWeight.Normal)
+                        Column(
+                            modifier = Modifier.weight(1f).padding(end = 10.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                text = choice.label,
+                                color = colors.textPrimary,
+                                fontSize = 15.sp,
+                                fontWeight = if (choice.selected) FontWeight.Bold else FontWeight.Normal,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (choice.isLoading) {
+                                Text(
+                                    text = "正在加载外挂字幕…",
+                                    color = colors.accent,
+                                    fontSize = 12.sp,
+                                )
+                            } else if (choice.isFailed) {
+                                Text(
+                                    text = "加载失败 · 点击重试",
+                                    color = Color(0xFFFF8A80),
+                                    fontSize = 12.sp,
+                                )
+                            }
+                        }
                         if (choice.selected) {
                             Icon(Icons.Rounded.Check, contentDescription = null, tint = colors.accent, modifier = Modifier.size(18.dp))
                         }

@@ -9,6 +9,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <!-- 声明外部播放器与各媒体服务器原生客户端包可见性（Android 11+） -->
@@ -109,16 +110,63 @@
             </intent-filter>
         </service>
 
-        <!-- Jetpack Glance 桌面小组件 -->
+        <!-- Jetpack Glance APP 主体桌面小组件与可选配置页 -->
+        <activity
+            android:name="com.moviepilot.widget.AppWidgetConfigureActivity"
+            android:exported="true"
+            android:theme="@style/Theme.MoviePilot">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+
         <receiver
             android:name="com.moviepilot.widget.MoviePilotWidgetReceiver"
-            android:exported="true">
+            android:exported="true"
+            android:label="@string/mp_main_widget_label">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
                 android:resource="@xml/moviepilot_widget_info" />
+        </receiver>
+
+        <!-- 固定音频播控「正在播放」桌面小组件 -->
+        <receiver
+            android:name="com.moviepilot.widget.MoviePilotNowPlayingWidgetReceiver"
+            android:exported="true"
+            android:label="@string/mp_now_playing_widget_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.moviepilot.widget.ACTION_NOW_PLAYING_UPDATED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/moviepilot_now_playing_widget_info" />
+        </receiver>
+
+        <!-- 自定义插件预设模板与声明式布局桌面小组件 -->
+        <activity
+            android:name="com.moviepilot.widget.PluginWidgetConfigureActivity"
+            android:exported="true"
+            android:theme="@style/Theme.MoviePilot">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+
+        <receiver
+            android:name="com.moviepilot.widget.MoviePilotPluginWidgetReceiver"
+            android:exported="true"
+            android:label="@string/mp_plugin_widget_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.moviepilot.widget.ACTION_PLUGIN_WIDGET_RUNTIME_UPDATED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/moviepilot_plugin_widget_info" />
         </receiver>
 
         <!-- 受管缓存文件安全共享（用于 3D 社区勋章荣誉海报分享回退） -->

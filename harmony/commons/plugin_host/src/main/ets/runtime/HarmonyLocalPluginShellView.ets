@@ -12,6 +12,7 @@ import {
 } from './HarmonyPluginHostBridgeV2';
 import { HarmonyPluginRemoteCache } from './HarmonyPluginRemoteCache';
 import { buildHarmonyPluginVisualTokens } from './HarmonyPluginVisualTokens';
+import { HarmonyPluginCapsuleManager } from './HarmonyPluginCapsule';
 
 interface RemoteDescriptorItem {
   id: string;
@@ -68,6 +69,14 @@ export struct HarmonyLocalPluginShellView {
   private isShellReady: boolean = false;
   private pendingMountPayloadJson: string = '';
   private toastTimer: number = -1;
+  private backFallbackTimer: number = -1;
+
+  private clearBackFallbackTimer(): void {
+    if (this.backFallbackTimer !== -1) {
+      clearTimeout(this.backFallbackTimer);
+      this.backFallbackTimer = -1;
+    }
+  }
 
   aboutToAppear(): void {
     this.bridge = new HarmonyPluginHostBridgeV2(
@@ -90,7 +99,45 @@ export struct HarmonyLocalPluginShellView {
           this.errorMessage = msg || '本地运行时加载插件失败';
         },
         onPluginClose: () => {
+          this.clearBackFallbackTimer();
           this.onRequestDismiss();
+        },
+        onPluginMinimize: (reqId: string, payload: Record<string, Object>) => {
+          this.clearBackFallbackTimer();
+          this.bridge?.sendSimpleResponse(
+            reqId,
+            '{"minimized":true,"overlaySupported":false,"overlayGranted":false}'
+          );
+          // 确保当前插件先作为全局保活层托管，再切入胶囊态
+          const cur = HarmonyPluginCapsuleManager.shared().currentState();
+          if (!cur || cur.pluginId.toLowerCase() !== this.pluginId.toLowerCase()) {
+            HarmonyPluginCapsuleManager.shared().openPlugin(
+              this.pluginId,
+              this.pluginName || this.pluginId,
+              this.surface,
+              this.pluginHasPage,
+              '',
+              this.navKey
+            );
+          }
+          HarmonyPluginCapsuleManager.shared().minimizeActive(
+            payload,
+            this.pluginId,
+            this.pluginName || this.pluginId
+          );
+        },
+        onCapsuleUpdate: (payload: Record<string, Object>) => {
+          HarmonyPluginCapsuleManager.shared().updateCapsule(payload);
+        },
+        onPluginRestore: (reqId: string) => {
+          this.bridge?.sendSimpleResponse(reqId, '{"restored":true}');
+          HarmonyPluginCapsuleManager.shared().restoreFullWindow();
+        },
+        onNavBackResult: (handled: boolean) => {
+          this.clearBackFallbackTimer();
+          if (!handled) {
+            this.onRequestDismiss();
+          }
         },
         onHeaderUpdate: (title: string, actions: HarmonyPluginHeaderAction[]) => {
           this.onHeaderUpdate(title, actions);
@@ -111,19 +158,37 @@ export struct HarmonyLocalPluginShellView {
       },
       () => this.getAbilityContext()
     );
+    this.bridge.nativeCapabilities.setActivePluginId(this.pluginId);
+    const requestCloseOrBack = (): boolean => {
+      if (!this.isMounted || !this.bridge) {
+        return false;
+      }
+      this.clearBackFallbackTimer();
+      this.backFallbackTimer = setTimeout(() => {
+        this.backFallbackTimer = -1;
+        this.onRequestDismiss();
+      }, 500);
+      this.bridge.sendNavBack();
+      return true;
+    };
     this.onRegisterActions(
       (actionId: string) => {
         this.bridge?.sendHostAction(actionId);
       },
-      () => {
-        this.bridge?.sendNavBack();
-        return false;
-      }
+      requestCloseOrBack
+    );
+    HarmonyPluginCapsuleManager.shared().bindRuntimeHandlers(
+      (actionId: string) => {
+        this.bridge?.sendCapsuleAction(actionId);
+      },
+      requestCloseOrBack
     );
     this.prepareMountPayload();
   }
 
   aboutToDisappear(): void {
+    this.clearBackFallbackTimer();
+    HarmonyPluginCapsuleManager.shared().bindRuntimeHandlers(null, null);
     if (this.toastTimer !== -1) {
       clearTimeout(this.toastTimer);
       this.toastTimer = -1;
@@ -641,6 +706,13 @@ export struct HarmonyLocalPluginShellView {
                 this.onFallbackToLegacy();
               })
           }
+          Button('返回上一页')
+            .backgroundColor(Color.Transparent)
+            .fontColor(mpSecondaryText(this.isDark))
+            .fontSize(13)
+            .onClick(() => {
+              this.onRequestDismiss();
+            })
         }
         .padding(20)
         .margin({ left: 16, right: 16 })

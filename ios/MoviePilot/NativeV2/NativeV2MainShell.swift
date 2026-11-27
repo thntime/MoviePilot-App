@@ -32,6 +32,7 @@ struct NativeV2MainShell<PluginDestination: View>: View {
   @ObservedObject private var routeHub = NativeSystemRouteHub.shared
   @ObservedObject private var appearance = NativeAppearanceStore.shared
   @ObservedObject private var playbackLauncher = NativeMediaPlaybackLauncher.shared
+  @ObservedObject private var pluginCapsuleManager = PluginCapsuleManager.shared
   @Environment(\.verticalSizeClass) private var verticalSizeClass
   @Environment(\.nativeVerticalBarEdge) private var verticalBarEdge
   @State private var selectedTab: Page = .discover
@@ -51,11 +52,20 @@ struct NativeV2MainShell<PluginDestination: View>: View {
   @State private var minePath: [NativeWorkspaceDestination] = []
   @State private var morePath: [NativeWorkspaceDestination] = []
   @State private var searchPath: [NativeMediaIdentity] = []
+  private struct DeepLinkPluginTarget: Identifiable {
+    let id = UUID()
+    let pluginID: String
+    let surface: String?
+  }
+
   @State private var showsAgentSheet = false
   @State private var showsMessagesSheet = false
+  @State private var restoredCapsuleSheetTarget: MinimizedPluginSession?
+  @State private var deepLinkPluginTarget: DeepLinkPluginTarget?
   @State private var userTabAvatar: UIImage?
   @AppStorage("nativeV2.showFloatingAssistant") private var showFloatingAssistant = true
   @State private var discoverModules = NativeDiscoverModuleItem.defaults
+  @State private var extraRecommendSources: [RecommendSource] = []
   @State private var showsModuleSheet = false
   @State private var pendingModuleRefetch = false
   @State private var latestServerName: String?
@@ -118,6 +128,12 @@ struct NativeV2MainShell<PluginDestination: View>: View {
             .transition(.move(edge: .bottom).combined(with: .opacity))
             .zIndex(45)
         }
+        if pluginCapsuleManager.currentSession != nil && restoredCapsuleSheetTarget == nil {
+          NativePluginFloatingCapsuleOverlay(manager: pluginCapsuleManager) { sessionToRestore in
+            restoredCapsuleSheetTarget = sessionToRestore
+          }
+          .zIndex(46)
+        }
         if showFloatingAssistant && !usesDuoSideOperationBar && !showsAgentSheet
           && !showsMessagesSheet
         {
@@ -147,6 +163,39 @@ struct NativeV2MainShell<PluginDestination: View>: View {
     .environmentObject(dynamicActionCenter)
     .onAppear { consumeSystemRouteIfNeeded() }
     .onChange(of: routeHub.pendingTarget) { _ in consumeSystemRouteIfNeeded() }
+    .onChange(of: pluginCapsuleManager.restoreRequestNonce) { _ in
+      if let target = pluginCapsuleManager.currentSession {
+        restoredCapsuleSheetTarget = target
+      }
+    }
+    .sheet(item: $restoredCapsuleSheetTarget) { restored in
+      NativeVuePluginSheet(
+        session: session,
+        pluginID: restored.pluginID,
+        pluginName: restored.pluginName,
+        surface: restored.surface,
+        pluginHasPage: restored.pluginHasPage
+      )
+    }
+    .sheet(item: $deepLinkPluginTarget) { target in
+      if target.surface?.lowercased() == "config" {
+        NativeVuePluginSheet(
+          session: session,
+          pluginID: target.pluginID,
+          pluginName: target.pluginID,
+          surface: .config,
+          pluginHasPage: true
+        )
+      } else {
+        NavigationStack {
+          NativePluginDataPageView(
+            session: session,
+            pluginID: target.pluginID,
+            pluginName: target.pluginID
+          )
+        }
+      }
+    }
     .task(id: "\(snapshot.scope)|\(snapshot.user.avatar)") {
       userTabAvatar = await NativeUserAvatarRenderer.loadTabAvatar(
         session: session, avatar: snapshot.user.avatar)
@@ -1684,6 +1733,13 @@ struct NativeV2MainShell<PluginDestination: View>: View {
         morePath = [.pluginMarket]
       }
 
+    case .pluginDetail(let pluginID, let surface):
+      guard snapshot.user.isSuperuser else {
+        routeHub.postBanner(t("仅管理员可访问插件中心。"))
+        return
+      }
+      deepLinkPluginTarget = DeepLinkPluginTarget(pluginID: pluginID, surface: surface)
+
     case .agent(let prompt):
       pendingAgentPrompt = prompt ?? ""
       showsAgentSheet = true
@@ -2013,18 +2069,31 @@ struct NativeV2MainShell<PluginDestination: View>: View {
     }
 
     async let modulesTask = try? requestDiscoverModules()
+    async let extraSourcesTask = requestRecommendSources()
     async let moviesTask = try? requestDiscoverMedia("tmdb_movies", page: 1)
     async let tvTask = try? requestDiscoverMedia("tmdb_tvs", page: 1)
     async let trendingTask = try? requestRecommendMedia("tmdb_trending", page: 1)
     async let clientsTask = try? requestMediaServerClients()
-    let (loadedModules, movies, television, trending, clients) = await (
-      modulesTask, moviesTask, tvTask, trendingTask, clientsTask
+    let (loadedModules, loadedExtraSources, movies, television, trending, clients) = await (
+      modulesTask, extraSourcesTask, moviesTask, tvTask, trendingTask, clientsTask
     )
     guard !Task.isCancelled, discoveryGeneration == generation else { return }
 
-    let resolvedModules = NativeDiscoverModuleItem.normalized(loadedModules ?? discoverModules)
+    extraRecommendSources = loadedExtraSources
+    let resolvedModules = NativeDiscoverModuleItem.merged(
+      saved: loadedModules ?? discoverModules,
+      extraSources: loadedExtraSources
+    )
     discoverModules = resolvedModules
     let enabledSet = Set(resolvedModules.filter(\.enabled).map(\.id))
+
+    let enabledPluginSources: [(NativeDiscoverModuleID, RecommendSource)] =
+      loadedExtraSources
+      .compactMap { src in
+        let modID = NativeDiscoverModuleID.pluginRecommend(src.apiPath)
+        return enabledSet.contains(modID) ? (modID, src) : nil
+      }
+    async let pluginRailsTask = fetchEnabledPluginRecommendRails(enabledPluginSources)
 
     async let doubanMusicTask: [NativeDiscoverMusicItem]? =
       enabledSet.contains(.doubanMusic)
@@ -2081,8 +2150,8 @@ struct NativeV2MainShell<PluginDestination: View>: View {
       latestServerName = nil
     }
 
-    let (doubanMusic, doubanShowing, doubanTop) = await (
-      doubanMusicTask, doubanShowingTask, doubanTopTask
+    let (doubanMusic, doubanShowing, doubanTop, loadedPluginRails) = await (
+      doubanMusicTask, doubanShowingTask, doubanTopTask, pluginRailsTask
     )
     guard !Task.isCancelled, discoveryGeneration == generation else { return }
 
@@ -2145,6 +2214,11 @@ struct NativeV2MainShell<PluginDestination: View>: View {
       rails.append(
         NativeDiscoverRail(
           id: "latest", title: "最新入库", items: latestItems, hasMore: latestItems.count >= 20))
+    }
+    for entry in loadedPluginRails where !entry.rail.items.isEmpty {
+      rails.append(entry.rail)
+      for (k, v) in entry.identities { identities[k] = v }
+      for (k, v) in entry.musicSeeds { nextMusicSeeds[k] = v }
     }
     musicSeeds = nextMusicSeeds
     mediaServerItems = nextMediaServerItems
@@ -2310,6 +2384,133 @@ struct NativeV2MainShell<PluginDestination: View>: View {
     return wrapper.value
   }
 
+  /// 兼容裸数组 `[T]` 与 `{"success": true, "message": String?, "data": [T]}` 的弹性解码器。
+  private struct FlexibleRecommendEnvelope<Element: Decodable>: Decodable {
+    let items: [Element]
+
+    private enum CodingKeys: String, CodingKey {
+      case success, data
+    }
+
+    init(from decoder: Decoder) throws {
+      if let direct = try? [Element](from: decoder) {
+        self.items = direct
+        return
+      }
+      let container = try decoder.container(keyedBy: CodingKeys.self)
+      if let ok = try container.decodeIfPresent(Bool.self, forKey: .success), !ok {
+        self.items = []
+        return
+      }
+      self.items = (try? container.decode([Element].self, forKey: .data)) ?? []
+    }
+  }
+
+  private struct LoadedPluginRecommendRail {
+    let rail: NativeDiscoverRail
+    let identities: [String: NativeMediaIdentity]
+    let musicSeeds: [String: NativeMusicCardItem]
+  }
+
+  /// 读取插件通过 `ChainEventType.RecommendSource` 动态注册的发现页推荐榜单（`GET /api/v1/recommend/source`）。
+  private func requestRecommendSources() async -> [RecommendSource] {
+    guard let endpoint = try? RecommendSourceEndpoint.list(),
+      let raw = try? await session.requestPayload(
+        endpoint, requiring: .init(category: .discovery)
+      ).value,
+      let decoded = try? JSONDecoder().decode(
+        FlexibleRecommendEnvelope<RecommendSource>.self, from: raw)
+    else { return [] }
+    var seen: Set<String> = []
+    return decoded.items.filter { src in
+      let cleanName = src.name.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !cleanName.isEmpty,
+        (try? RecommendSourceEndpoint.media(apiPath: src.apiPath)) != nil
+      else { return false }
+      return seen.insert(src.apiPath).inserted
+    }
+  }
+
+  /// 并发拉取所有已启用的插件动态推荐榜单首页内容，单条失败互不影响。
+  private func fetchEnabledPluginRecommendRails(
+    _ sources: [(NativeDiscoverModuleID, RecommendSource)]
+  ) async -> [LoadedPluginRecommendRail] {
+    guard !sources.isEmpty else { return [] }
+    return await withTaskGroup(of: (Int, LoadedPluginRecommendRail?).self) { group in
+      for (index, pair) in sources.enumerated() {
+        let (modID, source) = pair
+        group.addTask {
+          guard let pageResult = try? await self.requestPluginRecommendPage(source, page: 1),
+            !pageResult.items.isEmpty
+          else {
+            return (index, nil)
+          }
+          let rail = NativeDiscoverRail(
+            id: modID.rawValue,
+            title: source.name,
+            items: pageResult.items,
+            hasMore: pageResult.hasMore,
+            style: pageResult.style
+          )
+          return (
+            index,
+            LoadedPluginRecommendRail(
+              rail: rail,
+              identities: pageResult.identities,
+              musicSeeds: pageResult.musicSeeds
+            )
+          )
+        }
+      }
+      var ordered: [(Int, LoadedPluginRecommendRail)] = []
+      for await (idx, loaded) in group {
+        if let loaded { ordered.append((idx, loaded)) }
+      }
+      return ordered.sorted { $0.0 < $1.0 }.map(\.1)
+    }
+  }
+
+  /// 按插件声明的受控相对 `api_path` 请求单页推荐数据，自动兼容影视海报与音乐专辑两种载荷。
+  private func requestPluginRecommendPage(_ source: RecommendSource, page: Int) async throws -> (
+    items: [NativeDiscoverMedia],
+    hasMore: Bool,
+    style: NativeDiscoverRail.Style,
+    identities: [String: NativeMediaIdentity],
+    musicSeeds: [String: NativeMusicCardItem]
+  ) {
+    let endpoint = try RecommendSourceEndpoint.media(
+      apiPath: source.apiPath, page: page > 1 ? page : nil)
+    let raw = try await session.requestPayload(
+      endpoint, requiring: .init(category: .discovery)
+    ).value
+    let lowerType = source.type.lowercased()
+    let prefersMusic = lowerType.contains("music") || source.type.contains("音乐")
+    if prefersMusic,
+      let musicEnv = try? JSONDecoder().decode(
+        FlexibleRecommendEnvelope<NativeDiscoverMusicItem>.self, from: raw),
+      !musicEnv.items.isEmpty
+    {
+      var identities: [String: NativeMediaIdentity] = [:]
+      var seeds: [String: NativeMusicCardItem] = [:]
+      let projected = projectMusicPage(musicEnv.items, identities: &identities, seeds: &seeds)
+      return (projected, !musicEnv.items.isEmpty, .square, identities, seeds)
+    }
+    let decoded = try JSONDecoder().decode(
+      FlexibleRecommendEnvelope<NativeDiscoverAPIItem>.self, from: raw)
+    let fallbackType: String =
+      if lowerType.contains("tv") || source.type.contains("剧")
+        || lowerType.contains("anime") || source.type.contains("番")
+      {
+        "电视剧"
+      } else {
+        "电影"
+      }
+    var identities: [String: NativeMediaIdentity] = [:]
+    let projected = projectPage(
+      decoded.items, fallbackType: fallbackType, identities: &identities)
+    return (projected, !decoded.items.isEmpty, .poster, identities, [:])
+  }
+
   /// 单次持久化发现模块显隐与排序，并在需要时重新拉取新启用的豆瓣榜单。
   private func saveDiscoverModules(_ updated: [NativeDiscoverModuleItem]) async -> Bool {
     do {
@@ -2319,7 +2520,7 @@ struct NativeV2MainShell<PluginDestination: View>: View {
       try await session.perform(endpoint)
       let needsRefetch = updated.contains { item in
         item.enabled
-          && (item.id == .doubanShowing || item.id == .doubanTop250)
+          && (item.id == .doubanShowing || item.id == .doubanTop250 || item.id.isPluginRecommend)
           && !discovery.rails.contains(where: { $0.id == item.id.rawValue })
       }
       discoverModules = updated
@@ -2553,6 +2754,15 @@ struct NativeV2MainShell<PluginDestination: View>: View {
       for (k, v) in identities { mediaIdentities[k] = v }
       for (k, v) in seeds { musicSeeds[k] = v }
       return (projected, !rows.isEmpty)
+    }
+    if let apiPath = NativeDiscoverModuleID(rawValue: railID).pluginAPIPath {
+      let source =
+        extraRecommendSources.first(where: { $0.apiPath == apiPath })
+        ?? RecommendSource(name: apiPath, apiPath: apiPath, type: "")
+      let loaded = try await requestPluginRecommendPage(source, page: page)
+      for (k, v) in loaded.identities { mediaIdentities[k] = v }
+      for (k, v) in loaded.musicSeeds { musicSeeds[k] = v }
+      return (loaded.items, loaded.hasMore)
     }
     let rows: [NativeDiscoverAPIItem]
     let fallbackType: String
@@ -2794,6 +3004,136 @@ private struct NativeUserConfigValue<Value: Decodable & Sendable>: Decodable, Se
   let value: Value?
 }
 
+/// 按实例同步并持久化后端 `/api/v1/system/global?token=moviepilot` 中的全局图片缓存开关与自定义图源域名。
+@MainActor
+final class NativeGlobalImageSettingsStore {
+  static let shared = NativeGlobalImageSettingsStore()
+
+  private var loadedGenerations: Set<UUID> = []
+  private var inFlightTasks: [UUID: Task<APIImageSettings, Never>] = [:]
+  private var cachedByInstance: [UUID: APIImageSettings] = [:]
+
+  private init() {}
+
+  private func defaultsKey(for instanceID: UUID) -> String {
+    "mp.native.globalImageSettings.\(instanceID.uuidString)"
+  }
+
+  /// 读取当前实例已知的图片配置（优先内存，其次本地持久化快照）。
+  func currentSettings(for session: NativeSession) -> APIImageSettings {
+    let instanceID = session.scope.instanceID
+    if let cached = cachedByInstance[instanceID] {
+      if session.imageSettings != cached {
+        session.updateImageSettings(cached)
+      }
+      return cached
+    }
+    if let data = UserDefaults.standard.data(forKey: defaultsKey(for: instanceID)),
+      let decoded = try? JSONDecoder().decode(APIImageSettings.self, from: data)
+    {
+      cachedByInstance[instanceID] = decoded
+      session.updateImageSettings(decoded)
+      return decoded
+    }
+    return session.imageSettings
+  }
+
+  private func persist(_ settings: APIImageSettings, for session: NativeSession) {
+    let instanceID = session.scope.instanceID
+    cachedByInstance[instanceID] = settings
+    session.updateImageSettings(settings)
+    if let data = try? JSONEncoder().encode(settings) {
+      UserDefaults.standard.set(data, forKey: defaultsKey(for: instanceID))
+    }
+  }
+
+  /// 确保当前会话代次至少向后端同步一次全局图片配置；并发图片请求自动合并等待同一次查询。
+  @discardableResult
+  func ensureLoaded(using session: NativeSession, force: Bool = false) async -> APIImageSettings {
+    let baseline = currentSettings(for: session)
+    let generation = session.scope.generation
+    if !force && loadedGenerations.contains(generation) {
+      return baseline
+    }
+    if !force, let running = inFlightTasks[generation] {
+      return await running.value
+    }
+    let task = Task<APIImageSettings, Never> { @MainActor in
+      defer { self.inFlightTasks.removeValue(forKey: generation) }
+      guard
+        let endpoint = try? APIEndpoint(
+          path: ["system", "global"],
+          query: [URLQueryItem(name: "token", value: "moviepilot")]
+        )
+      else {
+        return baseline
+      }
+      struct GlobalPayload: Decodable, Sendable {
+        let globalImageCache: Bool?
+        let tmdbImageDomain: String?
+        let bangumiProxyEnable: Bool?
+        let bangumiImageDomain: String?
+
+        private enum CodingKeys: String, CodingKey {
+          case globalImageCache = "GLOBAL_IMAGE_CACHE"
+          case tmdbImageDomain = "TMDB_IMAGE_DOMAIN"
+          case bangumiProxyEnable = "BANGUMI_PROXY_ENABLE"
+          case bangumiImageDomain = "BANGUMI_IMAGE_DOMAIN"
+        }
+      }
+      do {
+        let payload = try await session.request(endpoint, as: GlobalPayload.self).value
+        let updated = APIImageSettings(
+          globalImageCache: payload.globalImageCache ?? baseline.globalImageCache,
+          tmdbImageDomain: payload.tmdbImageDomain ?? baseline.tmdbImageDomain,
+          bangumiProxyEnable: payload.bangumiProxyEnable ?? baseline.bangumiProxyEnable,
+          bangumiImageDomain: payload.bangumiImageDomain ?? baseline.bangumiImageDomain
+        )
+        self.loadedGenerations.insert(generation)
+        self.persist(updated, for: session)
+        return updated
+      } catch {
+        // 旧版后端或管理员实例可回退读取 `/system/env`
+        if session.user.isSuperuser,
+          let envEndpoint = try? APIEndpoint(path: ["system", "env"]),
+          let payload = try? await session.request(envEndpoint, as: GlobalPayload.self).value
+        {
+          let updated = APIImageSettings(
+            globalImageCache: payload.globalImageCache ?? baseline.globalImageCache,
+            tmdbImageDomain: payload.tmdbImageDomain ?? baseline.tmdbImageDomain,
+            bangumiProxyEnable: payload.bangumiProxyEnable ?? baseline.bangumiProxyEnable,
+            bangumiImageDomain: payload.bangumiImageDomain ?? baseline.bangumiImageDomain
+          )
+          self.loadedGenerations.insert(generation)
+          self.persist(updated, for: session)
+          return updated
+        }
+        self.loadedGenerations.insert(generation)
+        return baseline
+      }
+    }
+    inFlightTasks[generation] = task
+    return await task.value
+  }
+
+  /// 在系统设置页保存成功后立即同步最新全局图片缓存开关与图源域名，并后台刷新一次 `/system/global`。
+  func applySystemEnvUpdate(
+    globalImageCache: Bool,
+    tmdbImageDomain: String,
+    bangumiProxyEnable: Bool,
+    for session: NativeSession
+  ) {
+    var next = currentSettings(for: session)
+    next.globalImageCache = globalImageCache
+    next.tmdbImageDomain = APIImageSettings.normalizeTMDBDomain(tmdbImageDomain)
+    next.bangumiProxyEnable = bangumiProxyEnable
+    persist(next, for: session)
+    Task { @MainActor in
+      _ = await self.ensureLoaded(using: session, force: true)
+    }
+  }
+}
+
 /// 搜索结果和发现海报显示后端提供的 HTTPS 图片，优先命中同步内存缓存与本地磁盘缓存，无闪烁回显。
 @MainActor
 struct NativeMediaArtwork: View {
@@ -2801,6 +3141,7 @@ struct NativeMediaArtwork: View {
   let reference: String?
   let role: NativeDiscoverArtworkRole
   let maximumWidth: Int
+  var useCookies: Bool = false
   @Environment(\.colorScheme) private var colorScheme
   @State private var image: UIImage?
   @State private var loadedKey: String?
@@ -2830,9 +3171,16 @@ struct NativeMediaArtwork: View {
   }
 
   /// 规范化图片地址并构造持久化缓存键（按服务器实例、用户与尺寸隔离）。
-  private var normalizedURL: URL? {
-    guard let reference, reference.utf8.count <= 16_384,
-      var components = URLComponents(string: reference),
+  private func normalizedURL(using settings: APIImageSettings) -> URL? {
+    guard let raw = reference?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !raw.isEmpty, raw.utf8.count <= 16_384
+    else { return nil }
+    if raw.hasPrefix("/"), !raw.hasPrefix("/api/"), !raw.contains(".."), !raw.contains(" ") {
+      let bucket = maximumWidth <= 500 ? "w500" : (maximumWidth <= 800 ? "w780" : "w1280")
+      let domain = APIImageSettings.normalizeTMDBDomain(settings.tmdbImageDomain)
+      return URL(string: "https://\(domain)/t/p/\(bucket)\(raw)")
+    }
+    guard var components = URLComponents(string: raw),
       let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
       components.host?.isEmpty == false,
       components.user == nil, components.password == nil
@@ -2846,7 +3194,7 @@ struct NativeMediaArtwork: View {
     return components.url
   }
 
-  /// 二级缓存加载：L1 内存命中直出 → L2 本地磁盘后台解码 → 合并同 URL 并发请求拉取并落盘。
+  /// 二级缓存加载：L1 内存命中直出 → L2 本地磁盘后台解码 → 按全局图片缓存策略拉取并落盘。
   private func load(for key: String) async {
     guard (try? session.checkActive()) != nil else { return }
     if let cached = NativeMediaArtworkCache.shared.memoryImage(for: key) {
@@ -2857,7 +3205,6 @@ struct NativeMediaArtwork: View {
     if loadedKey != key {
       image = nil
     }
-    guard let url = normalizedURL else { return }
     let scopeDir = NativeMediaArtworkCache.scopeDirectoryName(for: session)
     let limit = maximumWidth
     if let diskImage = await NativeMediaArtworkCache.shared.diskImage(
@@ -2868,10 +3215,14 @@ struct NativeMediaArtwork: View {
       loadedKey = key
       return
     }
+    let settings = await NativeGlobalImageSettingsStore.shared.ensureLoaded(using: session)
+    guard !Task.isCancelled, let url = normalizedURL(using: settings) else { return }
+    let cookiesFlag = useCookies
     let decoded = await NativeMediaArtworkCache.shared.fetchAndCache(
       key: key, scopeDir: scopeDir, limit: limit
     ) {
-      let response = try await session.requestImage(url, maximumWidth: limit)
+      let response = try await session.requestDisplayImage(
+        url, maximumWidth: limit, useCookies: cookiesFlag)
       return response.data
     }
     guard !Task.isCancelled, let decoded else { return }
@@ -2881,11 +3232,12 @@ struct NativeMediaArtwork: View {
 
   /// 缓存键覆盖服务器实例、用户 ID、尺寸与规范化 URL，跨冷启动复用本地磁盘缓存，登出时按作用域清理。
   private var cacheKey: String {
-    [
+    let settings = NativeGlobalImageSettingsStore.shared.currentSettings(for: session)
+    return [
       session.scope.instanceID.uuidString,
       String(session.scope.userID),
       String(maximumWidth),
-      normalizedURL?.absoluteString ?? reference ?? "",
+      normalizedURL(using: settings)?.absoluteString ?? reference ?? "",
     ].joined(separator: "|")
   }
 
@@ -3052,6 +3404,7 @@ final class NativeMediaArtworkCache {
   }
 
   nonisolated static func decodeThumbnail(_ data: Data, limit: Int) -> UIImage? {
+    let rawImage: UIImage?
     if limit > 0,
       let source = CGImageSourceCreateWithData(data as CFData, nil),
       let cgImage = CGImageSourceCreateThumbnailAtIndex(
@@ -3062,9 +3415,13 @@ final class NativeMediaArtworkCache {
           kCGImageSourceThumbnailMaxPixelSize: limit,
         ] as CFDictionary)
     {
-      return UIImage(cgImage: cgImage)
+      rawImage = UIImage(cgImage: cgImage)
+    } else {
+      rawImage = UIImage(data: data)
     }
-    return UIImage(data: data)
+    guard let rawImage else { return nil }
+    // 在后台线程提前完成位图解压，避免 ProMotion 高刷滚动首帧在主线程同步解码 JPEG/PNG
+    return rawImage.preparingForDisplay() ?? rawImage
   }
 
   nonisolated private static func pruneDiskCache(scopeDir: String) {

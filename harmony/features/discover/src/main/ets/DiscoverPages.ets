@@ -1,9 +1,12 @@
+import { promptAction } from '@kit.ArkUI';
 import {
   MoviePilotRepository,
   MpMediaItem,
+  MpMediaSearchSource,
   MpCastMember,
   MpMediaServerLibrary,
   MpMusicAlbum,
+  MpRecommendSource,
   MpRemoteImage,
   PLAYBACK_SYNC_REVISION_KEY
 } from '@moviepilot/core_rust_bridge';
@@ -148,6 +151,21 @@ struct PosterCard {
   @Prop showPlayBadge: boolean = false;
   onTap: () => void = () => {};
 
+  @Builder
+  private posterContextMenuBuilder() {
+    Menu() {
+      MenuItem({ content: '查看影视详情' })
+        .onClick(() => { this.onTap(); })
+      if (!this.item.inLibrary && this.item.source !== 'mediaserver' && this.item.source !== 'library') {
+        MenuItem({ content: '快捷添加订阅' })
+          .onClick(async () => {
+            const res = await MoviePilotRepository.shared().quickSubscribeMedia(this.item);
+            try { promptAction.showToast({ message: res.message, duration: 2000 }); } catch { /* ignore */ }
+          })
+      }
+    }
+  }
+
   build() {
     Column({ space: 6 }) {
       Stack({ alignContent: Alignment.TopEnd }) {
@@ -237,6 +255,7 @@ struct PosterCard {
     .alignItems(HorizontalAlign.Start)
     .hoverEffect(HoverEffect.Highlight)
     .onClick(() => this.onTap())
+    .bindContextMenu(this.posterContextMenuBuilder(), ResponseType.LongPress)
   }
 }
 
@@ -266,6 +285,8 @@ export struct HarmonyDiscoverPage {
   @State private doubanShowing: MpMediaItem[] = [];
   @State private doubanTop250: MpMediaItem[] = [];
   @State private musicAlbums: MpMusicAlbum[] = [];
+  @State private extraRecommendSources: MpRecommendSource[] = [];
+  @State private pluginRails: Record<string, MpMediaItem[]> = {};
   @State private modules: CustomModulePref[] = DEFAULT_DISCOVER_MODULES;
   @State private showModulesSheet: boolean = false;
   @State private showMusicAlbumSheet: boolean = false;
@@ -308,7 +329,8 @@ export struct HarmonyDiscoverPage {
         repo.fetchRecentlyAdded(),
         repo.fetchRecommend('tmdb_movies'),
         repo.fetchRecommend('tmdb_tvs'),
-        repo.fetchMusicFeed('douban', 1)
+        repo.fetchMusicFeed('douban', 1),
+        repo.fetchRecommendSources()
       ]);
       this.trendingItems = res[0].slice(0, 14);
       this.heroItems = res[0].slice(0, 6);
@@ -318,6 +340,8 @@ export struct HarmonyDiscoverPage {
       this.popularMovies = res[4].slice(0, 14);
       this.popularTvs = res[5].slice(0, 14);
       this.musicAlbums = res[6].slice(0, 14);
+      this.extraRecommendSources = res[7];
+      this.modules = HarmonyAppearanceStore.mergeDiscoverModules(this.modulesRaw, res[7]);
     } catch {
       // keep existing state
     }
@@ -335,14 +359,49 @@ export struct HarmonyDiscoverPage {
     if (showTop250 && this.doubanTop250.length === 0) {
       try { this.doubanTop250 = (await repo.fetchDoubanTop250(1)).slice(0, 14); } catch { /* ignore */ }
     }
+    const enabledPluginMods = this.modules.filter((m: CustomModulePref) =>
+      m.enabled && m.id.startsWith('plugin_recommend:') && Boolean(m.apiPath && m.apiPath.length > 0)
+    );
+    if (enabledPluginMods.length > 0) {
+      const nextMap: Record<string, MpMediaItem[]> = {};
+      const existingKeys = Object.keys(this.pluginRails);
+      for (let k = 0; k < existingKeys.length; k++) {
+        nextMap[existingKeys[k]] = this.pluginRails[existingKeys[k]];
+      }
+      let changed = false;
+      await Promise.all(enabledPluginMods.map(async (mod: CustomModulePref): Promise<void> => {
+        if (!nextMap[mod.id] || nextMap[mod.id].length === 0) {
+          try {
+            const list = (await repo.fetchRecommendByApiPath(mod.apiPath ?? '', 1)).slice(0, 16);
+            if (list.length > 0) {
+              nextMap[mod.id] = list;
+              changed = true;
+            }
+          } catch {
+            // ignore single plugin rail error
+          }
+        }
+      }));
+      if (changed) {
+        this.pluginRails = nextMap;
+      }
+    }
+  }
+
+  private cloneModulePref(m: CustomModulePref, enabledOverride?: boolean): CustomModulePref {
+    return {
+      id: m.id,
+      title: m.title,
+      enabled: enabledOverride !== undefined ? enabledOverride : m.enabled,
+      apiPath: m.apiPath,
+      subtitle: m.subtitle
+    };
   }
 
   private moveModule(idx: number, delta: number): void {
     const target = idx + delta;
     if (target < 0 || target >= this.modules.length) { return; }
-    const copy: CustomModulePref[] = this.modules.map((m: CustomModulePref): CustomModulePref => ({
-      id: m.id, title: m.title, enabled: m.enabled
-    }));
+    const copy: CustomModulePref[] = this.modules.map((m: CustomModulePref): CustomModulePref => this.cloneModulePref(m));
     const tmp = copy[idx];
     copy[idx] = copy[target];
     copy[target] = tmp;
@@ -350,9 +409,9 @@ export struct HarmonyDiscoverPage {
   }
 
   private toggleModule(idx: number, enabled: boolean): void {
-    const copy: CustomModulePref[] = this.modules.map((m: CustomModulePref, i: number): CustomModulePref => ({
-      id: m.id, title: m.title, enabled: i === idx ? enabled : m.enabled
-    }));
+    const copy: CustomModulePref[] = this.modules.map((m: CustomModulePref, i: number): CustomModulePref =>
+      this.cloneModulePref(m, i === idx ? enabled : m.enabled)
+    );
     this.persistModules(copy);
   }
 
@@ -441,12 +500,12 @@ export struct HarmonyDiscoverPage {
         actionText: '恢复默认',
         onCancel: () => { this.showModulesSheet = false; },
         onAction: () => {
-          this.persistModules(DEFAULT_DISCOVER_MODULES.map((m: CustomModulePref): CustomModulePref => ({
-            id: m.id, title: m.title, enabled: m.enabled
-          })));
+          this.persistModules(
+            HarmonyAppearanceStore.mergeDiscoverModules('', this.extraRecommendSources, true)
+          );
         }
       })
-      Text('开关显隐并调整发现页 10 大模块的展示顺序')
+      Text('开关显隐并调整发现页内置与插件推荐模块的展示顺序')
         .fontSize(12)
         .fontColor(mpSecondaryText(this.isDark))
         .width('100%')
@@ -456,11 +515,22 @@ export struct HarmonyDiscoverPage {
           ForEach(this.modules, (mod: CustomModulePref, idx: number) => {
             CinematicPanel({ panelPadding: 12, cornerRadius: 16 }) {
               Row({ space: 8 }) {
-                Text(mod.title)
-                  .fontSize(15)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor(mpPrimaryText(this.isDark))
-                  .layoutWeight(1)
+                Column({ space: 2 }) {
+                  Text(mod.title)
+                    .fontSize(15)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(mpPrimaryText(this.isDark))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  if (mod.id.startsWith('plugin_recommend:')) {
+                    Text(mod.subtitle && mod.subtitle.length > 0 ? `插件推荐 · ${mod.subtitle}` : '插件推荐榜单')
+                      .fontSize(11)
+                      .fontColor(mpSecondaryText(this.isDark))
+                      .maxLines(1)
+                  }
+                }
+                .alignItems(HorizontalAlign.Start)
+                .layoutWeight(1)
 
                 Button({ type: ButtonType.Circle }) {
                   SymbolGlyph($r('sys.symbol.arrow_up'))
@@ -961,6 +1031,14 @@ export struct HarmonyDiscoverPage {
       this.librariesShelf()
     } else if (modId === 'categories') {
       this.categoriesShelf()
+    } else if (modId.startsWith('plugin_recommend:')) {
+      DiscoverMediaShelf({
+        title: this.modules.find((m: CustomModulePref) => m.id === modId)?.title ?? '推荐榜单',
+        items: this.pluginRails[modId] ?? [],
+        exploreKey: `${modId}|${this.modules.find((m: CustomModulePref) => m.id === modId)?.title ?? '推荐榜单'}`,
+        onOpenMedia: (it: MpMediaItem) => this.onOpenMedia(it),
+        onOpenExplore: (src: string) => this.onOpenExplore(src)
+      })
     }
   }
 
@@ -1147,7 +1225,15 @@ export struct HarmonyDiscoverPage {
       .scrollBar(BarState.Off)
       .onDidScroll(() => {
         const off = this.scroller.currentOffset();
-        this.scrollOffsetY = off ? off.yOffset : 0;
+        const rawY = off ? off.yOffset : 0;
+        const clamped = Math.min(160, Math.max(0, rawY));
+        if (
+          Math.abs(clamped - this.scrollOffsetY) >= 2
+          || (clamped === 0 && this.scrollOffsetY !== 0)
+          || (clamped === 160 && this.scrollOffsetY !== 160)
+        ) {
+          this.scrollOffsetY = clamped;
+        }
       })
       .width('100%')
       .height('100%')
@@ -1479,11 +1565,34 @@ export struct HarmonyExplorePage {
     return idx >= 0 ? idx : 0;
   }
 
+  private isPluginRecommendMode(): boolean {
+    return this.activeSource.startsWith('plugin_recommend:');
+  }
+
+  private pluginRecommendApiPath(): string {
+    if (!this.isPluginRecommendMode()) { return ''; }
+    const raw = this.activeSource.substring('plugin_recommend:'.length);
+    const barIdx = raw.indexOf('|');
+    return barIdx >= 0 ? raw.substring(0, barIdx) : raw;
+  }
+
+  private pluginRecommendTitle(): string {
+    if (!this.isPluginRecommendMode()) { return '分类探索'; }
+    const barIdx = this.activeSource.indexOf('|');
+    if (barIdx >= 0) {
+      const t = this.activeSource.substring(barIdx + 1).trim();
+      if (t.length > 0) { return t; }
+    }
+    return '推荐榜单';
+  }
+
   private async fetchCurrent(): Promise<void> {
     this.loading = true;
     const repo = MoviePilotRepository.shared();
     try {
-      if (this.activeSource === 'music') {
+      if (this.isPluginRecommendMode()) {
+        this.items = await repo.fetchRecommendByApiPath(this.pluginRecommendApiPath(), 1);
+      } else if (this.activeSource === 'music') {
         this.albums = await repo.fetchMusicFeed(this.activeMusicFeed, 1);
       } else {
         this.items = await repo.fetchExplore(this.activeSource, this.activeSort, 1);
@@ -1502,31 +1611,33 @@ export struct HarmonyExplorePage {
   build() {
     Column({ space: 10 }) {
       NativeBackHeader({
-        title: '分类探索',
+        title: this.isPluginRecommendMode() ? this.pluginRecommendTitle() : '分类探索',
         onBack: () => this.onBack()
       })
 
-      Scroll() {
-        Row({ space: 8 }) {
-          ForEach(EXPLORE_SOURCES, (s: ExploreSourceDef) => {
-            HarmonyEntityLogoPill({
-              kind: 'media_source',
-              value: s.key === 'music' ? 'musicbrainz' : s.key,
-              title: s.label,
-              selected: this.activeSource === s.key,
-              logoSize: 16,
-              onTap: () => {
-                this.activeSource = s.key;
-                this.fetchCurrent();
-              }
-            })
-          }, (s: ExploreSourceDef) => s.key)
+      if (!this.isPluginRecommendMode()) {
+        Scroll() {
+          Row({ space: 8 }) {
+            ForEach(EXPLORE_SOURCES, (s: ExploreSourceDef) => {
+              HarmonyEntityLogoPill({
+                kind: 'media_source',
+                value: s.key === 'music' ? 'musicbrainz' : s.key,
+                title: s.label,
+                selected: this.activeSource === s.key,
+                logoSize: 16,
+                onTap: () => {
+                  this.activeSource = s.key;
+                  this.fetchCurrent();
+                }
+              })
+            }, (s: ExploreSourceDef) => s.key)
+          }
+          .padding({ left: 16, right: 16 })
         }
-        .padding({ left: 16, right: 16 })
+        .scrollable(ScrollDirection.Horizontal)
+        .scrollBar(BarState.Off)
+        .width('100%')
       }
-      .scrollable(ScrollDirection.Horizontal)
-      .scrollBar(BarState.Off)
-      .width('100%')
 
       if (this.activeSource === 'music') {
         Scroll() {
@@ -1698,10 +1809,215 @@ export struct HarmonyGlobalSearchPage {
   @State private showEpisodePickerSheet: boolean = false;
   @State private selectedSeriesItem: MpMediaItem | null = null;
   @State private episodeSheetTrigger: number = 0;
+  @State private mediaSources: MpMediaSearchSource[] = [];
+  @State private loadingSources: boolean = false;
+  @State private selectedSourcesByKind: Record<string, string[]> = {};
+  @State private libraryTypeFilter: string = '全部';
+  @State private showSourcePopup: boolean = false;
+  @State private showLibraryTypePopup: boolean = false;
   onBack: () => void = () => {};
   onOpenMedia: (item: MpMediaItem) => void = () => {};
   onOpenPerson: (person: MpCastMember) => void = () => {};
   onPlayMedia: (req: HarmonyPlaybackRequest) => void = () => {};
+
+  aboutToAppear(): void {
+    this.loadSearchSources();
+  }
+
+  private async loadSearchSources(): Promise<void> {
+    this.loadingSources = true;
+    try {
+      this.mediaSources = await MoviePilotRepository.shared().fetchMediaSearchSources();
+    } catch {
+      this.mediaSources = [];
+    }
+    this.loadingSources = false;
+  }
+
+  private currentKindKey(): string {
+    return SEARCH_SCOPE_KEYS[Math.min(this.scopeIndex, SEARCH_SCOPE_KEYS.length - 1)];
+  }
+
+  private sourceSupportsKind(src: MpMediaSearchSource, kind: string): boolean {
+    const lowerId = src.id.toLowerCase();
+    if (kind === 'collection') { return lowerId === 'themoviedb'; }
+    if (kind === 'person') {
+      return lowerId === 'themoviedb' || lowerId === 'douban' || lowerId === 'musicbrainz';
+    }
+    const types = (src.mediaTypes.length > 0 ? src.mediaTypes : ['电影', '电视剧'])
+      .map((t: string) => t.toLowerCase());
+    if (kind === 'music') {
+      return types.includes('音乐') || types.includes('music');
+    }
+    return types.includes('电影') || types.includes('电视剧') || types.includes('movie') || types.includes('tv');
+  }
+
+  private availableSourcesForCurrentKind(): MpMediaSearchSource[] {
+    const kind = this.currentKindKey();
+    return this.mediaSources.filter((s: MpMediaSearchSource) => this.sourceSupportsKind(s, kind));
+  }
+
+  private selectedSourcesForCurrentKind(): string[] {
+    const kind = this.currentKindKey();
+    const raw = this.selectedSourcesByKind[kind] ?? [];
+    const avail = this.availableSourcesForCurrentKind();
+    if (avail.length === 0) { return raw; }
+    const validIds = avail.map((s: MpMediaSearchSource) => s.id);
+    return raw.filter((id: string) => validIds.includes(id));
+  }
+
+  private setSelectedSourcesForKind(kind: string, nextList: string[]): void {
+    const updated: Record<string, string[]> = {};
+    const keys = Object.keys(this.selectedSourcesByKind);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      if (k !== kind) {
+        updated[k] = this.selectedSourcesByKind[k];
+      }
+    }
+    if (nextList.length > 0) {
+      updated[kind] = nextList;
+    }
+    this.selectedSourcesByKind = updated;
+  }
+
+  private toggleSourceForCurrentKind(sourceId: string): void {
+    const kind = this.currentKindKey();
+    const current = this.selectedSourcesForCurrentKind();
+    const next = current.includes(sourceId)
+      ? current.filter((x: string) => x !== sourceId)
+      : [...current, sourceId];
+    this.setSelectedSourcesForKind(kind, next);
+    if (this.query.trim().length > 0) {
+      this.runSearch();
+    }
+  }
+
+  private clearSourcesForCurrentKindAndDismiss(): void {
+    this.setSelectedSourcesForKind(this.currentKindKey(), []);
+    this.showSourcePopup = false;
+    if (this.query.trim().length > 0) {
+      this.runSearch();
+    }
+  }
+
+  @Builder
+  private libraryTypePopupBuilder() {
+    Column({ space: 2 }) {
+      ForEach(['全部', '电影', '电视剧', '音乐'], (opt: string) => {
+        Row({ space: 8 }) {
+          Text(opt)
+            .fontSize(13.5)
+            .fontWeight(this.libraryTypeFilter === opt ? FontWeight.Bold : FontWeight.Normal)
+            .fontColor(mpPrimaryText(this.isDark))
+            .layoutWeight(1)
+          if (this.libraryTypeFilter === opt) {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(14)
+              .fontColor([this.accentHex])
+          }
+        }
+        .width('100%')
+        .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+        .borderRadius(10)
+        .onClick(() => {
+          this.libraryTypeFilter = opt;
+          this.showLibraryTypePopup = false;
+          if (this.query.trim().length > 0) {
+            this.runSearch();
+          }
+        })
+      }, (opt: string) => `lib_type_${opt}`)
+    }
+    .width(168)
+    .padding(6)
+  }
+
+  @Builder
+  private sourcePopupBuilder() {
+    Column({ space: 2 }) {
+      // 互斥默认项：点击重置系统默认并收起菜单
+      Row({ space: 8 }) {
+        Text('默认（系统设置）')
+          .fontSize(13.5)
+          .fontWeight(this.selectedSourcesForCurrentKind().length === 0 ? FontWeight.Bold : FontWeight.Normal)
+          .fontColor(mpPrimaryText(this.isDark))
+          .layoutWeight(1)
+        if (this.selectedSourcesForCurrentKind().length === 0) {
+          SymbolGlyph($r('sys.symbol.checkmark'))
+            .fontSize(14)
+            .fontColor([this.accentHex])
+        }
+      }
+      .width('100%')
+      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+      .borderRadius(10)
+      .onClick(() => {
+        this.clearSourcesForCurrentKindAndDismiss();
+      })
+
+      if (this.availableSourcesForCurrentKind().length === 0) {
+        Text(this.loadingSources ? '正在加载来源…' : '暂无可用来源')
+          .fontSize(12.5)
+          .fontColor(mpSecondaryText(this.isDark))
+          .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+      } else {
+        Divider().color(HarmonyThemeColors.chipFill(this.isDark)).margin({ top: 2, bottom: 2 })
+        Scroll() {
+          Column({ space: 2 }) {
+            ForEach(this.availableSourcesForCurrentKind(), (src: MpMediaSearchSource) => {
+              Row({ space: 8 }) {
+                HarmonyEntityLogo({
+                  kind: 'media_source',
+                  value: src.id,
+                  logoSize: 18,
+                  cornerRadius: 4
+                })
+                Text(src.displayName)
+                  .fontSize(13.5)
+                  .fontWeight(this.selectedSourcesForCurrentKind().includes(src.id) ? FontWeight.Medium : FontWeight.Normal)
+                  .fontColor(mpPrimaryText(this.isDark))
+                  .maxLines(1)
+                  .layoutWeight(1)
+                if (this.selectedSourcesForCurrentKind().includes(src.id)) {
+                  SymbolGlyph($r('sys.symbol.checkmark'))
+                    .fontSize(14)
+                    .fontColor([this.accentHex])
+                }
+              }
+              .width('100%')
+              .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+              .borderRadius(10)
+              .onClick(() => {
+                // 保持弹窗展开以支持连续多选（对齐 #67）
+                this.toggleSourceForCurrentKind(src.id);
+              })
+            }, (src: MpMediaSearchSource) => `src_opt_${src.id}`)
+          }
+        }
+        .constraintSize({ maxHeight: 260 })
+        .scrollBar(BarState.Off)
+
+        if (this.selectedSourcesForCurrentKind().length > 0) {
+          Divider().color(HarmonyThemeColors.chipFill(this.isDark)).margin({ top: 2, bottom: 2 })
+          Row() {
+            Text('清除来源筛选')
+              .fontSize(13)
+              .fontColor('#E84855')
+              .fontWeight(FontWeight.Medium)
+          }
+          .width('100%')
+          .padding({ left: 12, right: 12, top: 9, bottom: 9 })
+          .borderRadius(10)
+          .onClick(() => {
+            this.clearSourcesForCurrentKindAndDismiss();
+          })
+        }
+      }
+    }
+    .width(220)
+    .padding(6)
+  }
 
   private isSeriesMediaItem(it: MpMediaItem): boolean {
     const t = it.type.trim().toLowerCase();
@@ -1799,8 +2115,10 @@ export struct HarmonyGlobalSearchPage {
     this.searching = true;
     this.hasSearched = true;
     try {
-      const kind = SEARCH_SCOPE_KEYS[Math.min(this.scopeIndex, SEARCH_SCOPE_KEYS.length - 1)];
-      this.results = await MoviePilotRepository.shared().searchMedia(q, kind);
+      const kind = this.currentKindKey();
+      const sources = kind === 'library' ? [] : this.selectedSourcesForCurrentKind();
+      const libTypes = (kind === 'library' && this.libraryTypeFilter !== '全部') ? [this.libraryTypeFilter] : [];
+      this.results = await MoviePilotRepository.shared().searchMedia(q, kind, '', sources, libTypes);
     } catch {
       this.results = [];
     }
@@ -1848,6 +2166,66 @@ export struct HarmonyGlobalSearchPage {
                   }
                 })
                 .onSubmit(() => this.runSearch())
+
+              if (this.scopeIndex === 1) {
+                Row({ space: 3 }) {
+                  Text(this.libraryTypeFilter === '全部' ? '类型' : this.libraryTypeFilter)
+                    .fontSize(12)
+                    .fontWeight(this.libraryTypeFilter === '全部' ? FontWeight.Medium : FontWeight.Bold)
+                    .fontColor(this.libraryTypeFilter === '全部' ? mpPrimaryText(this.isDark) : Color.White)
+                  Text('▾')
+                    .fontSize(10)
+                    .fontColor(this.libraryTypeFilter === '全部' ? mpSecondaryText(this.isDark) : Color.White)
+                }
+                .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+                .borderRadius(14)
+                .backgroundColor(this.libraryTypeFilter === '全部' ? HarmonyThemeColors.chipFill(this.isDark) : this.accentHex)
+                .margin({ right: 4 })
+                .onClick(() => { this.showLibraryTypePopup = !this.showLibraryTypePopup; })
+                .bindPopup(this.showLibraryTypePopup, {
+                  builder: () => { this.libraryTypePopupBuilder(); },
+                  placement: Placement.BottomRight,
+                  popupColor: HarmonyThemeColors.overlayFallback(this.isDark),
+                  enableArrow: false,
+                  autoCancel: true,
+                  onStateChange: (e) => {
+                    if (!e.isVisible) {
+                      this.showLibraryTypePopup = false;
+                    }
+                  }
+                })
+              } else {
+                Row({ space: 3 }) {
+                  Text(this.selectedSourcesForCurrentKind().length === 0
+                    ? '来源'
+                    : `来源 ${this.selectedSourcesForCurrentKind().length}`)
+                    .fontSize(12)
+                    .fontWeight(this.selectedSourcesForCurrentKind().length === 0 ? FontWeight.Medium : FontWeight.Bold)
+                    .fontColor(this.selectedSourcesForCurrentKind().length === 0 ? mpPrimaryText(this.isDark) : Color.White)
+                  Text('▾')
+                    .fontSize(10)
+                    .fontColor(this.selectedSourcesForCurrentKind().length === 0 ? mpSecondaryText(this.isDark) : Color.White)
+                }
+                .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+                .borderRadius(14)
+                .backgroundColor(this.selectedSourcesForCurrentKind().length === 0
+                  ? HarmonyThemeColors.chipFill(this.isDark)
+                  : this.accentHex)
+                .margin({ right: 4 })
+                .onClick(() => { this.showSourcePopup = !this.showSourcePopup; })
+                .bindPopup(this.showSourcePopup, {
+                  builder: () => { this.sourcePopupBuilder(); },
+                  placement: Placement.BottomRight,
+                  popupColor: HarmonyThemeColors.overlayFallback(this.isDark),
+                  enableArrow: false,
+                  autoCancel: true,
+                  onStateChange: (e) => {
+                    if (!e.isVisible) {
+                      this.showSourcePopup = false;
+                    }
+                  }
+                })
+              }
             }
             .width('100%')
           }

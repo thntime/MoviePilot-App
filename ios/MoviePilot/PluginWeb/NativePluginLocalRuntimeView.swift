@@ -72,8 +72,8 @@ struct NativePluginLocalRuntimeView: View {
   @State private var errorMessage: String?
   @State private var activeToast: PluginToastPayload?
   @State private var toastDismissTask: Task<Void, Never>?
+  @State private var navBackFallbackTask: Task<Void, Never>?
   @State private var standaloneConfirm: NativeVueSheetConfirmation?
-  @State private var standaloneHeaderActions: [NativeVueSheetAction] = []
   @State private var reloadNonce = 0
 
   private var preferDark: Bool {
@@ -88,8 +88,10 @@ struct NativePluginLocalRuntimeView: View {
     let accentHex = NativeAppearanceStore.hexString(from: appearance.accentColor)
     let bgHex = NativeAppearanceStore.hexString(
       from: appearance.solidBackgroundColor(for: preferDark ? .dark : .light))
-    let customText = appearance.useCustomTextColor ? appearance.customTextHex + appearance.customLightTextHex : ""
-    return "\(preferDark)|\(accentHex)|\(bgHex)|\(customText)|\(appearance.backgroundPreset.rawValue)"
+    let customText =
+      appearance.useCustomTextColor ? appearance.customTextHex + appearance.customLightTextHex : ""
+    return
+      "\(preferDark)|\(accentHex)|\(bgHex)|\(customText)|\(appearance.backgroundPreset.rawValue)"
   }
 
   var body: some View {
@@ -131,26 +133,6 @@ struct NativePluginLocalRuntimeView: View {
           .transition(.move(edge: .bottom).combined(with: .opacity))
       }
     }
-    .toolbar {
-      if sheetBridge == nil, !standaloneHeaderActions.isEmpty {
-        ToolbarItem(placement: .topBarTrailing) {
-          Menu {
-            ForEach(standaloneHeaderActions) { action in
-              Button {
-                activeSlot?.bridge.sendHostAction(id: action.id)
-              } label: {
-                Label(action.title, systemImage: action.sfSymbol)
-              }
-              .disabled(!action.enabled)
-            }
-          } label: {
-            Image(systemName: "ellipsis.circle")
-          }
-          .tint(.primary)
-          .accessibilityIdentifier("native-vue-local-runtime-menu")
-        }
-      }
-    }
     .alert(
       standaloneConfirm?.title ?? "",
       isPresented: Binding(
@@ -189,10 +171,14 @@ struct NativePluginLocalRuntimeView: View {
     .onDisappear {
       toastDismissTask?.cancel()
       toastDismissTask = nil
+      navBackFallbackTask?.cancel()
+      navBackFallbackTask = nil
       detachSheetBridgeCallbacks()
       if let slot = activeSlot {
         activeSlot = nil
-        PluginWebViewPool.shared.release(slot)
+        if !PluginCapsuleManager.shared.isSlotParked(slot) {
+          PluginWebViewPool.shared.release(slot)
+        }
       }
     }
   }
@@ -248,11 +234,28 @@ struct NativePluginLocalRuntimeView: View {
           .accessibilityIdentifier("native-vue-local-runtime-fallback")
         }
         .padding(.top, 4)
+
+        Button(L10n.text("返回")) {
+          dismissHostContainer()
+        }
+        .font(.subheadline)
+        .foregroundStyle(.secondary)
+        .accessibilityIdentifier("native-vue-local-runtime-exit")
       }
       .frame(maxWidth: .infinity)
       .padding(.vertical, 12)
     }
     .padding(.horizontal, CinematicStyle.margin)
+  }
+
+  private func dismissHostContainer() {
+    navBackFallbackTask?.cancel()
+    navBackFallbackTask = nil
+    if let sheetBridge {
+      sheetBridge.shouldDismiss = true
+    } else {
+      dismiss()
+    }
   }
 
   private func toastBanner(_ toast: PluginToastPayload) -> some View {
@@ -305,7 +308,9 @@ struct NativePluginLocalRuntimeView: View {
     // 释放上一次挂载的槽
     if let existing = activeSlot {
       activeSlot = nil
-      PluginWebViewPool.shared.release(existing)
+      if !PluginCapsuleManager.shared.isSlotParked(existing) {
+        PluginWebViewPool.shared.release(existing)
+      }
     }
 
     do {
@@ -318,6 +323,29 @@ struct NativePluginLocalRuntimeView: View {
         resourceCookie: resourceCookie,
         locale: locale
       )
+
+      // 若当前插件处于最小化悬浮胶囊保活状态，直接无损接回原 WKWebView 实例（零重载）
+      if let resumed = PluginCapsuleManager.shared.consumeMatchingSession(
+        pluginID: pluginID, serverURL: auth.address.url)
+      {
+        let slot = resumed.slot
+        slot.sessionContext = context
+        slot.schemeHandler.updateSessionContext(context)
+        slot.bridge.updateSessionContext(context)
+        slot.bridge.nativeSession = session
+        slot.bindActivePlugin(id: pluginID, name: resumed.pluginName)
+        PluginNativeCapabilitiesService.latestActiveService?.activePluginID = pluginID
+        PluginNativeCapabilitiesService.latestActiveService?.activePluginName = resumed.pluginName
+        activeSlot = slot
+        bindBridgeCallbacks(for: slot)
+        let visualTokens = PluginVisualTokensSnapshot.make(
+          from: appearance, colorScheme: colorScheme)
+        slot.bridge.sendVisualTokens(visualTokens)
+        isMounted = true
+        errorMessage = nil
+        sheetBridge?.isReady = true
+        return
+      }
 
       // 1. 拉取后端 `/api/v1/plugin/remotes?token=moviepilot`，完全不依赖前端 3000 端口！
       let descriptor = try await fetchRemoteDescriptor(for: pluginID)
@@ -334,6 +362,11 @@ struct NativePluginLocalRuntimeView: View {
       // 3. 从预热池借出透明 WKWebView 槽
       let slot = PluginWebViewPool.shared.acquire(context: context)
       slot.bridge.nativeSession = session
+      let resolvedDisplayName =
+        pluginName.isEmpty ? (descriptor.name ?? pluginID) : pluginName
+      slot.bindActivePlugin(id: pluginID, name: resolvedDisplayName)
+      PluginNativeCapabilitiesService.latestActiveService?.activePluginID = pluginID
+      PluginNativeCapabilitiesService.latestActiveService?.activePluginName = resolvedDisplayName
       activeSlot = slot
       bindBridgeCallbacks(for: slot)
 
@@ -360,7 +393,9 @@ struct NativePluginLocalRuntimeView: View {
     }
   }
 
-  private func fetchRemoteDescriptor(for targetPluginID: String) async throws -> PluginRemoteDescriptor {
+  private func fetchRemoteDescriptor(for targetPluginID: String) async throws
+    -> PluginRemoteDescriptor
+  {
     let endpoint = try APIEndpoint(
       path: ["plugin", "remotes"],
       query: [URLQueryItem(name: "token", value: "moviepilot")],
@@ -385,7 +420,9 @@ struct NativePluginLocalRuntimeView: View {
       )
     }
 
-    if let exact = list.first(where: { $0.id.caseInsensitiveCompare(targetPluginID) == .orderedSame }) {
+    if let exact = list.first(where: {
+      $0.id.caseInsensitiveCompare(targetPluginID) == .orderedSame
+    }) {
       return exact
     }
     throw NSError(
@@ -484,10 +521,55 @@ struct NativePluginLocalRuntimeView: View {
     }
 
     slot.bridge.onPluginClose = {
-      if let sheetBridge {
-        sheetBridge.shouldDismiss = true
-      } else {
-        dismiss()
+      dismissHostContainer()
+    }
+
+    slot.bridge.onPluginMinimize = { reqId, payload in
+      guard let auth = try? session.playbackAuthorization() else {
+        slot.bridge.sendSimpleResponse(requestId: reqId, data: ["minimized": false])
+        return
+      }
+      let snap = PluginCapsuleSnapshot.from(
+        pluginID: pluginID,
+        fallbackName: sheetBridge?.title.isEmpty == false
+          ? (sheetBridge?.title ?? pluginName) : pluginName,
+        payload: payload
+      )
+      slot.bridge.sendSimpleResponse(
+        requestId: reqId,
+        data: [
+          "minimized": true,
+          "overlaySupported": false,
+          "overlayGranted": false,
+        ]
+      )
+      let parked = MinimizedPluginSession(
+        pluginID: pluginID,
+        pluginName: snap.pluginName,
+        surface: surface,
+        pluginHasPage: pluginHasPage,
+        serverURL: auth.address.url,
+        slot: slot,
+        snapshot: snap
+      )
+      PluginCapsuleManager.shared.parkSession(parked)
+      activeSlot = nil
+      dismissHostContainer()
+    }
+
+    slot.bridge.onCapsuleUpdate = { patch in
+      PluginCapsuleManager.shared.updateActiveSnapshot(patch)
+    }
+
+    slot.bridge.onPluginRestore = { reqId in
+      slot.bridge.sendSimpleResponse(requestId: reqId, data: ["restored": true])
+    }
+
+    slot.bridge.onNavBackResult = { handled in
+      navBackFallbackTask?.cancel()
+      navBackFallbackTask = nil
+      if !handled {
+        dismissHostContainer()
       }
     }
 
@@ -497,8 +579,6 @@ struct NativePluginLocalRuntimeView: View {
           sheetBridge.title = title
         }
         sheetBridge.actions = actions
-      } else {
-        standaloneHeaderActions = actions
       }
     }
 
@@ -541,8 +621,15 @@ struct NativePluginLocalRuntimeView: View {
         slot?.bridge.sendHostAction(id: id)
       }
       sheetBridge.localRequestClose = { [weak slot] in
-        slot?.bridge.sendNavBack()
-        return false
+        guard isMounted, let slot else { return false }
+        navBackFallbackTask?.cancel()
+        navBackFallbackTask = Task { @MainActor in
+          try? await Task.sleep(nanoseconds: 500_000_000)
+          guard !Task.isCancelled else { return }
+          dismissHostContainer()
+        }
+        slot.bridge.sendNavBack()
+        return true
       }
       sheetBridge.localRespondConfirmation = { [weak slot] id, confirmed in
         slot?.bridge.sendConfirmResult(id: id, confirmed: confirmed)
@@ -554,5 +641,185 @@ struct NativePluginLocalRuntimeView: View {
     sheetBridge?.localInvokeAction = nil
     sheetBridge?.localRequestClose = nil
     sheetBridge?.localRespondConfirmation = nil
+  }
+}
+
+/// iOS 全应用跨标签紧凑单行横向悬浮胶囊视图：
+/// `[圆形鉴权封面 (29pt)] + [标题/副标题文字区 (点击直接恢复完整插件窗口)] + [最多 3 个内联快捷图标按钮] + [关闭按钮 ✕]`。
+@MainActor
+struct NativePluginFloatingCapsuleOverlay: View {
+  @ObservedObject var manager: PluginCapsuleManager
+  let onOpenFullWindow: (MinimizedPluginSession) -> Void
+
+  @ObservedObject private var appearance = NativeAppearanceStore.shared
+  @State private var dragOffset: CGSize = .zero
+  @State private var accumulatedOffset: CGSize = .zero
+
+  var body: some View {
+    if let session = manager.currentSession {
+      let snap = session.snapshot
+      capsulePill(session: session, snap: snap)
+        .task(id: "\(session.serverURL.absoluteString)|\(snap.iconURL ?? "")") {
+          manager.ensureIconLoaded(for: session)
+        }
+        .offset(
+          x: accumulatedOffset.width + dragOffset.width,
+          y: accumulatedOffset.height + dragOffset.height
+        )
+        .gesture(
+          DragGesture()
+            .onChanged { value in
+              dragOffset = value.translation
+            }
+            .onEnded { value in
+              accumulatedOffset.width += value.translation.width
+              accumulatedOffset.height += value.translation.height
+              dragOffset = .zero
+            }
+        )
+        .padding(.trailing, 16)
+        .padding(.bottom, 102)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+    }
+  }
+
+  private func capsulePill(session: MinimizedPluginSession, snap: PluginCapsuleSnapshot)
+    -> some View
+  {
+    HStack(spacing: 5) {
+      Button {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        onOpenFullWindow(session)
+      } label: {
+        HStack(spacing: 8) {
+          capsuleIcon(session: session, size: 29)
+
+          VStack(alignment: .leading, spacing: 1) {
+            Text(snap.title)
+              .font(.footnote.weight(.semibold))
+              .foregroundStyle(.primary)
+              .lineLimit(1)
+            let secondary = snap.subtitle.isEmpty ? snap.statusText : snap.subtitle
+            if !secondary.isEmpty {
+              Text(secondary)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            }
+          }
+          .frame(maxWidth: 152, alignment: .leading)
+        }
+        .padding(.trailing, 3)
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel("恢复打开 \(snap.title)")
+
+      ForEach(Array(snap.actions.prefix(3))) { action in
+        inlineActionButton(action: action, isPlaying: snap.isPlaying)
+      }
+
+      Button {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        manager.closeAndRelease()
+      } label: {
+        Image(systemName: "xmark")
+          .font(.caption2.weight(.bold))
+          .foregroundStyle(.secondary)
+          .frame(width: 25, height: 25)
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel("关闭插件胶囊")
+    }
+    .padding(.leading, 7)
+    .padding(.trailing, 7)
+    .padding(.vertical, 5.5)
+    .background(.ultraThinMaterial, in: Capsule())
+    .overlay(
+      Capsule()
+        .strokeBorder(appearance.accentColor.opacity(0.38), lineWidth: 0.9)
+    )
+    .shadow(color: .black.opacity(0.22), radius: 12, y: 5)
+    .accessibilityIdentifier("native-plugin-floating-capsule")
+  }
+
+  /// 渲染紧凑单行胶囊内联纯图标快捷按钮（实时同步播放/暂停与选中态）。
+  private func inlineActionButton(
+    action: PluginCapsuleActionItem,
+    isPlaying: Bool
+  ) -> some View {
+    let kind = action.inlineKind
+    let symbolName: String = {
+      switch kind {
+      case .previous:
+        return "backward.end.fill"
+      case .playPause:
+        return isPlaying ? "pause.fill" : "play.fill"
+      case .next:
+        return "forward.end.fill"
+      case .heart:
+        return action.active ? "heart.fill" : "heart"
+      case .repeatOne:
+        return "repeat.1"
+      case .repeatAll:
+        return "repeat"
+      case .shuffle:
+        return "shuffle"
+      case .lyrics:
+        return "quote.bubble"
+      case .generic:
+        return "star.fill"
+      }
+    }()
+    let foreground: Color = {
+      if action.destructive {
+        return NativeTheme.danger
+      }
+      if kind == .heart && action.active {
+        return Color(red: 1.0, green: 0.36, blue: 0.54)
+      }
+      if kind != .playPause && action.active {
+        return appearance.accentColor
+      }
+      return .primary
+    }()
+
+    return Button {
+      UIImpactFeedbackGenerator(style: .light).impactOccurred()
+      manager.dispatchAction(action.id)
+    } label: {
+      Image(systemName: symbolName)
+        .font(.system(size: 13.5, weight: .semibold))
+        .foregroundStyle(foreground)
+        .frame(width: 27, height: 27)
+        .contentShape(Circle())
+    }
+    .buttonStyle(.plain)
+    .accessibilityLabel(action.label)
+  }
+
+  @ViewBuilder
+  private func capsuleIcon(session: MinimizedPluginSession, size: CGFloat) -> some View {
+    let revision = manager.iconCacheRevision
+    if revision >= 0, let cached = manager.cachedIcon(for: session) {
+      Image(uiImage: cached)
+        .resizable()
+        .scaledToFill()
+        .frame(width: size, height: size)
+        .clipShape(Circle())
+    } else {
+      fallbackCapsuleIcon(size: size)
+    }
+  }
+
+  private func fallbackCapsuleIcon(size: CGFloat) -> some View {
+    ZStack {
+      Circle()
+        .fill(appearance.accentColor.opacity(0.18))
+      Image(systemName: "puzzlepiece.extension.fill")
+        .font(.system(size: size * 0.48, weight: .semibold))
+        .foregroundStyle(appearance.accentColor)
+    }
+    .frame(width: size, height: size)
   }
 }

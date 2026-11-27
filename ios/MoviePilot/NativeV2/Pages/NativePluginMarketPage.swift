@@ -22,15 +22,17 @@ struct NativePluginMarketPage: View {
   /// 插件列表排序方式。
   enum SortMode: String, CaseIterable, Identifiable {
     case defaultOrder = "默认顺序"
-    case nameAsc = "名称排序"
+    case latestPublished = "最新发布"
     case installsDesc = "安装量最高"
     case ratingDesc = "评分最高"
+    case nameAsc = "名称排序"
     var id: String { rawValue }
   }
 
   let session: NativeSession
 
   @Environment(\.openURL) private var openURL
+  @ObservedObject private var appearance = NativeAppearanceStore.shared
   @State private var installedFilter: InstalledFilter = .all
   @State private var sortMode: SortMode = .defaultOrder
   @State private var installedPlugins: [NativeMarketPluginRecord] = []
@@ -343,6 +345,8 @@ struct NativePluginMarketPage: View {
     switch sortMode {
     case .defaultOrder:
       return matched
+    case .latestPublished:
+      return matched.sorted { Self.compareLatestPublished($0, $1) }
     case .nameAsc:
       return matched.sorted {
         $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
@@ -355,6 +359,18 @@ struct NativePluginMarketPage: View {
           > (resolvedRating(for: $1)?.averageRating ?? $1.averageRating)
       }
     }
+  }
+
+  /// 后端 `add_time` 表示在线目录逆序编号（正数且值越小代表越新发布；0 或未设置排在正数之后）。
+  fileprivate static func compareLatestPublished(
+    _ lhs: NativeMarketPluginRecord, _ rhs: NativeMarketPluginRecord
+  ) -> Bool {
+    let a = lhs.addTime
+    let b = rhs.addTime
+    if a > 0 && b > 0 && a != b { return a < b }
+    if a > 0 && b <= 0 { return true }
+    if a <= 0 && b > 0 { return false }
+    return lhs.displayName.localizedStandardCompare(rhs.displayName) == .orderedAscending
   }
 
   private func resolvedDownloads(for plugin: NativeMarketPluginRecord) -> Int {
@@ -388,7 +404,8 @@ struct NativePluginMarketPage: View {
       isInstalledContext: true,
       isMutating: isMutating,
       downloads: downloads,
-      effectiveRating: effectiveRating
+      effectiveRating: effectiveRating,
+      onQuickUpdate: plugin.hasUpdate ? { pendingInstall = plugin } : nil
     )
     .onTapGesture {
       guard mutatingID == nil else { return }
@@ -540,9 +557,9 @@ struct NativePluginMarketPage: View {
             .foregroundStyle(.white)
             .padding(.horizontal, 16)
             .padding(.vertical, 9)
-            .background { Capsule().fill(NativeTheme.brand) }
+            .background { Capsule().fill(appearance.accentColor) }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.borderless)
       }
       .frame(maxWidth: .infinity, minHeight: 170)
     }
@@ -603,11 +620,69 @@ struct NativePluginMarketPage: View {
           Array(loadedRemotes), for: remotesCacheKey, session: session)
       }
       NativePageDataCache.shared.set(valid, for: cacheKey, session: session)
-      Task { await loadPluginStatsAndRatings(pluginIDs: valid.map { $0.sourcePluginID ?? $0.id }) }
+      Task(priority: .utility) { await syncInstalledUpdateFlags(forceMarket: forceRefresh) }
+      Task(priority: .utility) {
+        await loadPluginStatsAndRatings(pluginIDs: valid.map { $0.sourcePluginID ?? $0.id })
+      }
     } catch is CancellationError {
       return
     } catch {
       if installedPlugins.isEmpty { loadFailed = true }
+    }
+  }
+
+  /// 对齐 Web `mergeMarketMetadataIntoInstalled`：将市场清单中的 `has_update` 与 `repo_url` 投影到已安装插件列表。
+  private func syncInstalledUpdateFlags(forceMarket: Bool) async {
+    let marketCacheKey = "plugins|market"
+    let marketItems: [NativeMarketPluginRecord]
+    if !forceMarket,
+      let cached: [NativeMarketPluginRecord] = NativePageDataCache.shared.get(
+        marketCacheKey, session: session)
+    {
+      marketItems = cached
+    } else {
+      var query = [URLQueryItem(name: "state", value: "market")]
+      if forceMarket { query.append(URLQueryItem(name: "force", value: "true")) }
+      guard
+        let endpoint = try? APIEndpoint(
+          path: ["plugin"],
+          query: query,
+          maximumResponseBytes: 8 * 1024 * 1024,
+          trailingSlash: true
+        ),
+        let loaded = try? await session.request(
+          endpoint, as: [NativeMarketPluginRecord].self,
+          requiring: PermissionRequirement(category: .admin)
+        ).value
+      else { return }
+      let valid = loaded.filter { !$0.id.isEmpty }
+      NativePageDataCache.shared.set(valid, for: marketCacheKey, session: session)
+      marketItems = valid
+    }
+    guard !Task.isCancelled, !installedPlugins.isEmpty else { return }
+    var updatableByID: [String: NativeMarketPluginRecord] = [:]
+    for item in marketItems where item.hasUpdate {
+      updatableByID[item.id] = item
+      updatableByID[item.id.lowercased()] = item
+    }
+    var changed = false
+    var next = installedPlugins
+    for idx in next.indices {
+      let key = next[idx].sourcePluginID ?? next[idx].id
+      let marketMatch = updatableByID[key] ?? updatableByID[key.lowercased()]
+      let shouldUpdate = (marketMatch != nil) || next[idx].hasUpdate
+      if next[idx].hasUpdate != shouldUpdate {
+        next[idx].hasUpdate = shouldUpdate
+        changed = true
+      }
+      if let repo = marketMatch?.repoURL, !repo.isEmpty, (next[idx].repoURL ?? "").isEmpty {
+        next[idx].repoURL = repo
+        changed = true
+      }
+    }
+    if changed {
+      installedPlugins = next
+      NativePageDataCache.shared.set(next, for: "plugins|installed", session: session)
     }
   }
 
@@ -1042,6 +1117,8 @@ private struct NativePluginStorePage: View {
     }
     switch sortMode {
     case .defaultOrder: return matched
+    case .latestPublished:
+      return matched.sorted { NativePluginMarketPage.compareLatestPublished($0, $1) }
     case .nameAsc:
       return matched.sorted {
         $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
@@ -1071,7 +1148,7 @@ private struct NativePluginStorePage: View {
         cacheKey, session: session)
     {
       marketPlugins = cached
-      marketHasMore = cached.count >= 60
+      marketHasMore = false
       isLoading = false
       loadFailed = false
       return
@@ -1080,12 +1157,8 @@ private struct NativePluginStorePage: View {
     loadFailed = false
     defer { isLoading = false }
     marketPage = 1
-    marketHasMore = true
-    var query = [
-      URLQueryItem(name: "state", value: "market"),
-      URLQueryItem(name: "page", value: "1"),
-      URLQueryItem(name: "count", value: "60"),
-    ]
+    marketHasMore = false
+    var query = [URLQueryItem(name: "state", value: "market")]
     if forceMarket { query.append(URLQueryItem(name: "force", value: "true")) }
     do {
       let endpoint = try APIEndpoint(
@@ -1096,7 +1169,7 @@ private struct NativePluginStorePage: View {
       ).value
       let valid = loaded.filter { !$0.id.isEmpty }
       marketPlugins = valid
-      marketHasMore = valid.count >= 60
+      marketHasMore = false
       NativePageDataCache.shared.set(valid, for: cacheKey, session: session)
       Task { await loadStatsAndRatings(ids: valid.map(\.id)) }
     } catch {
@@ -1183,6 +1256,8 @@ private struct NativePluginCardSurface: View {
   let isMutating: Bool
   let downloads: Int
   let effectiveRating: Double
+  var onQuickUpdate: (() -> Void)? = nil
+  @ObservedObject private var appearance = NativeAppearanceStore.shared
 
   var body: some View {
     let isInactive = isInstalledContext && !plugin.isRunning
@@ -1312,7 +1387,31 @@ private struct NativePluginCardSurface: View {
 
   @ViewBuilder
   private var statusBadge: some View {
-    if plugin.hasUpdate {
+    if isInstalledContext && plugin.hasUpdate, let onQuickUpdate {
+      HStack(spacing: 6) {
+        badgePill(
+          plugin.isRunning ? "运行中" : "未启用",
+          tint: plugin.isRunning ? NativeTheme.success : NativeTheme.badgeMutedText)
+        Button {
+          onQuickUpdate()
+        } label: {
+          HStack(spacing: 3.5) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+              .font(.system(size: 10, weight: .bold))
+            Text("更新")
+              .font(.caption2.weight(.bold))
+          }
+          .foregroundStyle(.white)
+          .padding(.horizontal, 9)
+          .padding(.vertical, 4)
+          .background {
+            Capsule().fill(Color.orange)
+          }
+        }
+        .buttonStyle(.borderless)
+        .accessibilityIdentifier("native-installed-update-\(plugin.id)")
+      }
+    } else if plugin.hasUpdate {
       badgePill("有更新", tint: NativeTheme.warning)
     } else if !isInstalledContext && plugin.installed {
       badgePill("已安装", tint: NativeTheme.success)
@@ -1368,6 +1467,7 @@ private struct NativePluginMarketDetailSheet: View {
 
   @Environment(\.dismiss) private var dismiss
   @Environment(\.openURL) private var openURL
+  @ObservedObject var appearance = NativeAppearanceStore.shared
 
   @State private var sourceOptions: NativePluginSourceOptions?
   @State private var selectedSourceRepo: String = ""
@@ -1503,6 +1603,7 @@ private struct NativePluginMarketDetailSheet: View {
             }
           }
         }
+        let ctaColor: Color = plugin.hasUpdate ? Color.orange : appearance.accentColor
         Button {
           Task { await installOrUpdate(releaseVersion: nil) }
         } label: {
@@ -1522,14 +1623,16 @@ private struct NativePluginMarketDetailSheet: View {
                   ? (plugin.hasUpdate ? "更新插件" : "重新安装") : "安装插件"))
           }
           .font(.subheadline.weight(.semibold))
-          .foregroundStyle(.white)
+          .foregroundStyle(Color.white)
           .frame(maxWidth: .infinity)
-          .padding(.vertical, 11)
+          .padding(.vertical, 12)
           .background {
-            RoundedRectangle(cornerRadius: 12, style: .continuous).fill(NativeTheme.brand)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+              .fill(ctaColor.opacity(isInstalling ? 0.65 : 1.0))
+              .shadow(color: ctaColor.opacity(isInstalling ? 0 : 0.28), radius: 8, y: 3)
           }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.borderless)
         .disabled(isInstalling)
       }
     }
@@ -1622,15 +1725,19 @@ private struct NativePluginMarketDetailSheet: View {
                 } label: {
                   Text(needsChange ? "切换到所选在线源" : "绑定并从所选在线源安装")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(NativeTheme.brand)
+                    .foregroundStyle(appearance.accentColor)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 9)
                     .background {
                       RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(NativeTheme.brand.opacity(0.14))
+                        .fill(appearance.accentColor.opacity(0.16))
+                        .overlay {
+                          RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(appearance.accentColor.opacity(0.32), lineWidth: 0.7)
+                        }
                     }
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.borderless)
                 .disabled(isInstalling)
               }
             }
@@ -2506,65 +2613,21 @@ private struct NativePluginCloneSheet: View {
   }
 }
 
-/// 插件专属实时日志查看弹窗（`GET /api/v1/system/logging?length=200&logfile=plugins/{id}.log`）。
+/// 插件日志弹窗直接复用实时日志工具，只注入插件文件名、标题和关闭入口。
 @MainActor
 private struct NativePluginLogSheet: View {
   let session: NativeSession
   let plugin: NativeMarketPluginRecord
 
   @Environment(\.dismiss) private var dismiss
-  @State private var lines: [String] = []
-  @State private var isLoading = true
-  @State private var errorMessage: String?
 
   var body: some View {
     NavigationStack {
-      ZStack {
-        CinematicBackground()
-        if isLoading && lines.isEmpty {
-          ScrollView {
-            NativeCardListSkeletonView(
-              count: 14,
-              style: .logLines,
-              spacing: 6,
-              showsIcon: false
-            )
-            .padding(.horizontal, CinematicStyle.margin)
-            .padding(.vertical, 12)
-          }
-          .scrollIndicators(.hidden)
-          .transition(.opacity)
-        } else if let errorMessage {
-          CinematicPanel {
-            VStack(spacing: 10) {
-              Text(errorMessage).font(.subheadline).foregroundStyle(.secondary)
-              Button("重试") { Task { await loadLogs() } }
-            }
-            .frame(maxWidth: .infinity)
-          }
-          .padding(.horizontal, CinematicStyle.margin)
-        } else if lines.isEmpty {
-          Text("暂无插件日志输出").font(.subheadline).foregroundStyle(.secondary)
-        } else {
-          ScrollView {
-            LazyVStack(alignment: .leading, spacing: 6) {
-              ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                Text(line)
-                  .font(.caption2.monospaced())
-                  .foregroundStyle(colorForLogLine(line))
-                  .textSelection(.enabled)
-                  .frame(maxWidth: .infinity, alignment: .leading)
-              }
-            }
-            .padding(.horizontal, CinematicStyle.margin)
-            .padding(.vertical, 12)
-          }
-          .refreshable { await loadLogs() }
-        }
-      }
-      .navigationTitle("\(plugin.displayName) 日志")
-      .navigationBarTitleDisplayMode(.inline)
-      .nativeTopNavigationBar()
+      NativeDiagnosticsToolsPage(
+        session: session, initialTool: .liveLog,
+        logfile: "plugins/\(plugin.id.lowercased()).log",
+        logTitle: "\(plugin.displayName) 日志"
+      )
       .toolbar {
         ToolbarItem(placement: .topBarLeading) {
           Button {
@@ -2574,52 +2637,13 @@ private struct NativePluginLogSheet: View {
           }
           .tint(.primary)
           .accessibilityLabel("关闭")
-        }
-        ToolbarItem(placement: .topBarTrailing) {
-          Button {
-            Task { await loadLogs() }
-          } label: {
-            Image(systemName: "arrow.clockwise")
-          }
-          .tint(.primary)
-          .accessibilityLabel("刷新")
+          .accessibilityIdentifier("native-plugin-log-close")
         }
       }
-      .task { await loadLogs() }
     }
     .nativeGlassSheet()
   }
 
-  private func loadLogs() async {
-    isLoading = true
-    errorMessage = nil
-    defer { isLoading = false }
-    do {
-      let ep = try APIEndpoint(
-        path: ["system", "logging"],
-        query: [
-          URLQueryItem(name: "length", value: "200"),
-          URLQueryItem(name: "logfile", value: "plugins/\(plugin.id.lowercased()).log"),
-        ],
-        responseContract: .payload,
-        timeout: 20)
-      let data = try await session.requestResourcePayload(ep).value
-      let rawText = String(data: data, encoding: .utf8) ?? ""
-      lines = rawText.components(separatedBy: .newlines).filter {
-        !$0.trimmingCharacters(in: .whitespaces).isEmpty
-      }
-    } catch {
-      errorMessage = "读取插件日志失败：\(error.localizedDescription)"
-    }
-  }
-
-  private func colorForLogLine(_ line: String) -> Color {
-    let upper = line.uppercased()
-    if upper.contains("ERROR") || upper.contains("CRITICAL") { return NativeTheme.danger }
-    if upper.contains("WARNING") || upper.contains("WARN") { return NativeTheme.warning }
-    if upper.contains("DEBUG") { return .secondary }
-    return .primary
-  }
 }
 
 /// 插件运行能力只读诊断弹窗（`GET /api/v1/plugin/runtime/capabilities?plugin_id={id}`）。
@@ -3113,8 +3137,9 @@ private struct NativeMarketPluginRecord: Codable, Sendable, Identifiable {
   let hasPage: Bool
   let renderMode: String?
   let state: Bool?
-  let repoURL: String?
+  var repoURL: String?
   let installCount: Int
+  let addTime: Int
   let averageRating: Double
   let ratingCount: Int
   let history: [String: String]?
@@ -3178,6 +3203,7 @@ private struct NativeMarketPluginRecord: Codable, Sendable, Identifiable {
     state = try? container.decodeIfPresent(Bool.self, forKey: .state)
     repoURL = try? container.decodeIfPresent(String.self, forKey: .repoURL)
     installCount = (try? container.decodeIfPresent(Int.self, forKey: .installCount)) ?? 0
+    addTime = (try? container.decodeIfPresent(Int.self, forKey: .addTime)) ?? 0
     averageRating = (try? container.decodeIfPresent(Double.self, forKey: .averageRating)) ?? 0
     ratingCount = (try? container.decodeIfPresent(Int.self, forKey: .ratingCount)) ?? 0
     history = try? container.decodeIfPresent([String: String].self, forKey: .history)
@@ -3203,6 +3229,7 @@ private struct NativeMarketPluginRecord: Codable, Sendable, Identifiable {
     case state
     case repoURL = "repo_url"
     case installCount = "install_count"
+    case addTime = "add_time"
     case averageRating = "average_rating"
     case ratingCount = "rating_count"
     case history

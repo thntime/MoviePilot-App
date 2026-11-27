@@ -72,6 +72,10 @@ final class PluginHostBridgeV2: NSObject, WKScriptMessageHandler {
   var onPluginMounted: ((_ mountId: String, _ title: String) -> Void)?
   var onPluginError: ((_ stage: String, _ message: String, _ recoverable: Bool) -> Void)?
   var onPluginClose: (() -> Void)?
+  var onPluginMinimize: ((_ requestId: String, _ payload: [String: Any]) -> Void)?
+  var onCapsuleUpdate: ((_ payload: [String: Any]) -> Void)?
+  var onPluginRestore: ((_ requestId: String) -> Void)?
+  var onNavBackResult: ((_ handled: Bool) -> Void)?
   var onPluginAction: ((_ payload: [String: Any]) -> Void)?
   var onHeaderUpdate: ((_ title: String, _ actions: [NativeVueSheetAction]) -> Void)?
   var onToast: ((_ toast: PluginToastPayload) -> Void)?
@@ -97,6 +101,10 @@ final class PluginHostBridgeV2: NSObject, WKScriptMessageHandler {
     onPluginMounted = nil
     onPluginError = nil
     onPluginClose = nil
+    onPluginMinimize = nil
+    onCapsuleUpdate = nil
+    onPluginRestore = nil
+    onNavBackResult = nil
     onPluginAction = nil
     onHeaderUpdate = nil
     onToast = nil
@@ -158,6 +166,22 @@ final class PluginHostBridgeV2: NSObject, WKScriptMessageHandler {
 
   func sendHostAction(id: String) {
     sendToWeb(type: "host.action", payload: ["actionId": id])
+  }
+
+  func sendCapsuleAction(id: String) {
+    sendToWeb(type: "capsule.action", payload: ["actionId": id])
+  }
+
+  func sendSimpleResponse(requestId: String, data: [String: Any]) {
+    guard !requestId.isEmpty else { return }
+    sendToWeb(
+      type: "bridge.response",
+      payload: [
+        "requestId": requestId,
+        "ok": true,
+        "data": data,
+      ]
+    )
   }
 
   func sendConfirmResult(id: String, confirmed: Bool) {
@@ -228,6 +252,29 @@ final class PluginHostBridgeV2: NSObject, WKScriptMessageHandler {
 
     case "plugin.close":
       onPluginClose?()
+
+    case "plugin.minimize":
+      let reqId = payload["requestId"] as? String ?? ""
+      if let onPluginMinimize {
+        onPluginMinimize(reqId, payload)
+      } else {
+        sendSimpleResponse(requestId: reqId, data: ["minimized": false])
+      }
+
+    case "plugin.capsule.update":
+      onCapsuleUpdate?(payload)
+
+    case "plugin.restore":
+      let reqId = payload["requestId"] as? String ?? ""
+      if let onPluginRestore {
+        onPluginRestore(reqId)
+      } else {
+        sendSimpleResponse(requestId: reqId, data: ["restored": true])
+      }
+
+    case "nav.backResult":
+      let handled = (payload["handled"] as? Bool) ?? false
+      onNavBackResult?(handled)
 
     case "plugin.action":
       onPluginAction?(payload)
@@ -320,6 +367,7 @@ final class PluginHostBridgeV2: NSObject, WKScriptMessageHandler {
 
   // MARK: - Authenticated Native API Proxy
 
+  /// 校验插件 API 路径后，经原生实例与网关鉴权代发请求。
   private func handleAPIRequest(requestId: String, payload: [String: Any]) {
     guard let rawPath = payload["path"] as? String else {
       sendAPIError(requestId: requestId, status: 400, code: "INVALID_PATH", message: "Missing request path")
@@ -373,6 +421,8 @@ final class PluginHostBridgeV2: NSObject, WKScriptMessageHandler {
     if let cookie = context.resourceCookie {
       request.setValue("\(cookie.name)=\(cookie.value)", forHTTPHeaderField: "Cookie")
     }
+    // 与原生 API 和插件资源通道保持相同网关鉴权，注册表会保留资源 Cookie。
+    CloudflareAccessCredentialRegistry.shared.applyHeaders(to: &request, for: context.address)
 
     let bodyEncoding = (payload["bodyEncoding"] as? String) ?? ""
     switch bodyEncoding {

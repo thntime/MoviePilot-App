@@ -5,7 +5,10 @@ import XCTest
 @MainActor
 final class NativeV2EntryTests: XCTestCase {
   private let base = "http://127.0.0.1:5330/"
-  private let arguments = ["-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+  private let arguments = [
+    "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN",
+    "-nativeV2.appearance.animateBackground", "NO",
+  ]
 
   /// 显式交互运行时才从一次性回环通道取得凭据；App 自己连接真实后端执行只读浏览。
   func testLiveBackendReadOnlyMediaScreens() async throws {
@@ -855,9 +858,19 @@ final class NativeV2EntryTests: XCTestCase {
       app.descendants(matching: .any)["native-vue-local-runtime-ready"].waitForExistence(
         timeout: 25),
       "Vue 联邦插件本地预热运行时必须完成远程分片加载并挂载。")
-    XCTAssertTrue(app.buttons["native-vue-plugin-sheet-close"].exists)
-    XCTAssertTrue(app.webViews.firstMatch.exists)
-    app.buttons["native-vue-plugin-sheet-close"].tap()
+    XCTAssertFalse(
+      app.buttons["native-vue-plugin-sheet-close"].exists,
+      "模块联邦插件自带退出按钮，App 不应重复渲染顶部关闭按钮。")
+    let webView = app.webViews.firstMatch
+    XCTAssertTrue(webView.exists)
+    let pluginCloseBtn = webView.buttons.matching(
+      NSPredicate(format: "label CONTAINS[c] %@ OR label == '×' OR label == '✕'", "关闭")
+    ).firstMatch
+    if pluginCloseBtn.waitForExistence(timeout: 5) {
+      pluginCloseBtn.tap()
+    } else {
+      webView.swipeDown(velocity: .fast)
+    }
     XCTAssertTrue(app.scrollViews["native-plugin-market-scroll"].waitForExistence(timeout: 12))
   }
 
@@ -1063,6 +1076,62 @@ final class NativeV2EntryTests: XCTestCase {
     XCTAssertEqual(counts["unexpected"], [:])
   }
 
+  /// 验证资源搜索页多选菜单勾选后保持展开可连续勾选且全部勾选项同时保留，互斥项与清空项仍点选即收起，零 WebView。
+  func testNativeResourceMultiSelectMenusStayOpen() async throws {
+    guard #available(iOS 16.4, *) else {
+      throw XCTSkip("iOS 16.4 以下系统菜单不支持点选后保持展开，沿用点选即收起")
+    }
+    let app = try await signInToNativeBusiness()
+    defer { app.terminate() }
+    openOverflowItem("native-workspace-resources", app: app)
+    XCTAssertTrue(app.scrollViews["native-resource-search-scroll"].waitForExistence(timeout: 15))
+    let outsideMenu = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.82))
+
+    let sitesMenu = app.buttons["native-resource-search-sites"]
+    XCTAssertTrue(sitesMenu.waitForExistence(timeout: 10))
+    sitesMenu.tap()
+    let siteOptions = try tapEveryMenuOption(prefix: "native-resource-search-site-", app: app)
+    let expectedScope =
+      siteOptions.count == 1 ? String(siteOptions[0].label.prefix(6)) : "\(siteOptions.count)站"
+    capture("native-v2-fixture-resource-site-menu-multi-select")
+    outsideMenu.tap()
+    XCTAssertTrue(siteOptions[0].waitForNonExistence(timeout: 5), "点选菜单外应收起菜单")
+    XCTAssertTrue(sitesMenu.label.contains(expectedScope), "全部勾选站点应同时保留")
+    sitesMenu.tap()
+    XCTAssertTrue(siteOptions[0].waitForExistence(timeout: 5))
+    app.buttons["全部站点"].tap()
+    XCTAssertTrue(siteOptions[0].waitForNonExistence(timeout: 5), "互斥项点选后菜单应收起")
+
+    let resolutionMenu = app.buttons["native-resource-facet-分辨率"]
+    XCTAssertTrue(resolutionMenu.waitForExistence(timeout: 10))
+    // 大字号窄屏下胶囊可能位于横向筛选条屏外，先横向滑入可视区域再点选。
+    for _ in 0..<4 where !resolutionMenu.isHittable {
+      app.scrollViews["native-resource-facet-bar"].swipeLeft()
+    }
+    resolutionMenu.tap()
+    let facetOptions = try tapEveryMenuOption(prefix: "native-resource-facet-分辨率-", app: app)
+    capture("native-v2-fixture-resource-facet-menu-multi-select")
+    XCTAssertTrue(resolutionMenu.label.contains("\(facetOptions.count)"), "全部勾选项应同时保留")
+    app.buttons["清空分辨率"].tap()
+    XCTAssertTrue(facetOptions[0].waitForNonExistence(timeout: 5), "清空项点选后菜单应收起")
+    XCTAssertEqual(app.webViews.count, 0)
+  }
+
+  /// 依次点选已展开菜单内全部多选项，每次点选后菜单都必须保持展开；返回这些菜单项供后续断言。
+  private func tapEveryMenuOption(prefix: String, app: XCUIApplication) throws -> [XCUIElement] {
+    let query = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", prefix))
+    XCTAssertTrue(query.firstMatch.waitForExistence(timeout: 5))
+    let options = query.allElementsBoundByIndex.map { app.buttons[$0.identifier] }
+    for option in try XCTUnwrap(options.isEmpty ? nil : options) {
+      option.tap()
+      let dismissed = XCTNSPredicateExpectation(
+        predicate: NSPredicate(format: "exists == false"), object: option)
+      XCTAssertEqual(
+        XCTWaiter.wait(for: [dismissed], timeout: 1.5), .timedOut, "多选项点选后菜单应保持展开")
+    }
+    return options
+  }
+
   /// P5.3 / P6.1 / P6.4：验证原生整理历史展开/确认删除、站点连通测试与消息中心分类过滤，零 WebView。
   func testNativeHistorySitesAndMessagesFlows() async throws {
     let app = try await signInToNativeBusiness()
@@ -1213,6 +1282,43 @@ final class NativeV2EntryTests: XCTestCase {
     XCTAssertEqual(counts["a"]?["POST api/v1/system/env"], 1)
     XCTAssertGreaterThanOrEqual(counts["a"]?["GET api/v1/user"] ?? 0, 1)
     XCTAssertEqual(counts["unexpected"], [:])
+  }
+
+  /// 只编辑邮箱时，真实完整更新请求仍需保留 OTP、资料和细粒度权限。
+  func testUserEditorPreservesUneditedFields() async throws {
+    let app = try await signInToNativeBusiness()
+    defer { app.terminate() }
+    openSettingsHub(app: app)
+    let usersEntry = app.buttons["native-workspace-users"]
+    reveal(usersEntry, app: app)
+    tap(usersEntry, app: app)
+    let member = app.buttons["native-user-card-20"]
+    XCTAssertTrue(member.waitForExistence(timeout: 10))
+    tap(member, app: app)
+    let email = app.textFields["native-user-editor-email"]
+    XCTAssertTrue(email.waitForExistence(timeout: 10))
+    email.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.5)).tap()
+    let existingEmailLength = (email.value as? String)?.count ?? 0
+    email.typeText(
+      String(repeating: XCUIKeyboardKey.delete.rawValue, count: existingEmailLength * 2)
+        + "edited@example.test")
+    dismissKeyboard(app)
+    tap(app.buttons["native-user-editor-save"], app: app)
+    XCTAssertTrue(
+      app.descendants(matching: .any)["native-users-feedback"].firstMatch.waitForExistence(
+        timeout: 10))
+    var request = URLRequest(url: URL(string: base + "a/api/v1/user/")!)
+    request.setValue("Bearer synthetic-native-a", forHTTPHeaderField: "Authorization")
+    let (data, _) = try await URLSession.shared.data(for: request)
+    let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let users = try XCTUnwrap(root["data"] as? [[String: Any]])
+    let saved = try XCTUnwrap(users.first { $0["id"] as? Int == 20 })
+    XCTAssertEqual(saved["email"] as? String, "edited@example.test")
+    XCTAssertEqual(saved["is_otp"] as? Bool, true)
+    XCTAssertEqual(saved["avatar"] as? String, "synthetic-avatar")
+    XCTAssertEqual((saved["settings"] as? [String: String])?["theme"], "dark")
+    let permissions = saved["permissions"] as? [String: Any]
+    XCTAssertEqual((permissions?["features"] as? [String: Bool])?["plugin.demo.main"], false)
   }
 
   /// P3.2b：验证多来源片库探索筛选切换与发现页模块编排开关持久化，零 WebView。
@@ -1410,6 +1516,69 @@ final class NativeV2EntryTests: XCTestCase {
     XCTAssertEqual(counts["unexpected"], [:])
   }
 
+  /// 插件日志复用实时日志的解析卡片、级别筛选、跟随与刷新，并覆盖空日志和错误恢复。
+  func testPluginLogSnapshotLoadsRefreshesAndRetries() async throws {
+    let app = try await signInToNativeBusiness()
+    defer { app.terminate() }
+    openOverflowItem("native-overflow-plugin-market", app: app)
+    let card = app.descendants(matching: .any)["native-installed-card-DemoPlugin"].firstMatch
+    XCTAssertTrue(card.waitForExistence(timeout: 10))
+    card.press(forDuration: 1.0)
+    let logs = app.buttons["查看日志"]
+    XCTAssertTrue(logs.waitForExistence(timeout: 8))
+    logs.tap()
+
+    let output = app.descendants(matching: .any)["native-diag-log-output"].firstMatch
+    let refresh = app.buttons["native-diag-log-refresh"]
+    let newest = app.staticTexts["合成插件日志 450"]
+    XCTAssertTrue(output.waitForExistence(timeout: 10))
+    XCTAssertTrue(newest.waitForExistence(timeout: 5))
+    XCTAssertTrue(app.staticTexts["demoplugin.py"].firstMatch.exists)
+    XCTAssertTrue(app.textFields["native-diag-log-filter"].exists)
+    let beforeFollow = try await stats()["a"]?["log-snapshot"] ?? 0
+    try await Task.sleep(nanoseconds: 4_000_000_000)
+    let afterFollow = try await stats()["a"]?["log-snapshot"] ?? 0
+    XCTAssertGreaterThan(afterFollow, beforeFollow)
+    let follow = app.buttons["native-diag-log-follow"]
+    tap(follow, app: app)
+    XCTAssertEqual(follow.label, "恢复实时跟随")
+
+    tap(app.buttons["native-diag-log-level-ERROR"], app: app)
+    XCTAssertTrue(app.staticTexts["合成插件日志 448"].waitForExistence(timeout: 5))
+    XCTAssertFalse(newest.exists)
+    tap(app.buttons["native-diag-log-level-WARNING"], app: app)
+    XCTAssertTrue(app.staticTexts["合成插件日志 449"].waitForExistence(timeout: 5))
+    tap(app.buttons["native-diag-log-level-DEBUG"], app: app)
+    XCTAssertTrue(app.staticTexts["合成插件日志 447"].waitForExistence(timeout: 5))
+    tap(app.buttons["native-diag-log-level-全部"], app: app)
+    XCTAssertTrue(newest.waitForExistence(timeout: 5))
+    capture("native-v2-plugin-log-snapshot")
+
+    try await configure("a", mode: "logs-empty")
+    tap(refresh, app: app)
+    XCTAssertTrue(app.staticTexts["暂无匹配的日志记录"].waitForExistence(timeout: 10))
+
+    try await configure("a", mode: "logs-failed")
+    tap(refresh, app: app)
+    let feedback = app.descendants(matching: .any)["native-diag-feedback"].firstMatch
+    XCTAssertTrue(feedback.waitForExistence(timeout: 10))
+
+    try await configure("a", mode: "ready")
+    tap(refresh, app: app)
+    XCTAssertTrue(output.waitForExistence(timeout: 10))
+    XCTAssertTrue(newest.waitForExistence(timeout: 5))
+    XCTAssertFalse(feedback.exists)
+    tap(app.buttons["native-plugin-log-close"], app: app)
+    XCTAssertTrue(card.waitForExistence(timeout: 8))
+    XCTAssertEqual(app.webViews.count, 0)
+
+    let counts = try await stats()
+    XCTAssertGreaterThanOrEqual(counts["a"]?["GET api/v1/system/logging"] ?? 0, 5)
+    XCTAssertGreaterThanOrEqual(counts["a"]?["log-snapshot"] ?? 0, 4)
+    XCTAssertEqual(counts["a"]?["log-stream"] ?? 0, 0)
+    XCTAssertEqual(counts["unexpected"], [:])
+  }
+
   /// P6.5：验证原生智能助手 SSE 流式回复解析、工具调用摘要与历史会话读取，零 WebView。
   func testNativeAgentChatStreamAndSessionHistory() async throws {
     let app = try await signInToNativeBusiness()
@@ -1417,6 +1586,10 @@ final class NativeV2EntryTests: XCTestCase {
 
     let mascotBtn = app.buttons["native-agent-floating-mascot"]
     XCTAssertTrue(mascotBtn.waitForExistence(timeout: 8))
+    // 登录转场期间可访问性节点先出现，等浮动入口真正可点击后再打开对话。
+    let mascotReady = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "hittable == true"), object: mascotBtn)
+    XCTAssertEqual(XCTWaiter.wait(for: [mascotReady], timeout: 15), .completed)
     mascotBtn.tap()
     XCTAssertTrue(app.scrollViews["native-agent-scroll"].waitForExistence(timeout: 10))
 
@@ -1434,13 +1607,15 @@ final class NativeV2EntryTests: XCTestCase {
     tap(sessionsBtn, app: app)
     let firstSession = app.buttons["native-agent-session-sess-1"]
     XCTAssertTrue(firstSession.waitForExistence(timeout: 10))
+    // 启动恢复可能已读取最近会话；只要求本次手动打开新增一次读取。
+    let beforeOpen = try await stats()["a"]?["GET api/v1/message/agent/sessions/sess-1"] ?? 0
     firstSession.tap()
     XCTAssertTrue(app.staticTexts["已检索 TMDB 评分"].waitForExistence(timeout: 10))
     XCTAssertEqual(app.webViews.count, 0)
 
     let counts = try await stats()
-    XCTAssertEqual(counts["a"]?["POST api/v1/agent/stream"], 1)
-    XCTAssertEqual(counts["a"]?["GET api/v1/agent/sessions/sess-1"], 1)
+    XCTAssertEqual(counts["a"]?["POST api/v1/message/agent/stream"], 1)
+    XCTAssertEqual(counts["a"]?["GET api/v1/message/agent/sessions/sess-1"], beforeOpen + 1)
     XCTAssertEqual(counts["unexpected"], [:])
   }
 
@@ -1692,26 +1867,28 @@ final class NativeV2EntryTests: XCTestCase {
     XCTAssertTrue(app.scrollViews["native-diag-scroll"].waitForExistence(timeout: 10))
     XCTAssertTrue(app.staticTexts["TMDB 元数据"].waitForExistence(timeout: 10))
 
-    let ruleTab = app.buttons["native-diag-tab-识别与规则"]
-    XCTAssertTrue(ruleTab.waitForExistence(timeout: 8))
-    ruleTab.tap()
+    app.navigationBars.buttons.firstMatch.tap()
+    openOverflowItem("native-shortcut-识别与规则", app: app)
     let titleField = app.textFields["native-diag-test-title"]
     XCTAssertTrue(titleField.waitForExistence(timeout: 8))
     titleField.tap()
     titleField.typeText("The.Matrix.1999.2160p")
+    dismissKeyboard(app)
     let runBtn = app.buttons["native-diag-test-run"]
     XCTAssertTrue(runBtn.waitForExistence(timeout: 8))
-    runBtn.tap()
+    tap(runBtn, app: app)
     XCTAssertTrue(
       app.descendants(matching: .any)["native-diag-test-result"].firstMatch.waitForExistence(
         timeout: 10))
 
-    let logTab = app.buttons["native-diag-tab-实时日志"]
-    XCTAssertTrue(logTab.waitForExistence(timeout: 8))
-    logTab.tap()
+    app.navigationBars.buttons.firstMatch.tap()
+    openOverflowItem("native-shortcut-实时日志", app: app)
     XCTAssertTrue(
       app.descendants(matching: .any)["native-diag-log-output"].firstMatch.waitForExistence(
         timeout: 10))
+    XCTAssertTrue(
+      app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "合成系统日志 450"))
+        .firstMatch.waitForExistence(timeout: 10))
     XCTAssertEqual(app.webViews.count, 0)
 
     let counts = try await stats()
@@ -2082,6 +2259,7 @@ final class NativeV2EntryTests: XCTestCase {
       "Unexpected web requests: \(counts["unexpected"] ?? [:])")
   }
 
+  /// 通过实例选择和真实登录控件建立本案例会话，不绕过认证或继承上一案例状态。
   private func signInToNativeBusiness(
     _ profile: String = "a", mode: String = "ready", extra: [String] = []
   )
@@ -2093,6 +2271,7 @@ final class NativeV2EntryTests: XCTestCase {
     enterCredentials(profile, app: app)
     tap(app.buttons["native-v2-login"], app: app)
     XCTAssertTrue(tabButton("我的", app: app).waitForExistence(timeout: 15))
+    dismissSystemPasswordSavePrompt(app)
     return app
   }
 
@@ -3324,20 +3503,44 @@ final class NativeV2EntryTests: XCTestCase {
     tap(app.buttons["native-v2-saved-\(base)\(name)/"], app: app)
   }
 
-  /// 合成输入经真正的安全密码框提交；截图不显示明文密码或令牌。
+  /// 合成密码只填写，不用回车提前移除键盘工具栏；由「完成」按钮统一收起键盘。
   private func enterCredentials(_ name: String, app: XCUIApplication) {
     let username = app.textFields["native-v2-username"]
     tap(username, app: app)
     username.typeText("native-" + name + "\n")
     let password = app.secureTextFields["native-v2-password"]
-    password.typeText("fixture-" + name + "123\n")
+    password.typeText("fixture-" + name + "123")
     dismissKeyboard(app)
   }
 
-  /// 通过系统键盘工具栏收键盘，后续按钮必须仍可由用户滚动到达。
+  /// 先等待回车触发的收起动画，再按需使用工具栏，避免点击已经消失的按钮。
   private func dismissKeyboard(_ app: XCUIApplication) {
-    let done = app.toolbars.buttons["完成"]
-    if done.exists { done.tap() }
+    let keyboard = app.keyboards.firstMatch
+    let hidden = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "exists == false"), object: keyboard)
+    if XCTWaiter.wait(for: [hidden], timeout: 2) == .completed { return }
+    let done = app.toolbars.buttons["完成"].firstMatch
+    guard done.exists && done.isHittable else { return }
+    done.tap()
+    let dismissed = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "exists == false"), object: keyboard)
+    XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 5), .completed)
+  }
+
+  /// 新版系统会在登录转场后弹出密码保存 sheet；只拒绝该系统提示，避免遮挡业务控件或保存夹具凭据。
+  private func dismissSystemPasswordSavePrompt(_ app: XCUIApplication) {
+    let titles = ["Save Password?", "存储密码？", "存储密码?", "保存密码？", "儲存密碼？"]
+    let prompt = app.sheets.matching(NSPredicate(format: "label IN %@", titles)).firstMatch
+    guard prompt.waitForExistence(timeout: 3) else { return }
+    let decline = prompt.buttons.matching(
+      NSPredicate(format: "label IN %@", ["Not Now", "以后", "暂不", "稍后", "稍後", "現在不要"])
+    )
+    .firstMatch
+    XCTAssertTrue(decline.waitForExistence(timeout: 5))
+    decline.tap()
+    let dismissed = XCTNSPredicateExpectation(
+      predicate: NSPredicate(format: "exists == false"), object: prompt)
+    XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 5), .completed)
   }
 
   /// 大字/横屏通过滚动查找可触控控件，不使用坐标绕过被遮挡的按钮。
@@ -3472,6 +3675,7 @@ final class NativeV2EntryTests: XCTestCase {
       "native-user-editor-save", "native-user-editor-cancel",
       "native-more-settings-btn",
       "native-subscriptions-community", "native-subscriptions-calendar",
+      "native-subscriptions-history",
     ].contains(element.identifier) {
       // iPad 原生 sheet 的工具栏 AX 框可能仍用局部坐标；这是导航动作，不属于滚动内容。
       return app.windows.firstMatch.frame.contains(
@@ -3513,6 +3717,7 @@ final class NativeV2EntryTests: XCTestCase {
 
   /// 已认证账号标签必须属于本次服务（「我的」顶部身份卡），同时检查运行中的可访问性树没有 WebView。
   private func assertAccount(_ name: String, app: XCUIApplication) {
+    dismissSystemPasswordSavePrompt(app)
     let mineTab = tabButton("我的", app: app)
     if !app.descendants(matching: .any)["native-v2-account"].firstMatch.exists,
       mineTab.exists
@@ -3784,16 +3989,19 @@ final class NativeV2EntryTests: XCTestCase {
     try await Task.sleep(nanoseconds: 600_000_000)
     capture("vue-runtime-02-dark-fusion")
 
-    // 4. 校验原生标题栏按钮桥接（hostSdk.shell.registerButton -> 原生导航栏 Menu -> host.action 回传）
-    let headerMenu = app.buttons["native-sheet-menu"]
-    XCTAssertTrue(headerMenu.waitForExistence(timeout: 8), "原生标题栏插件操作菜单未展示")
-    headerMenu.tap()
-    let refreshAction = app.buttons["刷新状态"]
-    XCTAssertTrue(refreshAction.waitForExistence(timeout: 6), "标题栏菜单中未找到插件注册的「刷新状态」按钮")
+    // 4. 校验联邦插件不重复渲染 App 顶栏退出按钮，并支持插件自身顶部操作按钮
+    XCTAssertFalse(
+      app.buttons["native-vue-plugin-sheet-close"].exists,
+      "模块联邦插件自带退出按钮，App 不应重复渲染顶部关闭按钮"
+    )
+    let refreshAction = webView.buttons.matching(
+      NSPredicate(format: "label CONTAINS[c] %@", "刷新状态")
+    ).firstMatch
+    XCTAssertTrue(refreshAction.waitForExistence(timeout: 8), "联邦插件未展示内置「刷新状态」按钮")
     refreshAction.tap()
     XCTAssertTrue(
       webView.staticTexts["刷新次数 1"].waitForExistence(timeout: 8),
-      "点击原生标题栏动作后未触发插件回调更新刷新次数"
+      "点击插件刷新动作后未更新刷新次数"
     )
 
     // 5. 校验原生 Toast 桥接（Vuetify VBtn 默认 uppercase，使用大小写不敏感匹配）
@@ -3833,9 +4041,11 @@ final class NativeV2EntryTests: XCTestCase {
     XCTAssertTrue(capsPass.waitForExistence(timeout: 12), "原生音频与硬件能力自检未通过")
     capture("vue-runtime-04b-native-capabilities")
 
-    // 6. 关闭弹窗 -> 切换浅色模式 -> 再次打开验证热池复用 + 磁盘缓存命中 + 浅色透明视觉融合
-    let closeBtn = app.buttons["native-vue-plugin-sheet-close"]
-    XCTAssertTrue(closeBtn.waitForExistence(timeout: 8))
+    // 6. 使用联邦插件自带退出按钮关闭弹窗 -> 切换浅色模式 -> 再次打开验证热池复用 + 磁盘缓存命中 + 浅色透明视觉融合
+    let closeBtn = webView.buttons.matching(
+      NSPredicate(format: "label CONTAINS[c] %@", "关闭插件")
+    ).firstMatch
+    XCTAssertTrue(closeBtn.waitForExistence(timeout: 8), "联邦插件自带退出按钮未展示")
     closeBtn.tap()
     try await Task.sleep(nanoseconds: 600_000_000)
     if app.navigationBars.buttons.firstMatch.exists {

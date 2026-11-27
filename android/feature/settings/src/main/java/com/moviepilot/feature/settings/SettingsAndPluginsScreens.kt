@@ -4,15 +4,18 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,8 +27,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -59,11 +64,13 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Contrast
 import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Extension
 import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.RestartAlt
 import androidx.compose.material.icons.rounded.Search
@@ -99,9 +106,12 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -126,6 +136,7 @@ import com.moviepilot.designsystem.NativeAdaptiveBadge
 import com.moviepilot.designsystem.NativeAdaptivePill
 import com.moviepilot.designsystem.NativeAppearanceMode
 import com.moviepilot.designsystem.NativeCardListSkeleton
+import com.moviepilot.designsystem.NativeGlassSheet
 import com.moviepilot.designsystem.NativeNetworkEntityLogo
 import com.moviepilot.designsystem.NativeSegmentedControl
 import com.moviepilot.designsystem.NativeSkeletonBlock
@@ -223,13 +234,14 @@ fun SettingsHubScreen(
     val listState = rememberLazyListState()
     val isAdmin = permissions?.admin != false
 
-    var stats by remember { mutableStateOf(DashboardStatsDto()) }
-    var activeSitesCount by remember { mutableIntStateOf(0) }
-    var usersCount by remember { mutableIntStateOf(1) }
-    var mediaServersCount by remember { mutableIntStateOf(0) }
-    var notificationsCount by remember { mutableIntStateOf(0) }
-    var authorizedCount by remember { mutableIntStateOf(0) }
-    var isLoading by remember { mutableStateOf(true) }
+    val initialSummary = remember { repository.cachedSettingsSummary }
+    var stats by remember { mutableStateOf(initialSummary?.stats ?: repository.cachedDashboard?.stats ?: DashboardStatsDto()) }
+    var activeSitesCount by remember { mutableIntStateOf(initialSummary?.activeSitesCount ?: 0) }
+    var usersCount by remember { mutableIntStateOf(initialSummary?.usersCount ?: 1) }
+    var mediaServersCount by remember { mutableIntStateOf(initialSummary?.mediaServersCount ?: 0) }
+    var notificationsCount by remember { mutableIntStateOf(initialSummary?.notificationsCount ?: 0) }
+    var authorizedCount by remember { mutableIntStateOf(initialSummary?.authorizedCount ?: 0) }
+    var isLoading by remember { mutableStateOf(initialSummary == null) }
     var isRefreshing by remember { mutableStateOf(false) }
 
     suspend fun loadAll() {
@@ -240,7 +252,7 @@ fun SettingsHubScreen(
                 val usersDef = async { repository.fetchUsers().size.coerceAtLeast(1) }
                 val serversDef = async { repository.fetchMediaServers().count { it.enabled } }
                 val notifDef = async { repository.fetchNotificationChannels().count { it.enabled } }
-                val authDef = async { repository.fetchChannelAuthorizations().size }
+                val authDef = async { runCatching { repository.fetchChannelAuthorizations().size }.getOrDefault(0) }
                 stats = statsDef.await()
                 activeSitesCount = sitesDef.await()
                 usersCount = usersDef.await()
@@ -251,11 +263,23 @@ fun SettingsHubScreen(
                 stats = statsDef.await()
             }
         }
+        repository.cachedSettingsSummary = com.moviepilot.rustbridge.SettingsSummarySnapshot(
+            stats = stats,
+            activeSitesCount = activeSitesCount,
+            usersCount = usersCount,
+            mediaServersCount = mediaServersCount,
+            notificationsCount = notificationsCount,
+            authorizedCount = authorizedCount,
+        )
         isLoading = false
         isRefreshing = false
     }
 
-    LaunchedEffect(isAdmin) { loadAll() }
+    LaunchedEffect(isAdmin) {
+        if (repository.cachedSettingsSummary == null) {
+            loadAll()
+        }
+    }
 
     val showInlineShimmer = isLoading && !isRefreshing
     val usedRatio = if (stats.totalBytes > 0) (stats.usedBytes / stats.totalBytes).toFloat().coerceIn(0.02f, 1f) else 0f
@@ -1048,62 +1072,174 @@ fun AppearanceSettingsScreen(onBack: () -> Unit) {
 }
 
 /**
+ * 判定插件是否声明使用模块联邦（`render_mode == "vue"`）组件自渲染：
+ * 联邦组件插件自带标题栏与关闭（`@close`）退出按钮；传统 MoviePilot JSON（`vuetify`）插件由宿主负责顶栏与返回按钮。
+ */
+fun isDetectedFederationVuePlugin(
+    pluginRenderMode: String,
+    pageJson: String? = null,
+    formJson: String? = null,
+): Boolean {
+    fun declaresVue(raw: String?): Boolean {
+        if (raw.isNullOrBlank()) return false
+        val compact = raw.filterNot { it.isWhitespace() }
+        return compact.contains("\"render_mode\":\"vue\"", ignoreCase = true)
+    }
+    return pluginRenderMode.equals("vue", ignoreCase = true) ||
+        declaresVue(pageJson) ||
+        declaresVue(formJson)
+}
+
+/**
+ * 判定当前插件详情页是否应隐藏 App 自身的顶栏与返回退出按钮：
+ * - 已安装的模块联邦插件（`detectedVuePlugin == true`）且未回退旧版网页壳时隐藏 App 顶栏，交由插件自身退出按钮与系统侧滑返回处理，为上方腾出显示空间；
+ * - 未安装插件、传统 `vuetify` 自渲染插件（含手动切换兼容网页模式）及回退旧版 `moviepilot.chrome` v1 壳时，均由 App 显示顶栏与返回退出按钮。
+ */
+fun shouldHideAppPluginTopBar(
+    isInstalled: Boolean,
+    detectedVuePlugin: Boolean,
+    usingLegacyFallback: Boolean = false,
+): Boolean = isInstalled && detectedVuePlugin && !usingLegacyFallback
+
+/**
  * Android 原生插件中心：
  * 支持 HorizontalPager 左右手势在「已安装 / 插件市场」之间丝滑切换、关键词搜索、下拉刷新，
  * 市场一键安装与在线更新（`GET /api/v1/plugin/install/{id}`），
  * 图标回退统一使用官方 `logo_plugin`，点击任意插件进入 `PluginDetailScreen`。
  */
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun PluginsCenterScreen(
     repository: MoviePilotRepository,
     initialInstalledOnly: Boolean = true,
     onBack: () -> Unit,
-    onOpenPluginDetail: (PluginItemDto) -> Unit,
+    onOpenPluginDetail: (PluginItemDto, Boolean) -> Unit,
 ) {
     val colors = LocalMoviePilotColors.current
+    val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
     val margin = AdaptiveDeviceLayout.horizontalMargin()
     val bottomOverlayInset = LocalBottomOverlayInset.current
     val scope = rememberCoroutineScope()
     val snackbar = LocalSnackbarHostState.current
     val pagerState = rememberPagerState(initialPage = if (initialInstalledOnly) 0 else 1, pageCount = { 2 })
 
-    var installedPlugins by remember { mutableStateOf<List<PluginItemDto>>(emptyList()) }
-    var marketPlugins by remember { mutableStateOf<List<PluginItemDto>>(emptyList()) }
-    var isLoadingInstalled by remember { mutableStateOf(true) }
-    var isLoadingMarket by remember { mutableStateOf(true) }
+    val initialInstalledCache = remember { repository.cachedInstalledPlugins }
+    val initialMarketCache = remember { repository.cachedMarketPlugins }
+    var installedPlugins by remember { mutableStateOf(initialInstalledCache.orEmpty()) }
+    var marketPlugins by remember { mutableStateOf(initialMarketCache.orEmpty()) }
+    var isLoadingInstalled by remember { mutableStateOf(initialInstalledCache == null) }
+    var isLoadingMarket by remember { mutableStateOf(initialMarketCache == null) }
     var isRefreshing by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
+    var sortMode by remember { mutableStateOf("default") } // default, latest, installs, rating, name
+    var showSortMenu by remember { mutableStateOf(false) }
     val installingIds = remember { mutableStateMapOf<String, Boolean>() }
+    var actionSheetPlugin by remember { mutableStateOf<PluginItemDto?>(null) }
+    var marketInstallSheetPlugin by remember { mutableStateOf<PluginItemDto?>(null) }
+    var logSheetPlugin by remember { mutableStateOf<PluginItemDto?>(null) }
+    var pendingResetPlugin by remember { mutableStateOf<PluginItemDto?>(null) }
+    var pendingUninstallPlugin by remember { mutableStateOf<PluginItemDto?>(null) }
 
-    suspend fun loadTab(installedOnly: Boolean) {
+    fun mergeMarketUpdates(installed: List<PluginItemDto>, market: List<PluginItemDto>): List<PluginItemDto> {
+        if (installed.isEmpty() || market.isEmpty()) return installed
+        val updatableById = market.filter { it.hasUpdate }.associateBy { it.id.lowercase() }
+        if (updatableById.isEmpty()) return installed
+        return installed.map { item ->
+            val match = updatableById[item.id.lowercase()]
+            if (match != null) {
+                item.copy(
+                    hasUpdate = true,
+                    repoUrl = item.repoUrl.ifBlank { match.repoUrl },
+                )
+            } else {
+                item
+            }
+        }
+    }
+
+    suspend fun loadTab(installedOnly: Boolean, forceRefresh: Boolean = true) {
         if (installedOnly) {
-            installedPlugins = repository.fetchPlugins(true)
+            val loadedInstalled = repository.fetchPlugins(installedOnly = true, forceRefresh = forceRefresh)
+            installedPlugins = mergeMarketUpdates(loadedInstalled, marketPlugins)
+            repository.cachedInstalledPlugins = installedPlugins
             isLoadingInstalled = false
         } else {
-            marketPlugins = repository.fetchPlugins(false)
+            val loadedMarket = repository.fetchPlugins(installedOnly = false, forceRefresh = forceRefresh)
+            marketPlugins = loadedMarket
+            installedPlugins = mergeMarketUpdates(installedPlugins, loadedMarket)
+            repository.cachedInstalledPlugins = installedPlugins
             isLoadingMarket = false
         }
         isRefreshing = false
     }
 
-    suspend fun reloadBoth() {
-        coroutineScope {
-            launch { loadTab(true) }
-            launch { loadTab(false) }
+    suspend fun reloadBoth(forceRefresh: Boolean = false) {
+        val (loadedInstalled, loadedMarket) = coroutineScope {
+            val instDef = async { repository.fetchPlugins(installedOnly = true, forceRefresh = forceRefresh) }
+            val mktDef = async { repository.fetchPlugins(installedOnly = false, forceRefresh = forceRefresh) }
+            instDef.await() to mktDef.await()
         }
+        marketPlugins = loadedMarket
+        installedPlugins = mergeMarketUpdates(loadedInstalled, loadedMarket)
+        repository.cachedInstalledPlugins = installedPlugins
+        isLoadingInstalled = false
+        isLoadingMarket = false
+        isRefreshing = false
     }
 
     LaunchedEffect(Unit) {
-        reloadBoth()
+        if (initialInstalledCache == null || initialMarketCache == null) {
+            reloadBoth(forceRefresh = false)
+        } else {
+            installedPlugins = mergeMarketUpdates(initialInstalledCache, initialMarketCache)
+        }
     }
 
     val installedTabTitle = if (isLoadingInstalled && installedPlugins.isEmpty()) "已安装" else "已安装 (${installedPlugins.size})"
     val marketTabTitle = if (isLoadingMarket && marketPlugins.isEmpty()) "插件市场" else "插件市场 (${marketPlugins.size})"
 
+    val sortOptions = remember {
+        listOf(
+            "default" to "默认顺序",
+            "latest" to "最新发布",
+            "installs" to "安装量最高",
+            "rating" to "评分最高",
+            "name" to "名称排序",
+        )
+    }
+
     ExpressiveTintedScaffold(
         title = "插件中心",
         onBack = onBack,
+        actions = {
+            Box {
+                ExpressiveHeaderActionButton(
+                    icon = Icons.Rounded.Tune,
+                    contentDescription = "插件排序",
+                    onClick = { showSortMenu = true },
+                )
+                DropdownMenu(
+                    expanded = showSortMenu,
+                    onDismissRequest = { showSortMenu = false },
+                ) {
+                    sortOptions.forEach { (key, label) ->
+                        DropdownMenuItem(
+                            text = { Text(label, fontWeight = if (sortMode == key) FontWeight.Bold else FontWeight.Normal) },
+                            trailingIcon = if (sortMode == key) {
+                                { Icon(Icons.Rounded.Check, contentDescription = null, tint = colors.accent) }
+                            } else {
+                                null
+                            },
+                            onClick = {
+                                sortMode = key
+                                showSortMenu = false
+                            },
+                        )
+                    }
+                }
+            }
+        },
         headerExtra = {
             ExpressivePillTabRow(
                 tabs = listOf(installedTabTitle, marketTabTitle),
@@ -1142,13 +1278,27 @@ fun PluginsCenterScreen(
 
             HorizontalPager(state = pagerState, modifier = Modifier.weight(1f)) { pageIdx ->
                 val raw = if (pageIdx == 0) installedPlugins else marketPlugins
-                val filtered = remember(raw, searchQuery) {
+                val filtered = remember(raw, searchQuery, sortMode) {
                     val q = searchQuery.trim().lowercase()
-                    if (q.isEmpty()) raw else raw.filter { p ->
+                    val searched = if (q.isEmpty()) raw else raw.filter { p ->
                         p.name.lowercase().contains(q) ||
                             p.desc.lowercase().contains(q) ||
                             p.author.lowercase().contains(q) ||
                             p.labels.any { it.lowercase().contains(q) }
+                    }
+                    when (sortMode) {
+                        "latest" -> searched.sortedWith { a, b ->
+                            when {
+                                a.addTime > 0 && b.addTime > 0 && a.addTime != b.addTime -> a.addTime.compareTo(b.addTime)
+                                a.addTime > 0 && b.addTime <= 0 -> -1
+                                a.addTime <= 0 && b.addTime > 0 -> 1
+                                else -> a.name.compareTo(b.name, ignoreCase = true)
+                            }
+                        }
+                        "installs" -> searched.sortedByDescending { it.installCount }
+                        "rating" -> searched.sortedByDescending { it.averageRating }
+                        "name" -> searched.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.name })
+                        else -> searched
                     }
                 }
                 PullToRefreshBox(
@@ -1204,7 +1354,25 @@ fun PluginsCenterScreen(
                             val isInstalling = installingIds[plugin.id] == true
                             CinematicPanel(
                                 padding = 16.dp,
-                                modifier = Modifier.clickable { onOpenPluginDetail(plugin) },
+                                modifier = Modifier.combinedClickable(
+                                    onClick = {
+                                        if (pageIdx == 1) {
+                                            val installedMatch = installedPlugins.find { it.id.equals(plugin.id, ignoreCase = true) }
+                                            marketInstallSheetPlugin = plugin.copy(
+                                                installed = plugin.installed || installedMatch != null,
+                                                hasUpdate = plugin.hasUpdate || installedMatch?.hasUpdate == true,
+                                            )
+                                        } else {
+                                            onOpenPluginDetail(plugin, false)
+                                        }
+                                    },
+                                    onLongClick = {
+                                        if (plugin.installed) {
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            actionSheetPlugin = plugin
+                                        }
+                                    },
+                                ),
                             ) {
                                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                                     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1249,30 +1417,61 @@ fun PluginsCenterScreen(
                                                     tint = if (plugin.state) colors.success else colors.textMuted,
                                                 )
                                             } else {
-                                                NativeAdaptivePill(
-                                                    title = when {
-                                                        isInstalling -> "处理中…"
-                                                        plugin.hasUpdate -> "更新"
-                                                        else -> "安装"
-                                                    },
-                                                    selected = true,
-                                                    icon = if (plugin.hasUpdate) Icons.Rounded.Refresh else Icons.Rounded.Download,
+                                                val ctaBg = if (plugin.hasUpdate) colors.warning else colors.accent
+                                                Button(
+                                                    enabled = !isInstalling,
                                                     onClick = {
-                                                        if (!isInstalling) {
-                                                            scope.launch {
-                                                                installingIds[plugin.id] = true
-                                                                val (ok, msg) = repository.installPlugin(
-                                                                    pluginId = plugin.id,
-                                                                    repoUrl = plugin.repoUrl,
-                                                                    force = plugin.hasUpdate,
-                                                                )
-                                                                if (ok) reloadBoth()
-                                                                installingIds.remove(plugin.id)
-                                                                snackbar?.showSnackbar(msg)
-                                                            }
+                                                        scope.launch {
+                                                            installingIds[plugin.id] = true
+                                                            val (ok, msg) = repository.installPlugin(
+                                                                pluginId = plugin.id,
+                                                                repoUrl = plugin.repoUrl,
+                                                                force = plugin.hasUpdate || plugin.installed,
+                                                            )
+                                                            if (ok) reloadBoth()
+                                                            installingIds.remove(plugin.id)
+                                                            snackbar?.showSnackbar(msg)
                                                         }
                                                     },
-                                                )
+                                                    colors = ButtonDefaults.buttonColors(
+                                                        containerColor = ctaBg,
+                                                        contentColor = Color.White,
+                                                        disabledContainerColor = ctaBg.copy(alpha = 0.55f),
+                                                        disabledContentColor = Color.White.copy(alpha = 0.85f),
+                                                    ),
+                                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                                                    shape = CircleShape,
+                                                    modifier = Modifier.height(32.dp),
+                                                ) {
+                                                    Icon(
+                                                        if (plugin.hasUpdate) Icons.Rounded.Refresh else Icons.Rounded.Download,
+                                                        contentDescription = null,
+                                                        modifier = Modifier.size(15.dp),
+                                                    )
+                                                    Spacer(Modifier.width(4.dp))
+                                                    Text(
+                                                        when {
+                                                            isInstalling -> "处理中…"
+                                                            plugin.hasUpdate -> "更新"
+                                                            else -> "安装"
+                                                        },
+                                                        fontSize = 12.5.sp,
+                                                        fontWeight = FontWeight.Bold,
+                                                    )
+                                                }
+                                            }
+                                            if (plugin.installed) {
+                                                IconButton(
+                                                    onClick = { actionSheetPlugin = plugin },
+                                                    modifier = Modifier.size(38.dp),
+                                                ) {
+                                                    Icon(
+                                                        Icons.Rounded.MoreVert,
+                                                        contentDescription = "插件更多操作",
+                                                        tint = colors.textSecondary,
+                                                        modifier = Modifier.size(20.dp),
+                                                    )
+                                                }
                                             }
                                         }
                                         }
@@ -1284,6 +1483,336 @@ fun PluginsCenterScreen(
                 }
             }
         }
+    }
+
+    // 对齐 iOS 插件卡片上下文菜单的原生 Material 3 底部操作面板（支持点击 `⋮` 或长按卡片呼出）
+    actionSheetPlugin?.let { plugin ->
+        val isInstalling = installingIds[plugin.id] == true
+        val validHomeUrl = plugin.repoUrl.trim().takeIf { it.startsWith("http://") || it.startsWith("https://") }
+        NativeGlassSheet(onDismissRequest = { actionSheetPlugin = null }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    NativeNetworkEntityLogo(
+                        imageUrl = plugin.icon,
+                        kind = "plugin",
+                        value = plugin.name,
+                        size = 44.dp,
+                        cornerRadius = 12.dp,
+                    )
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(plugin.name, color = colors.textPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            "v${plugin.version} · ${plugin.author.ifBlank { "MoviePilot" }}",
+                            color = colors.textSecondary,
+                            fontSize = 12.5.sp,
+                            maxLines = 1,
+                        )
+                    }
+                    NativeAdaptiveBadge(
+                        if (plugin.state) "已启用" else "未启用",
+                        tint = if (plugin.state) colors.success else colors.textMuted,
+                    )
+                }
+
+                CinematicPanel(padding = 4.dp, showsShadow = false) {
+                    Column {
+                        if (plugin.hasPage) {
+                            PluginSheetActionRow(
+                                icon = Icons.Rounded.Extension,
+                                title = "打开数据页",
+                                tint = colors.accent,
+                                onClick = {
+                                    actionSheetPlugin = null
+                                    onOpenPluginDetail(plugin, false)
+                                },
+                            )
+                            HorizontalDivider(color = colors.divider)
+                        }
+                        PluginSheetActionRow(
+                            icon = Icons.Rounded.Tune,
+                            title = "参数配置",
+                            onClick = {
+                                actionSheetPlugin = null
+                                onOpenPluginDetail(plugin, true)
+                            },
+                        )
+                        HorizontalDivider(color = colors.divider)
+                        PluginSheetActionRow(
+                            icon = Icons.Rounded.Description,
+                            title = "查看插件日志",
+                            onClick = {
+                                actionSheetPlugin = null
+                                logSheetPlugin = plugin
+                            },
+                        )
+                        HorizontalDivider(color = colors.divider)
+                        PluginSheetActionRow(
+                            icon = Icons.Rounded.Refresh,
+                            title = "重新加载插件",
+                            onClick = {
+                                actionSheetPlugin = null
+                                scope.launch {
+                                    installingIds[plugin.id] = true
+                                    val (ok, msg) = repository.reloadPlugin(plugin.id)
+                                    if (ok) reloadBoth()
+                                    installingIds.remove(plugin.id)
+                                    snackbar?.showSnackbar(msg)
+                                }
+                            },
+                        )
+                        if (plugin.hasUpdate) {
+                            HorizontalDivider(color = colors.divider)
+                            PluginSheetActionRow(
+                                icon = Icons.Rounded.Download,
+                                title = "更新插件版本",
+                                tint = colors.warning,
+                                onClick = {
+                                    actionSheetPlugin = null
+                                    if (!isInstalling) {
+                                        scope.launch {
+                                            installingIds[plugin.id] = true
+                                            val (ok, msg) = repository.installPlugin(
+                                                pluginId = plugin.id,
+                                                repoUrl = plugin.repoUrl,
+                                                force = true,
+                                            )
+                                            if (ok) reloadBoth()
+                                            installingIds.remove(plugin.id)
+                                            snackbar?.showSnackbar(msg)
+                                        }
+                                    }
+                                },
+                            )
+                        }
+                        if (validHomeUrl != null) {
+                            HorizontalDivider(color = colors.divider)
+                            PluginSheetActionRow(
+                                icon = Icons.Rounded.OpenInNew,
+                                title = "项目主页",
+                                onClick = {
+                                    actionSheetPlugin = null
+                                    runCatching {
+                                        context.startActivity(
+                                            Intent(Intent.ACTION_VIEW, Uri.parse(validHomeUrl)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                        )
+                                    }
+                                },
+                            )
+                        }
+                        HorizontalDivider(color = colors.divider)
+                        PluginSheetActionRow(
+                            icon = Icons.Rounded.RestartAlt,
+                            title = "重置插件数据",
+                            tint = colors.warning,
+                            onClick = {
+                                actionSheetPlugin = null
+                                pendingResetPlugin = plugin
+                            },
+                        )
+                        HorizontalDivider(color = colors.divider)
+                        PluginSheetActionRow(
+                            icon = Icons.Rounded.Delete,
+                            title = "卸载此插件",
+                            tint = colors.danger,
+                            isDanger = true,
+                            onClick = {
+                                actionSheetPlugin = null
+                                pendingUninstallPlugin = plugin
+                            },
+                        )
+                    }
+                }
+                Spacer(Modifier.height(14.dp))
+            }
+        }
+    }
+
+    marketInstallSheetPlugin?.let { target ->
+        val isInstalling = installingIds[target.id] == true
+        val validHomeUrl = target.repoUrl.trim().takeIf { it.startsWith("http://") || it.startsWith("https://") }
+        val ctaBg = if (target.hasUpdate) colors.warning else colors.accent
+        NativeGlassSheet(onDismissRequest = { marketInstallSheetPlugin = null }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    NativeNetworkEntityLogo(
+                        imageUrl = target.icon,
+                        kind = "plugin",
+                        value = target.name,
+                        size = 52.dp,
+                        cornerRadius = 14.dp,
+                    )
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(target.name, color = colors.textPrimary, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            "v${target.version} · 作者 ${target.author.ifBlank { "MoviePilot" }}",
+                            color = colors.textSecondary,
+                            fontSize = 12.5.sp,
+                        )
+                    }
+                }
+                if (target.desc.isNotBlank()) {
+                    Text(target.desc, color = colors.textSecondary, fontSize = 13.5.sp)
+                }
+                if (target.labels.isNotEmpty()) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        target.labels.forEach { lbl -> NativeAdaptiveBadge(lbl) }
+                    }
+                }
+                Button(
+                    enabled = !isInstalling,
+                    onClick = {
+                        scope.launch {
+                            installingIds[target.id] = true
+                            val (ok, msg) = repository.installPlugin(
+                                pluginId = target.id,
+                                repoUrl = target.repoUrl,
+                                force = true,
+                            )
+                            if (ok) reloadBoth()
+                            installingIds.remove(target.id)
+                            marketInstallSheetPlugin = null
+                            snackbar?.showSnackbar(msg)
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = ctaBg,
+                        contentColor = Color.White,
+                        disabledContainerColor = ctaBg.copy(alpha = 0.55f),
+                        disabledContentColor = Color.White.copy(alpha = 0.85f),
+                    ),
+                    shape = CircleShape,
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                ) {
+                    if (isInstalling) {
+                        CircularProgressIndicator(
+                            color = Color.White,
+                            strokeWidth = 2.dp,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                    } else {
+                        Icon(
+                            if (target.installed) Icons.Rounded.Refresh else Icons.Rounded.Download,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(6.dp))
+                    }
+                    Text(
+                        when {
+                            isInstalling -> "正在处理…"
+                            target.hasUpdate -> "更新插件"
+                            target.installed -> "重新安装"
+                            else -> "安装插件"
+                        },
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp,
+                    )
+                }
+                if (target.installed) {
+                    TextButton(
+                        onClick = {
+                            val current = installedPlugins.find { it.id.equals(target.id, ignoreCase = true) } ?: target
+                            marketInstallSheetPlugin = null
+                            onOpenPluginDetail(current, false)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(if (target.hasPage) "打开插件数据页 / 配置" else "打开插件配置", color = colors.accent, fontWeight = FontWeight.SemiBold)
+                    }
+                } else if (validHomeUrl != null) {
+                    TextButton(
+                        onClick = {
+                            marketInstallSheetPlugin = null
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW, Uri.parse(validHomeUrl)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                )
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("查看项目主页", color = colors.textSecondary)
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+            }
+        }
+    }
+
+    logSheetPlugin?.let { target ->
+        PluginLogsSheet(
+            plugin = target,
+            repository = repository,
+            onDismiss = { logSheetPlugin = null },
+        )
+    }
+
+    pendingResetPlugin?.let { target ->
+        AlertDialog(
+            onDismissRequest = { pendingResetPlugin = null },
+            title = { Text("确认重置插件数据？") },
+            text = { Text("确定要重置「${target.name}」的配置与缓存数据吗？此操作不可撤销。") },
+            dismissButton = {
+                TextButton(onClick = { pendingResetPlugin = null }) { Text("取消") }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingResetPlugin = null
+                        scope.launch {
+                            val (_, msg) = repository.resetPlugin(target.id)
+                            snackbar?.showSnackbar(msg)
+                        }
+                    },
+                ) {
+                    Text("确认重置", color = colors.warning)
+                }
+            },
+        )
+    }
+
+    pendingUninstallPlugin?.let { target ->
+        AlertDialog(
+            onDismissRequest = { pendingUninstallPlugin = null },
+            title = { Text("确认卸载插件？") },
+            text = { Text("卸载后将从 MoviePilot 实例移除「${target.name}」。") },
+            dismissButton = {
+                TextButton(onClick = { pendingUninstallPlugin = null }) { Text("取消") }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingUninstallPlugin = null
+                        scope.launch {
+                            val (ok, msg) = repository.uninstallPlugin(target.id)
+                            if (ok) reloadBoth()
+                            snackbar?.showSnackbar(msg)
+                        }
+                    },
+                ) {
+                    Text("卸载", color = colors.danger)
+                }
+            },
+        )
     }
 }
 
@@ -1298,6 +1827,7 @@ fun PluginsCenterScreen(
 fun PluginDetailScreen(
     plugin: PluginItemDto,
     repository: MoviePilotRepository,
+    openConfigFirst: Boolean = false,
     onBack: () -> Unit,
 ) {
     val colors = LocalMoviePilotColors.current
@@ -1324,17 +1854,20 @@ fun PluginDetailScreen(
 
     val hasDataPage = plugin.hasPage
     val pageCount = if (hasDataPage) 2 else 1
-    val pagerState = rememberPagerState(initialPage = 0, pageCount = { pageCount })
+    val initialTab = if (hasDataPage && openConfigFirst) 1 else 0
+    val pagerState = rememberPagerState(initialPage = initialTab, pageCount = { pageCount })
 
     var pageJson by remember(plugin.id) { mutableStateOf<String?>(null) }
     var formJson by remember(plugin.id) { mutableStateOf<String?>(null) }
     var isLoading by remember(plugin.id) { mutableStateOf(plugin.installed) }
     var forceVueWebMode by remember(plugin.id) { mutableStateOf(false) }
+    var usingLegacyVueFallback by remember(plugin.id) { mutableStateOf(false) }
     var showOverflowMenu by remember { mutableStateOf(false) }
     var hasUnsavedChanges by remember { mutableStateOf(false) }
     var showDiscardDialog by remember { mutableStateOf(false) }
     var showResetConfirm by remember { mutableStateOf(false) }
     var showUninstallConfirm by remember { mutableStateOf(false) }
+    var showPluginLogSheet by remember { mutableStateOf(false) }
     val vueChrome = remember(plugin.id) { VuePluginChromeController(plugin.name) }
 
     suspend fun loadPluginResources() {
@@ -1359,16 +1892,14 @@ fun PluginDetailScreen(
     }
 
     val detectedVuePlugin = remember(plugin.renderMode, pageJson, formJson) {
-        fun declaresVue(raw: String?): Boolean {
-            if (raw.isNullOrBlank()) return false
-            val compact = raw.replace(" ", "")
-            return compact.contains("\"render_mode\":\"vue\"", ignoreCase = true)
-        }
-        plugin.renderMode.equals("vue", ignoreCase = true) ||
-            declaresVue(pageJson) ||
-            declaresVue(formJson)
+        isDetectedFederationVuePlugin(plugin.renderMode, pageJson, formJson)
     }
     val openInVueWebView = isInstalled && (forceVueWebMode || detectedVuePlugin)
+    val hideAppTopBar = shouldHideAppPluginTopBar(
+        isInstalled = isInstalled,
+        detectedVuePlugin = detectedVuePlugin,
+        usingLegacyFallback = usingLegacyVueFallback,
+    )
 
     val attemptLeave: () -> Unit = {
         when {
@@ -1378,7 +1909,7 @@ fun PluginDetailScreen(
         }
     }
 
-    BackHandler(enabled = hasUnsavedChanges || openInVueWebView) {
+    BackHandler(enabled = hasUnsavedChanges || openInVueWebView || hideAppTopBar) {
         attemptLeave()
     }
 
@@ -1389,7 +1920,28 @@ fun PluginDetailScreen(
         plugin.name
     }
 
-    ExpressiveTintedScaffold(
+    if (hideAppTopBar) {
+        // 模块联邦插件自带顶部栏与关闭退出按钮：隐藏 App 顶栏与返回按钮，释放上方空间交由插件全屏展示
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(colors.sheetSurface)
+                .statusBarsPadding()
+                .navigationBarsPadding(),
+        ) {
+            IsolatedVuePluginWebView(
+                pluginId = plugin.id,
+                session = vueSession,
+                surface = if (currentIsConfigTab) VuePluginSurface.Config else VuePluginSurface.DataPage,
+                chromeController = vueChrome,
+                pluginHasPage = hasDataPage,
+                onLegacyFallbackChanged = { usingLegacyVueFallback = it },
+                onRequestExit = onBack,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+    } else {
+        ExpressiveTintedScaffold(
         title = resolvedTopTitle,
         onBack = attemptLeave,
         actions = {
@@ -1460,6 +2012,28 @@ fun PluginDetailScreen(
                                 },
                             )
                         }
+                        DropdownMenuItem(
+                            text = { Text("查看插件日志") },
+                            leadingIcon = { Icon(Icons.Rounded.Description, contentDescription = null) },
+                            onClick = {
+                                showOverflowMenu = false
+                                showPluginLogSheet = true
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("重新加载插件") },
+                            leadingIcon = { Icon(Icons.Rounded.Refresh, contentDescription = null) },
+                            onClick = {
+                                showOverflowMenu = false
+                                scope.launch {
+                                    isInstallingOrMutating = true
+                                    val (ok, msg) = repository.reloadPlugin(plugin.id)
+                                    isInstallingOrMutating = false
+                                    if (ok) loadPluginResources()
+                                    snackbar?.showSnackbar(msg)
+                                }
+                            },
+                        )
                         DropdownMenuItem(
                             text = { Text("刷新插件数据") },
                             leadingIcon = { Icon(Icons.Rounded.Refresh, contentDescription = null) },
@@ -1552,7 +2126,9 @@ fun PluginDetailScreen(
                                 },
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = colors.accent,
-                                    contentColor = colors.primaryButtonFg,
+                                    contentColor = Color.White,
+                                    disabledContainerColor = colors.accent.copy(alpha = 0.55f),
+                                    disabledContentColor = Color.White.copy(alpha = 0.85f),
                                 ),
                                 shape = CircleShape,
                                 modifier = Modifier.fillMaxWidth().height(48.dp),
@@ -1584,6 +2160,8 @@ fun PluginDetailScreen(
                     surface = if (currentIsConfigTab) VuePluginSurface.Config else VuePluginSurface.DataPage,
                     chromeController = vueChrome,
                     pluginHasPage = hasDataPage,
+                    onLegacyFallbackChanged = { usingLegacyVueFallback = it },
+                    onRequestExit = onBack,
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth(),
@@ -1686,6 +2264,15 @@ fun PluginDetailScreen(
                 }
             }
         }
+    }
+    }
+
+    if (showPluginLogSheet) {
+        PluginLogsSheet(
+            plugin = plugin,
+            repository = repository,
+            onDismiss = { showPluginLogSheet = false },
+        )
     }
 
     if (showResetConfirm) {
@@ -1797,6 +2384,121 @@ fun PluginDetailScreen(
                 }
             },
         )
+    }
+}
+
+@Composable
+private fun PluginSheetActionRow(
+    icon: ImageVector,
+    title: String,
+    tint: Color? = null,
+    isDanger: Boolean = false,
+    onClick: () -> Unit,
+) {
+    val colors = LocalMoviePilotColors.current
+    val resolvedTint = tint ?: colors.textPrimary
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 13.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Icon(icon, contentDescription = null, tint = resolvedTint, modifier = Modifier.size(20.dp))
+        Text(
+            text = title,
+            color = if (isDanger) colors.danger else colors.textPrimary,
+            fontSize = 15.sp,
+            fontWeight = if (isDanger) FontWeight.SemiBold else FontWeight.Medium,
+        )
+    }
+}
+
+/**
+ * 插件日志快照底部弹窗；与 iOS 一致，手动刷新最近 200 行而不等待持续 SSE 结束。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PluginLogsSheet(
+    plugin: PluginItemDto,
+    repository: MoviePilotRepository,
+    onDismiss: () -> Unit,
+) {
+    val colors = LocalMoviePilotColors.current
+    val scope = rememberCoroutineScope()
+    var lines by remember(plugin.id) { mutableStateOf<List<String>>(emptyList()) }
+    var loading by remember(plugin.id) { mutableStateOf(true) }
+
+    /** 请求完成、失败或取消时均释放加载状态。 */
+    suspend fun reloadLogs() {
+        loading = true
+        try {
+            lines = repository.fetchPluginLogs(plugin.id, length = 200)
+        } finally {
+            loading = false
+        }
+    }
+
+    LaunchedEffect(plugin.id) { reloadLogs() }
+
+    NativeGlassSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("${plugin.name} · 运行日志", color = colors.textPrimary, fontSize = 17.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text("plugins/${plugin.id.lowercase()}.log", color = colors.textMuted, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace)
+                }
+                NativeAdaptivePill(
+                    title = if (loading) "刷新中" else "刷新",
+                    selected = false,
+                    icon = Icons.Rounded.Refresh,
+                    onClick = { if (!loading) scope.launch { reloadLogs() } },
+                )
+            }
+
+            if (loading && lines.isEmpty()) {
+                Box(modifier = Modifier.fillMaxWidth().height(180.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = colors.accent, strokeWidth = 2.5.dp, modifier = Modifier.size(26.dp))
+                }
+            } else if (lines.isEmpty()) {
+                CinematicPanel(padding = 20.dp, showsShadow = false) {
+                    Text("当前插件暂无输出日志记录。", color = colors.textSecondary, fontSize = 13.5.sp)
+                }
+            } else {
+                CinematicPanel(padding = 10.dp, showsShadow = false, modifier = Modifier.weight(1f, fill = false)) {
+                    LazyColumn(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        items(lines.size) { i ->
+                            val ln = lines[i]
+                            val upper = ln.uppercase()
+                            val lineColor = when {
+                                "ERROR" in upper || "CRITICAL" in upper -> colors.danger
+                                "WARN" in upper -> colors.warning
+                                "DEBUG" in upper -> colors.textMuted
+                                else -> colors.textPrimary
+                            }
+                            Text(
+                                text = ln,
+                                color = lineColor,
+                                fontSize = 11.5.sp,
+                                lineHeight = 16.sp,
+                                fontFamily = FontFamily.Monospace,
+                            )
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(14.dp))
+        }
     }
 }
 

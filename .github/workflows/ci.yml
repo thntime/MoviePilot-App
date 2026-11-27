@@ -30,7 +30,8 @@ jobs:
   ios:
     needs: ssot-and-rust
     runs-on: macos-26
-    timeout-minutes: 25
+    # 冷构建、首次启动和六项交互回归分别占用时间，保留导出失败证据的余量。
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - name: Toolchain
@@ -54,7 +55,19 @@ jobs:
           -scheme MoviePilot
           -destination 'generic/platform=iOS Simulator'
           -derivedDataPath DerivedData
-          CODE_SIGNING_ALLOWED=NO
+          CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES
+      - name: Run API-only simulator smoke tests
+        timeout-minutes: 30
+        run: >-
+          python3 tools/ios/test-api-smoke.py
+          --derived-data DerivedData
+          --output-dir "${{ runner.temp }}/api-smoke-results"
+      - name: Upload API smoke failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-api-smoke-results
+          path: ${{ runner.temp }}/api-smoke-results
 
   android:
     needs: ssot-and-rust

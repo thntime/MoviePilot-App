@@ -344,6 +344,9 @@ data class PluginItemDto(
     @SerialName("has_update") val hasUpdate: Boolean = false,
     @SerialName("render_mode") val renderMode: String = "vuetify",
     @SerialName("repo_url") val repoUrl: String = "",
+    @SerialName("install_count") val installCount: Int = 0,
+    @SerialName("add_time") val addTime: Int = 0,
+    @SerialName("average_rating") val averageRating: Double = 0.0,
 )
 
 /** 消息中心通知条目。 */
@@ -551,6 +554,34 @@ data class MediaPersonDto(
     val placeOfBirth: String = "",
     val source: String = "themoviedb",
 )
+
+/** 后端媒体搜索来源目录项（对应 `GET /api/v1/media/source`）。 */
+@Serializable
+data class MediaSearchSourceDto(
+    val id: String = "",
+    val name: String = "",
+    val mediaTypes: List<String> = listOf("电影", "电视剧"),
+) {
+    val displayName: String
+        get() {
+            val trimmed = name.trim()
+            return if (trimmed.equals("tmdb", ignoreCase = true) || trimmed.equals("themoviedb", ignoreCase = true)) {
+                "TheMovieDB"
+            } else {
+                trimmed.ifBlank { id }
+            }
+        }
+
+    /** 判断该搜索源是否支持指定搜索域（对齐 iOS `NativeMediaSourceOption.supports`）。 */
+    fun supports(kind: String): Boolean {
+        val lowerId = id.lowercase()
+        if (kind == "collection") return lowerId == "themoviedb"
+        if (kind == "person") return lowerId in setOf("themoviedb", "douban", "musicbrainz")
+        val types = (mediaTypes.ifEmpty { listOf("电影", "电视剧") }).map { it.lowercase() }
+        if (kind == "music") return "音乐" in types || "music" in types
+        return types.any { it in setOf("电影", "电视剧", "movie", "tv") }
+    }
+}
 
 /** 电视剧分季信息。 */
 @Serializable
@@ -1305,6 +1336,14 @@ data class MediaServerItemDetailDto(
     val canPlay: Boolean = false,
 )
 
+/** 插件动态注册的推荐榜单数据源（对应 `GET /api/v1/recommend/source`）。 */
+@Serializable
+data class RecommendSourceDto(
+    val name: String = "",
+    @SerialName("api_path") val apiPath: String = "",
+    val type: String = "",
+)
+
 /** 发现页内存会话快照（用于切 Tab 与详情返回时零闪烁保留滚动位置与已加载内容）。 */
 data class DiscoverSessionSnapshot(
     val trending: List<MediaCardItem> = emptyList(),
@@ -1317,6 +1356,8 @@ data class DiscoverSessionSnapshot(
     val latestItems: List<MediaCardItem> = emptyList(),
     val libraries: List<MediaServerLibraryDto> = emptyList(),
     val heroLogos: Map<String, String> = emptyMap(),
+    val extraSources: List<RecommendSourceDto> = emptyList(),
+    val extraRails: Map<String, List<MediaCardItem>> = emptyMap(),
 )
 
 /** 探索页筛选维度内存快照。 */

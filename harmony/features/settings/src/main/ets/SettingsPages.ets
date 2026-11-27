@@ -62,6 +62,7 @@ import {
 import { CommunityMedal3DComponent } from '@moviepilot/medal_3d';
 import {
   HarmonyVueChromeController,
+  HarmonyPluginCapsuleManager,
   NativePluginDataPageView,
   NativePluginHostView,
   VueChromeAction
@@ -159,9 +160,22 @@ struct HarmonyPluginCardIcon {
   }
 }
 
+interface MpPluginMarketSortOption {
+  id: string;
+  label: string;
+}
+
+const PLUGIN_MARKET_SORT_OPTIONS: MpPluginMarketSortOption[] = [
+  { id: 'default', label: '默认顺序' },
+  { id: 'latest', label: '最新发布' },
+  { id: 'installs', label: '安装量最高' },
+  { id: 'rating', label: '评分最高' },
+  { id: 'name', label: '名称排序' }
+];
+
 /**
  * 鸿蒙「插件中心」独立页面：
- * - 支持「已安装 / 插件市场」切换、市场一键安装（`/api/v1/plugin/install/{id}`）、已安装重置与卸载确认；
+ * - 支持「已安装 / 插件市场」切换、最新发布/安装量/评分/名称排序、已安装更新提示与一键更新；
  * - 未配置远程图标时统一回退品牌图标 `logo_plugin.png`，并联动系统返回手势关闭详情。
  */
 @Component
@@ -169,13 +183,17 @@ export struct HarmonyPluginsPage {
   @StorageLink(HarmonyAppearanceStore.KEY_IS_DARK) isDark: boolean = true;
   @StorageLink(HarmonyAppearanceStore.KEY_ACCENT_HEX) accentHex: string = '#317AF7';
   @StorageLink(HarmonyAppearanceStore.KEY_WINDOW_WIDTH_VP) windowWidthVp: number = 412;
+  @StorageLink(HarmonyAppearanceStore.KEY_WINDOW_HEIGHT_VP) windowHeightVp: number = 892;
+  @StorageLink(HarmonyAppearanceStore.KEY_SAFE_TOP_VP) safeTopVp: number = 38;
   @StorageProp('mp_plugin_detail_close_req') @Watch('onExternalCloseDetailReq') closeDetailReq: number = 0;
+  @StorageProp('mp_pending_open_plugin_id') @Watch('onPendingOpenPluginChanged') pendingOpenPluginSpec: string = '';
   @Prop serverUrl: string = '';
   @Prop userName: string = 'admin';
   @Prop userAvatar: string = '';
   @Prop isSuperuser: boolean = true;
   @State private activeTabIdx: number = 0; // 0: 已安装, 1: 插件市场
   @State private searchQuery: string = '';
+  @State private marketSortMode: string = 'default';
   @State private installedPlugins: MpPluginItem[] = [];
   @State private marketPlugins: MpPluginItem[] = [];
   @State private marketLoadedOnce: boolean = false;
@@ -185,6 +203,7 @@ export struct HarmonyPluginsPage {
   @State private activePlugin: MpPluginItem | null = null;
   @State private detailTabIndex: number = 0; // 0: 数据页, 1: 参数配置
   @State private forceWebView: boolean = false;
+  @State private usingLegacyFallback: boolean = false;
   @State private activeFormDoc: string = '{}';
   @State private activePageDoc: string = '{}';
   @State private loadingDetail: boolean = false;
@@ -192,12 +211,21 @@ export struct HarmonyPluginsPage {
   @State private chromeTitle: string = '';
   @State private chromeActions: VueChromeAction[] = [];
   @State private saveNotice: string = '';
+  @State private showPluginActionSheet: boolean = false;
+  @State private actionTargetPlugin: MpPluginItem | null = null;
+  @State private showPluginLogSheet: boolean = false;
+  @State private logTargetPlugin: MpPluginItem | null = null;
+  @State private pluginLogLines: string[] = [];
+  @State private loadingPluginLogs: boolean = false;
+  @State private showMarketDetailSheet: boolean = false;
+  @State private marketDetailTarget: MpPluginItem | null = null;
   private vueChromeController: HarmonyVueChromeController = new HarmonyVueChromeController();
   onBack: () => void = () => {};
 
   aboutToAppear(): void {
     this.syncDetailBackFlag(false);
     this.loadInstalled();
+    this.loadMarketForUpdatesSilently();
   }
 
   aboutToDisappear(): void {
@@ -214,14 +242,111 @@ export struct HarmonyPluginsPage {
     }
   }
 
+  private mergeMarketUpdatesOntoInstalled(installed: MpPluginItem[], market: MpPluginItem[]): MpPluginItem[] {
+    if (installed.length === 0 || market.length === 0) {
+      return installed;
+    }
+    const updateById = new Map<string, MpPluginItem>();
+    for (let i = 0; i < market.length; i++) {
+      const mp = market[i];
+      if (mp.hasUpdate) {
+        updateById.set(mp.id.toLowerCase(), mp);
+      }
+    }
+    const merged: MpPluginItem[] = [];
+    for (let i = 0; i < installed.length; i++) {
+      const cur = installed[i];
+      const marketMatch = updateById.get(cur.id.toLowerCase());
+      if (marketMatch) {
+        merged.push({
+          id: cur.id,
+          pluginName: cur.pluginName,
+          pluginDesc: cur.pluginDesc,
+          pluginVersion: cur.pluginVersion,
+          pluginAuthor: cur.pluginAuthor,
+          installed: cur.installed,
+          state: cur.state,
+          hasPage: cur.hasPage,
+          iconUrl: cur.iconUrl,
+          renderMode: cur.renderMode,
+          repoUrl: (cur.repoUrl && cur.repoUrl.length > 0) ? cur.repoUrl : marketMatch.repoUrl,
+          hasUpdate: true,
+          installCount: cur.installCount,
+          addTime: cur.addTime,
+          averageRating: cur.averageRating,
+          pluginLabel: cur.pluginLabel
+        });
+      } else if (cur.hasUpdate) {
+        merged.push({
+          id: cur.id,
+          pluginName: cur.pluginName,
+          pluginDesc: cur.pluginDesc,
+          pluginVersion: cur.pluginVersion,
+          pluginAuthor: cur.pluginAuthor,
+          installed: cur.installed,
+          state: cur.state,
+          hasPage: cur.hasPage,
+          iconUrl: cur.iconUrl,
+          renderMode: cur.renderMode,
+          repoUrl: cur.repoUrl,
+          hasUpdate: false,
+          installCount: cur.installCount,
+          addTime: cur.addTime,
+          averageRating: cur.averageRating,
+          pluginLabel: cur.pluginLabel
+        });
+      } else {
+        merged.push(cur);
+      }
+    }
+    return merged;
+  }
+
+  private async loadMarketForUpdatesSilently(): Promise<void> {
+    if (this.marketLoadedOnce) { return; }
+    try {
+      const market = await MoviePilotRepository.shared().fetchPlugins('market');
+      this.marketPlugins = market;
+      this.marketLoadedOnce = true;
+      if (this.installedPlugins.length > 0) {
+        this.installedPlugins = this.mergeMarketUpdatesOntoInstalled(this.installedPlugins, market);
+      }
+    } catch {
+      // silent background check
+    }
+  }
+
   private async loadInstalled(): Promise<void> {
     this.loading = true;
     try {
-      this.installedPlugins = await MoviePilotRepository.shared().fetchPlugins('installed');
+      const loaded = await MoviePilotRepository.shared().fetchPlugins('installed');
+      this.installedPlugins = this.marketPlugins.length > 0
+        ? this.mergeMarketUpdatesOntoInstalled(loaded, this.marketPlugins)
+        : loaded;
     } catch {
       this.installedPlugins = [];
     }
     this.loading = false;
+    this.consumePendingOpenPluginIfNeeded();
+  }
+
+  onPendingOpenPluginChanged(): void {
+    this.consumePendingOpenPluginIfNeeded();
+  }
+
+  private consumePendingOpenPluginIfNeeded(): void {
+    const raw = (AppStorage.get<string>('mp_pending_open_plugin_id') ?? '').trim();
+    if (raw.length === 0 || this.installedPlugins.length === 0) {
+      return;
+    }
+    const parts = raw.split('|');
+    const targetId = (parts[0] ?? '').trim();
+    const openConfigFirst = (parts[1] ?? '') === 'config';
+    const matched = this.installedPlugins.find((p: MpPluginItem) => p.id.toLowerCase() === targetId.toLowerCase());
+    AppStorage.setOrCreate('mp_pending_open_plugin_id', '');
+    if (matched) {
+      this.openPluginDetail(matched, openConfigFirst);
+    }
   }
 
   private async loadMarketIfNeeded(force: boolean = false): Promise<void> {
@@ -230,6 +355,9 @@ export struct HarmonyPluginsPage {
     try {
       this.marketPlugins = await MoviePilotRepository.shared().fetchPlugins('market');
       this.marketLoadedOnce = true;
+      if (this.installedPlugins.length > 0) {
+        this.installedPlugins = this.mergeMarketUpdatesOntoInstalled(this.installedPlugins, this.marketPlugins);
+      }
     } catch {
       this.marketPlugins = [];
       this.marketLoadedOnce = true;
@@ -241,24 +369,56 @@ export struct HarmonyPluginsPage {
     return this.installedPlugins.some((p: MpPluginItem) => p.id === pluginId);
   }
 
+  private static compareLatestPublished(a: MpPluginItem, b: MpPluginItem): number {
+    const aTime = a.addTime ?? 0;
+    const bTime = b.addTime ?? 0;
+    if (aTime > 0 && bTime > 0 && aTime !== bTime) {
+      return aTime - bTime;
+    }
+    if (aTime > 0 && bTime <= 0) { return -1; }
+    if (aTime <= 0 && bTime > 0) { return 1; }
+    return a.pluginName.localeCompare(b.pluginName);
+  }
+
   private filteredPlugins(): MpPluginItem[] {
     const src = this.activeTabIdx === 0 ? this.installedPlugins : this.marketPlugins;
     const q = this.searchQuery.trim().toLowerCase();
-    if (!q) { return src.slice(0, 80); }
-    return src.filter((p: MpPluginItem) =>
-      `${p.pluginName} ${p.pluginDesc} ${p.pluginAuthor} ${p.id}`.toLowerCase().includes(q)
-    ).slice(0, 80);
+    const matched: MpPluginItem[] = !q
+      ? src.slice()
+      : src.filter((p: MpPluginItem) =>
+        `${p.pluginName} ${p.pluginDesc} ${p.pluginAuthor} ${p.pluginLabel ?? ''} ${p.id}`.toLowerCase().includes(q)
+      );
+    if (this.activeTabIdx !== 1 || this.marketSortMode === 'default') {
+      return matched;
+    }
+    if (this.marketSortMode === 'latest') {
+      return matched.sort((a: MpPluginItem, b: MpPluginItem) => HarmonyPluginsPage.compareLatestPublished(a, b));
+    }
+    if (this.marketSortMode === 'installs') {
+      return matched.sort((a: MpPluginItem, b: MpPluginItem) => (b.installCount ?? 0) - (a.installCount ?? 0));
+    }
+    if (this.marketSortMode === 'rating') {
+      return matched.sort((a: MpPluginItem, b: MpPluginItem) => (b.averageRating ?? 0) - (a.averageRating ?? 0));
+    }
+    if (this.marketSortMode === 'name') {
+      return matched.sort((a: MpPluginItem, b: MpPluginItem) => a.pluginName.localeCompare(b.pluginName));
+    }
+    return matched;
   }
 
-  private async handleInstallPlugin(pl: MpPluginItem): Promise<void> {
+  private async handleInstallPlugin(pl: MpPluginItem, force: boolean = false): Promise<void> {
     if (this.installingId.length > 0) { return; }
+    const isUpdate = Boolean(pl.hasUpdate);
     this.installingId = pl.id;
     this.listNotice = '';
-    const ok = await MoviePilotRepository.shared().installPlugin(pl.id, pl.repoUrl ?? '');
+    const ok = await MoviePilotRepository.shared().installPlugin(pl.id, pl.repoUrl ?? '', force);
     this.installingId = '';
-    this.listNotice = ok ? `已安装插件「${pl.pluginName}」` : `安装插件「${pl.pluginName}」失败`;
+    const verb = isUpdate ? '更新' : (force ? '重新安装' : '安装');
+    this.listNotice = ok ? `已${verb}插件「${pl.pluginName}」` : `${verb}插件「${pl.pluginName}」失败`;
     if (ok) {
-      await Promise.all([this.loadInstalled(), this.loadMarketIfNeeded(true)]);
+      this.showMarketDetailSheet = false;
+      this.marketDetailTarget = null;
+      await Promise.all([this.loadMarketIfNeeded(true), this.loadInstalled()]);
     }
   }
 
@@ -274,9 +434,28 @@ export struct HarmonyPluginsPage {
     }
   }
 
-  private confirmUninstallActivePlugin(): void {
-    const pl = this.activePlugin;
-    if (!pl) { return; }
+  private confirmResetPluginItem(pl: MpPluginItem): void {
+    this.getUIContext().showAlertDialog({
+      title: '重置插件',
+      message: `确定要重置插件「${pl.pluginName}」的配置与缓存数据吗？此操作不可撤销。`,
+      autoCancel: true,
+      primaryButton: {
+        value: '取消',
+        action: () => {}
+      },
+      secondaryButton: {
+        value: '确认重置',
+        fontColor: '#F29B38',
+        action: () => {
+          MoviePilotRepository.shared().resetPlugin(pl.id).then((ok: boolean) => {
+            this.listNotice = ok ? `已重置插件「${pl.pluginName}」` : `重置插件「${pl.pluginName}」失败`;
+          });
+        }
+      }
+    });
+  }
+
+  private confirmUninstallPluginItem(pl: MpPluginItem): void {
     this.getUIContext().showAlertDialog({
       title: '卸载插件',
       message: `确定要卸载插件「${pl.pluginName}」吗？卸载后插件配置与运行任务将被移除。`,
@@ -295,6 +474,12 @@ export struct HarmonyPluginsPage {
     });
   }
 
+  private confirmUninstallActivePlugin(): void {
+    const pl = this.activePlugin;
+    if (!pl) { return; }
+    this.confirmUninstallPluginItem(pl);
+  }
+
   private async executeUninstallPlugin(pl: MpPluginItem): Promise<void> {
     this.actionBusy = true;
     const ok = await MoviePilotRepository.shared().uninstallPlugin(pl.id);
@@ -309,14 +494,26 @@ export struct HarmonyPluginsPage {
     }
   }
 
-  private async openPluginDetail(pl: MpPluginItem): Promise<void> {
+  private async openPluginDetail(pl: MpPluginItem, openConfigFirst: boolean = false): Promise<void> {
+    const targetSurface = (pl.hasPage && !openConfigFirst) ? 'dataPage' : 'config';
+    if (pl.renderMode.toLowerCase() === 'vue') {
+      HarmonyPluginCapsuleManager.shared().openPlugin(
+        pl.id,
+        pl.pluginName,
+        targetSurface,
+        pl.hasPage,
+        pl.iconUrl ?? ''
+      );
+      return;
+    }
     this.activePlugin = pl;
     this.syncDetailBackFlag(true);
     this.chromeTitle = pl.pluginName;
     this.chromeActions = [];
     this.saveNotice = '';
     this.forceWebView = false;
-    this.detailTabIndex = pl.hasPage ? 0 : 1;
+    this.usingLegacyFallback = false;
+    this.detailTabIndex = (pl.hasPage && !openConfigFirst) ? 0 : 1;
     this.loadingDetail = true;
     const repo = MoviePilotRepository.shared();
     try {
@@ -331,14 +528,32 @@ export struct HarmonyPluginsPage {
       this.activePageDoc = '{}';
     }
     this.loadingDetail = false;
+    if (this.isDetectedVuePlugin()) {
+      this.activePlugin = null;
+      this.syncDetailBackFlag(false);
+      HarmonyPluginCapsuleManager.shared().openPlugin(
+        pl.id,
+        pl.pluginName,
+        targetSurface,
+        pl.hasPage,
+        pl.iconUrl ?? ''
+      );
+    }
   }
 
-  private isActivePluginVue(): boolean {
-    if (this.forceWebView) { return true; }
+  private isDetectedVuePlugin(): boolean {
     if (!this.activePlugin) { return false; }
     if (this.activePlugin.renderMode.toLowerCase() === 'vue') { return true; }
     return this.activeFormDoc.includes('"render_mode":"vue"') || this.activeFormDoc.includes('"render_mode": "vue"')
       || this.activePageDoc.includes('"render_mode":"vue"') || this.activePageDoc.includes('"render_mode": "vue"');
+  }
+
+  private isActivePluginVue(): boolean {
+    return this.forceWebView || this.isDetectedVuePlugin();
+  }
+
+  private shouldHideAppTopBar(): boolean {
+    return this.isDetectedVuePlugin() && !this.usingLegacyFallback;
   }
 
   private closePluginDetail(): void {
@@ -350,55 +565,509 @@ export struct HarmonyPluginsPage {
     this.chromeTitle = '';
     this.chromeActions = [];
     this.forceWebView = false;
+    this.usingLegacyFallback = false;
+  }
+
+  private openActionSheetForPlugin(pl: MpPluginItem): void {
+    this.actionTargetPlugin = pl;
+    this.showPluginActionSheet = true;
+  }
+
+  private async handleReloadPluginItem(pl: MpPluginItem): Promise<void> {
+    if (this.actionBusy) { return; }
+    this.actionBusy = true;
+    const res = await MoviePilotRepository.shared().reloadPlugin(pl.id);
+    this.actionBusy = false;
+    this.listNotice = res.ok ? `已重新加载插件「${pl.pluginName}」` : res.message;
+    if (res.ok) {
+      await this.loadInstalled();
+    }
+  }
+
+  /** 打开或刷新插件日志快照，并在请求结束或失败后释放加载状态。 */
+  private async openLogsForPlugin(pl: MpPluginItem): Promise<void> {
+    this.logTargetPlugin = pl;
+    this.pluginLogLines = [];
+    this.loadingPluginLogs = true;
+    this.showPluginLogSheet = true;
+    try {
+      this.pluginLogLines = await MoviePilotRepository.shared().fetchPluginLogs(pl.id, 200);
+    } finally {
+      this.loadingPluginLogs = false;
+    }
+  }
+
+  /** 用日志级别区分正文颜色，保留原始文本内容。 */
+  private logLineColor(line: string): ResourceColor {
+    const upper = line.toUpperCase();
+    if (upper.includes('ERROR') || upper.includes('CRITICAL')) { return '#E84855'; }
+    if (upper.includes('WARN')) { return '#F29B38'; }
+    if (upper.includes('DEBUG')) { return mpSecondaryText(this.isDark); }
+    return mpPrimaryText(this.isDark);
+  }
+
+  @Builder
+  private pluginActionSheetBuilder() {
+    Column({ space: 12 }) {
+      if (this.actionTargetPlugin) {
+        HarmonySheetHeader({
+          title: this.actionTargetPlugin.pluginName,
+          cancelText: '关闭',
+          onCancel: () => { this.showPluginActionSheet = false; }
+        })
+
+        Row({ space: 10 }) {
+          HarmonyPluginCardIcon({
+            iconUrl: this.actionTargetPlugin.iconUrl,
+            pluginName: this.actionTargetPlugin.pluginName
+          })
+          Column({ space: 3 }) {
+            Text(`v${this.actionTargetPlugin.pluginVersion || '1.0.0'} · 作者 ${this.actionTargetPlugin.pluginAuthor || 'MoviePilot'}`)
+              .fontSize(12.5)
+              .fontColor(mpSecondaryText(this.isDark))
+            if (this.actionTargetPlugin.pluginDesc.length > 0) {
+              Text(this.actionTargetPlugin.pluginDesc)
+                .fontSize(12)
+                .fontColor(mpSecondaryText(this.isDark))
+                .maxLines(2)
+            }
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+        }
+        .width('100%')
+
+        CinematicPanel({ panelPadding: 6, cornerRadius: 18 }) {
+          Column() {
+            if (this.actionTargetPlugin.hasUpdate) {
+              Row({ space: 10 }) {
+                SymbolGlyph($r('sys.symbol.arrow_up_circle')).fontSize(17).fontColor(['#F29B38'])
+                Text('更新至最新版本').fontSize(15).fontWeight(FontWeight.Bold).fontColor('#F29B38').layoutWeight(1)
+              }
+              .width('100%')
+              .padding({ left: 12, right: 12, top: 13, bottom: 13 })
+              .onClick(() => {
+                const target = this.actionTargetPlugin;
+                this.showPluginActionSheet = false;
+                if (target) { this.handleInstallPlugin(target, true); }
+              })
+              Divider().color(HarmonyThemeColors.divider(this.isDark))
+            }
+
+            if (this.actionTargetPlugin.hasPage) {
+              Row({ space: 10 }) {
+                SymbolGlyph($r('sys.symbol.doc_plaintext')).fontSize(17).fontColor([this.accentHex])
+                Text('打开数据页').fontSize(15).fontWeight(FontWeight.Medium).fontColor(mpPrimaryText(this.isDark)).layoutWeight(1)
+              }
+              .width('100%')
+              .padding({ left: 12, right: 12, top: 13, bottom: 13 })
+              .onClick(() => {
+                const target = this.actionTargetPlugin;
+                this.showPluginActionSheet = false;
+                if (target) { this.openPluginDetail(target, false); }
+              })
+              Divider().color(HarmonyThemeColors.divider(this.isDark))
+            }
+
+            Row({ space: 10 }) {
+              SymbolGlyph($r('sys.symbol.slider_horizontal_2')).fontSize(17).fontColor([mpPrimaryText(this.isDark)])
+              Text('参数配置').fontSize(15).fontWeight(FontWeight.Medium).fontColor(mpPrimaryText(this.isDark)).layoutWeight(1)
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 13, bottom: 13 })
+            .onClick(() => {
+              const target = this.actionTargetPlugin;
+              this.showPluginActionSheet = false;
+              if (target) { this.openPluginDetail(target, true); }
+            })
+            Divider().color(HarmonyThemeColors.divider(this.isDark))
+
+            Row({ space: 10 }) {
+              SymbolGlyph($r('sys.symbol.doc_text')).fontSize(17).fontColor([mpPrimaryText(this.isDark)])
+              Text('查看插件日志').fontSize(15).fontWeight(FontWeight.Medium).fontColor(mpPrimaryText(this.isDark)).layoutWeight(1)
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 13, bottom: 13 })
+            .onClick(() => {
+              const target = this.actionTargetPlugin;
+              this.showPluginActionSheet = false;
+              if (target) {
+                setTimeout(() => { this.openLogsForPlugin(target); }, 140);
+              }
+            })
+            Divider().color(HarmonyThemeColors.divider(this.isDark))
+
+            Row({ space: 10 }) {
+              SymbolGlyph($r('sys.symbol.arrow_clockwise')).fontSize(17).fontColor([mpPrimaryText(this.isDark)])
+              Text('重新加载插件').fontSize(15).fontWeight(FontWeight.Medium).fontColor(mpPrimaryText(this.isDark)).layoutWeight(1)
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 13, bottom: 13 })
+            .onClick(() => {
+              const target = this.actionTargetPlugin;
+              this.showPluginActionSheet = false;
+              if (target) { this.handleReloadPluginItem(target); }
+            })
+            Divider().color(HarmonyThemeColors.divider(this.isDark))
+
+            Row({ space: 10 }) {
+              SymbolGlyph($r('sys.symbol.arrow_counterclockwise')).fontSize(17).fontColor(['#F29B38'])
+              Text('重置插件数据').fontSize(15).fontWeight(FontWeight.Medium).fontColor('#F29B38').layoutWeight(1)
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 13, bottom: 13 })
+            .onClick(() => {
+              const target = this.actionTargetPlugin;
+              this.showPluginActionSheet = false;
+              if (target) {
+                setTimeout(() => { this.confirmResetPluginItem(target); }, 120);
+              }
+            })
+            Divider().color(HarmonyThemeColors.divider(this.isDark))
+
+            Row({ space: 10 }) {
+              SymbolGlyph($r('sys.symbol.trash')).fontSize(17).fontColor(['#E84855'])
+              Text('卸载此插件').fontSize(15).fontWeight(FontWeight.Bold).fontColor('#E84855').layoutWeight(1)
+            }
+            .width('100%')
+            .padding({ left: 12, right: 12, top: 13, bottom: 13 })
+            .onClick(() => {
+              const target = this.actionTargetPlugin;
+              this.showPluginActionSheet = false;
+              if (target) {
+                setTimeout(() => { this.confirmUninstallPluginItem(target); }, 120);
+              }
+            })
+          }
+        }
+      }
+    }
+    .padding({ left: 20, right: 20, top: 14, bottom: 28 })
+    .width('100%')
+  }
+
+  @Builder
+  private pluginLogSheetBuilder() {
+    Column({ space: 12 }) {
+      HarmonySheetHeader({
+        title: this.logTargetPlugin ? `${this.logTargetPlugin.pluginName} · 日志` : '插件日志',
+        cancelText: '关闭',
+        actionText: this.loadingPluginLogs ? '加载中' : '刷新',
+        actionEnabled: !this.loadingPluginLogs,
+        onCancel: () => { this.showPluginLogSheet = false; },
+        onAction: () => {
+          if (this.logTargetPlugin) {
+            this.openLogsForPlugin(this.logTargetPlugin);
+          }
+        }
+      })
+
+      if (this.loadingPluginLogs && this.pluginLogLines.length === 0) {
+        Column({ space: 8 }) {
+          LoadingProgress().width(28).height(28).color(this.accentHex)
+          Text('正在读取插件日志…').fontSize(12.5).fontColor(mpSecondaryText(this.isDark))
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+      } else if (this.pluginLogLines.length === 0) {
+        Column({ space: 8 }) {
+          SymbolGlyph($r('sys.symbol.doc_plaintext')).fontSize(34).fontColor([mpSecondaryText(this.isDark)])
+          Text('当前插件暂无输出日志记录').fontSize(13.5).fontColor(mpSecondaryText(this.isDark))
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+      } else {
+        Scroll() {
+          Column({ space: 6 }) {
+            ForEach(this.pluginLogLines, (ln: string, idx: number) => {
+              Text(ln)
+                .fontSize(11.5)
+                .fontColor(this.logLineColor(ln))
+                .width('100%')
+            }, (ln: string, idx: number) => `${idx}_${ln.length}`)
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+          .padding(12)
+        }
+        .backgroundColor(HarmonyThemeColors.chipFill(this.isDark))
+        .borderRadius(16)
+        .layoutWeight(1)
+        .width('100%')
+      }
+    }
+    .padding({ left: 20, right: 20, top: 14, bottom: 24 })
+    .width('100%')
+    .height('100%')
+  }
+
+  @Builder
+  private marketDetailSheetBuilder() {
+    Column({ space: 14 }) {
+      if (this.marketDetailTarget) {
+        HarmonySheetHeader({
+          title: '插件详情',
+          cancelText: '关闭',
+          onCancel: () => { this.showMarketDetailSheet = false; }
+        })
+
+        Row({ space: 12 }) {
+          HarmonyPluginCardIcon({
+            iconUrl: this.marketDetailTarget.iconUrl,
+            pluginName: this.marketDetailTarget.pluginName
+          })
+          Column({ space: 4 }) {
+            Row({ space: 6 }) {
+              Text(this.marketDetailTarget.pluginName)
+                .fontSize(16.5)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(mpPrimaryText(this.isDark))
+                .maxLines(1)
+                .layoutWeight(1)
+              if (this.marketDetailTarget.pluginVersion.length > 0) {
+                NativeAdaptiveBadge({ text: `v${this.marketDetailTarget.pluginVersion}`, tintHex: this.accentHex })
+              }
+            }.width('100%')
+            Text(`作者：${this.marketDetailTarget.pluginAuthor || 'MoviePilot'}`)
+              .fontSize(12.5)
+              .fontColor(mpSecondaryText(this.isDark))
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+        }
+        .width('100%')
+
+        if (this.marketDetailTarget.pluginDesc.length > 0) {
+          CinematicPanel({ panelPadding: 14, cornerRadius: 16 }) {
+            Text(this.marketDetailTarget.pluginDesc)
+              .fontSize(13.5)
+              .lineHeight(20)
+              .fontColor(mpPrimaryText(this.isDark))
+              .width('100%')
+          }
+        }
+
+        Column({ space: 10 }) {
+          Button(
+            this.installingId === this.marketDetailTarget.id
+              ? (this.marketDetailTarget.hasUpdate ? '正在更新…' : '正在安装…')
+              : (this.marketDetailTarget.hasUpdate
+                ? '更新插件'
+                : ((this.marketDetailTarget.installed || this.isInstalledInList(this.marketDetailTarget.id)) ? '重新安装' : '安装插件'))
+          )
+            .width('100%')
+            .height(46)
+            .borderRadius(23)
+            .fontSize(15)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(Color.White)
+            .backgroundColor(this.marketDetailTarget.hasUpdate ? '#F29B38' : this.accentHex)
+            .enabled(this.installingId.length === 0)
+            .onClick(() => {
+              const target = this.marketDetailTarget;
+              if (target) {
+                const needForce = Boolean(target.hasUpdate || target.installed || this.isInstalledInList(target.id));
+                this.handleInstallPlugin(target, needForce);
+              }
+            })
+
+          if (this.isInstalledInList(this.marketDetailTarget.id)) {
+            Button('打开插件配置')
+              .width('100%')
+              .height(42)
+              .borderRadius(21)
+              .fontSize(14)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(mpPrimaryText(this.isDark))
+              .backgroundColor(HarmonyThemeColors.chipFill(this.isDark))
+              .onClick(() => {
+                const target = this.marketDetailTarget;
+                this.showMarketDetailSheet = false;
+                if (target) {
+                  const installed = this.installedPlugins.find((x: MpPluginItem) => x.id === target.id);
+                  if (installed) { this.openPluginDetail(installed); }
+                }
+              })
+          }
+        }
+        .width('100%')
+        .padding({ top: 4 })
+      }
+    }
+    .padding({ left: 20, right: 20, top: 14, bottom: 28 })
+    .width('100%')
+  }
+
+  @Builder
+  private pluginListBodyBuilder(items: MpPluginItem[]) {
+    if (items.length === 0) {
+      Column({ space: 8 }) {
+        SymbolGlyph($r('sys.symbol.puzzle')).fontSize(38).fontColor([mpSecondaryText(this.isDark)])
+        Text('暂无匹配的插件条目').fontSize(14).fontColor(mpSecondaryText(this.isDark))
+      }
+      .width('100%')
+      .layoutWeight(1)
+      .justifyContent(FlexAlign.Center)
+    } else {
+      Grid() {
+        ForEach(items, (pl: MpPluginItem) => {
+          GridItem() {
+            Column() {
+              CinematicPanel({ panelPadding: 14, cornerRadius: 18, interactive: this.activeTabIdx === 0 }) {
+                Row({ space: 12 }) {
+                  HarmonyPluginCardIcon({
+                    iconUrl: pl.iconUrl,
+                    pluginName: pl.pluginName
+                  })
+
+                  Column({ space: 4 }) {
+                    Row({ space: 6 }) {
+                      Text(pl.pluginName).fontSize(15).fontWeight(FontWeight.Bold)
+                        .fontColor(mpPrimaryText(this.isDark)).maxLines(1).layoutWeight(1)
+                      if (pl.pluginVersion.length > 0) {
+                        NativeAdaptiveBadge({ text: `v${pl.pluginVersion}`, tintHex: this.accentHex })
+                      }
+                    }.width('100%')
+                    Text(pl.pluginDesc || pl.id).fontSize(12).fontColor(mpSecondaryText(this.isDark))
+                      .maxLines(2).width('100%')
+                    Row({ space: 8 }) {
+                      Text(`作者：${pl.pluginAuthor || 'MoviePilot'}`).fontSize(11).fontColor(mpSecondaryText(this.isDark))
+                      if (pl.hasPage) {
+                        NativeAdaptiveBadge({ text: '数据页', tintHex: '#5AC8FA' })
+                      }
+                    }
+                  }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+
+                  if (this.activeTabIdx === 0) {
+                    Row({ space: 6 }) {
+                      if (pl.hasUpdate) {
+                        Button(this.installingId === pl.id ? '更新中…' : '更新')
+                          .height(28).padding({ left: 10, right: 10 }).borderRadius(14)
+                          .fontSize(12).fontWeight(FontWeight.Bold)
+                          .backgroundColor('#F29B38').fontColor(Color.White)
+                          .enabled(this.installingId.length === 0)
+                          .onClick(() => { this.handleInstallPlugin(pl, true); })
+                      } else {
+                        NativeAdaptiveBadge({
+                          text: pl.state ? '已启用' : '配置',
+                          tintHex: pl.state ? '#34C759' : this.accentHex
+                        })
+                      }
+                      Button({ type: ButtonType.Circle }) {
+                        SymbolGlyph($r('sys.symbol.dot_grid_1x2'))
+                          .fontSize(16)
+                          .fontColor([mpSecondaryText(this.isDark)])
+                      }
+                      .width(34)
+                      .height(34)
+                      .backgroundColor(HarmonyThemeColors.chipFill(this.isDark))
+                      .accessibilityText(`更多操作 ${pl.pluginName}`)
+                      .onClick(() => { this.openActionSheetForPlugin(pl); })
+                    }
+                  } else if (pl.hasUpdate) {
+                    Button(this.installingId === pl.id ? '更新中…' : '更新')
+                      .height(30).padding({ left: 12, right: 12 }).borderRadius(15)
+                      .fontSize(12).fontWeight(FontWeight.Bold)
+                      .backgroundColor('#F29B38').fontColor(Color.White)
+                      .enabled(this.installingId.length === 0)
+                      .onClick(() => { this.handleInstallPlugin(pl, true); })
+                  } else if (pl.installed || this.isInstalledInList(pl.id)) {
+                    NativeAdaptiveBadge({ text: '已安装', tintHex: '#34C759' })
+                  } else {
+                    Button(this.installingId === pl.id ? '安装中…' : '安装')
+                      .height(30).padding({ left: 12, right: 12 }).borderRadius(15)
+                      .fontSize(12).fontWeight(FontWeight.Bold)
+                      .backgroundColor(this.accentHex).fontColor(Color.White)
+                      .enabled(this.installingId.length === 0)
+                      .onClick(() => { this.handleInstallPlugin(pl, false); })
+                  }
+                }.width('100%')
+              }
+            }
+            .width('100%')
+            .gesture(
+              LongPressGesture({ repeat: false })
+                .onAction(() => {
+                  if (this.activeTabIdx === 0) {
+                    this.openActionSheetForPlugin(pl);
+                  } else if (this.isInstalledInList(pl.id)) {
+                    const installed = this.installedPlugins.find((x: MpPluginItem) => x.id === pl.id);
+                    if (installed) { this.openActionSheetForPlugin(installed); }
+                  }
+                })
+            )
+            .onClick(() => {
+              if (this.activeTabIdx === 0) {
+                this.openPluginDetail(pl);
+              } else {
+                this.marketDetailTarget = pl;
+                this.showMarketDetailSheet = true;
+              }
+            })
+          }
+        }, (pl: MpPluginItem) => `${this.activeTabIdx}_${pl.id}_${this.isInstalledInList(pl.id)}_${Boolean(pl.hasUpdate)}_${this.installingId === pl.id}`)
+      }
+      .cachedCount(6)
+      .columnsTemplate(HarmonyAdaptiveLayout.cardGridTemplate(this.windowWidthVp))
+      .columnsGap(10)
+      .rowsGap(10)
+      .padding({ left: 16, right: 16, top: 2, bottom: 44 })
+      .scrollBar(BarState.Off)
+      .layoutWeight(1)
+    }
   }
 
   build() {
     if (this.activePlugin) {
-      Column({ space: 8 }) {
-        NativeBackHeader({
-          title: this.chromeTitle || this.activePlugin.pluginName,
-          trailingText: this.chromeActions.length > 0
-            ? this.chromeActions[0].title
-            : (this.forceWebView ? '原生视图' : '网页视图'),
-          onBack: () => this.closePluginDetail(),
-          onTrailingClick: () => {
-            if (this.chromeActions.length > 0) {
-              this.vueChromeController.invokeAction(this.chromeActions[0].id);
-            } else {
-              this.forceWebView = !this.forceWebView;
+      Column({ space: this.shouldHideAppTopBar() ? 0 : 8 }) {
+        if (!this.shouldHideAppTopBar()) {
+          NativeBackHeader({
+            title: this.chromeTitle || this.activePlugin.pluginName,
+            trailingText: this.chromeActions.length > 0
+              ? this.chromeActions[0].title
+              : (this.forceWebView ? '原生视图' : '网页视图'),
+            onBack: () => this.closePluginDetail(),
+            onTrailingClick: () => {
+              if (this.chromeActions.length > 0) {
+                this.vueChromeController.invokeAction(this.chromeActions[0].id);
+              } else {
+                this.forceWebView = !this.forceWebView;
+              }
             }
-          }
-        })
-
-        // 插件管理动作条（重置与卸载）
-        Row({ space: 8 }) {
-          if (this.activePlugin.pluginVersion.length > 0) {
-            NativeAdaptiveBadge({ text: `v${this.activePlugin.pluginVersion}`, tintHex: this.accentHex })
-          }
-          Blank()
-          NativeAdaptivePill({
-            title: '重置插件',
-            selected: false,
-            onTap: () => { this.handleResetActivePlugin(); }
           })
-          Row({ space: 4 }) {
-            SymbolGlyph($r('sys.symbol.trash')).fontSize(13).fontColor(['#E84855'])
-            Text('卸载').fontSize(12.5).fontWeight(FontWeight.Medium).fontColor('#E84855')
-          }
-          .padding({ left: 10, right: 12, top: 6, bottom: 6 })
-          .borderRadius(14)
-          .backgroundColor(HarmonyThemeColors.softDangerBg(this.isDark))
-          .onClick(() => this.confirmUninstallActivePlugin())
-        }
-        .width('100%')
-        .padding({ left: 16, right: 16 })
 
-        if (this.saveNotice.length > 0) {
-          Text(this.saveNotice)
-            .fontSize(12)
-            .fontColor('#34C759')
-            .padding({ left: 16, right: 16 })
-            .width('100%')
+          // 插件管理动作条（重置与卸载）
+          Row({ space: 8 }) {
+            if (this.activePlugin.pluginVersion.length > 0) {
+              NativeAdaptiveBadge({ text: `v${this.activePlugin.pluginVersion}`, tintHex: this.accentHex })
+            }
+            Blank()
+            NativeAdaptivePill({
+              title: '重置插件',
+              selected: false,
+              onTap: () => { this.handleResetActivePlugin(); }
+            })
+            Row({ space: 4 }) {
+              SymbolGlyph($r('sys.symbol.trash')).fontSize(13).fontColor(['#E84855'])
+              Text('卸载').fontSize(12.5).fontWeight(FontWeight.Medium).fontColor('#E84855')
+            }
+            .padding({ left: 10, right: 12, top: 6, bottom: 6 })
+            .borderRadius(14)
+            .backgroundColor(HarmonyThemeColors.softDangerBg(this.isDark))
+            .onClick(() => this.confirmUninstallActivePlugin())
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16 })
+
+          if (this.saveNotice.length > 0) {
+            Text(this.saveNotice)
+              .fontSize(12)
+              .fontColor('#34C759')
+              .padding({ left: 16, right: 16 })
+              .width('100%')
+          }
         }
 
         if (!this.isActivePluginVue() && this.activePlugin.hasPage) {
@@ -434,9 +1103,11 @@ export struct HarmonyPluginsPage {
             chromeController: this.vueChromeController,
             onChromeTitleChange: (t: string) => { this.chromeTitle = t; },
             onChromeActionsChange: (acts: VueChromeAction[]) => { this.chromeActions = acts; },
+            onLegacyFallbackChange: (legacy: boolean) => { this.usingLegacyFallback = legacy; },
             onRequestDismiss: () => {
               this.activePlugin = null;
               this.syncDetailBackFlag(false);
+              this.usingLegacyFallback = false;
             }
           }).layoutWeight(1)
         } else {
@@ -452,9 +1123,11 @@ export struct HarmonyPluginsPage {
             chromeController: this.vueChromeController,
             onChromeTitleChange: (t: string) => { this.chromeTitle = t; },
             onChromeActionsChange: (acts: VueChromeAction[]) => { this.chromeActions = acts; },
+            onLegacyFallbackChange: (legacy: boolean) => { this.usingLegacyFallback = legacy; },
             onRequestDismiss: () => {
               this.activePlugin = null;
               this.syncDetailBackFlag(false);
+              this.usingLegacyFallback = false;
             },
             onSaveFullModel: async (fullJson: string) => {
               if (this.activePlugin) {
@@ -467,6 +1140,7 @@ export struct HarmonyPluginsPage {
       }
       .width('100%')
       .height('100%')
+      .padding({ top: this.shouldHideAppTopBar() ? Math.max(8, this.safeTopVp) : 0 })
     } else {
       Column({ space: 10 }) {
         NativeBackHeader({
@@ -507,6 +1181,24 @@ export struct HarmonyPluginsPage {
             .onChange((v: string) => { this.searchQuery = v; })
         }.padding({ left: 16, right: 16 })
 
+        if (this.activeTabIdx === 1) {
+          Scroll() {
+            Row({ space: 8 }) {
+              ForEach(PLUGIN_MARKET_SORT_OPTIONS, (opt: MpPluginMarketSortOption) => {
+                NativeAdaptivePill({
+                  title: opt.label,
+                  selected: this.marketSortMode === opt.id,
+                  onTap: () => { this.marketSortMode = opt.id; }
+                })
+              }, (opt: MpPluginMarketSortOption) => opt.id)
+            }
+            .padding({ left: 16, right: 16 })
+          }
+          .scrollable(ScrollDirection.Horizontal)
+          .scrollBar(BarState.Off)
+          .width('100%')
+        }
+
         if (this.listNotice.length > 0) {
           Text(this.listNotice)
             .fontSize(12)
@@ -521,81 +1213,36 @@ export struct HarmonyPluginsPage {
             fillViewport: true,
             bottomPadding: 44
           })
-        } else if (this.filteredPlugins().length === 0) {
-          Column({ space: 8 }) {
-            SymbolGlyph($r('sys.symbol.puzzle')).fontSize(38).fontColor([mpSecondaryText(this.isDark)])
-            Text('暂无匹配的插件条目').fontSize(14).fontColor(mpSecondaryText(this.isDark))
-          }
-          .width('100%')
-          .layoutWeight(1)
-          .justifyContent(FlexAlign.Center)
         } else {
-          Grid() {
-            ForEach(this.filteredPlugins(), (pl: MpPluginItem) => {
-              GridItem() {
-                Column() {
-                  CinematicPanel({ panelPadding: 14, cornerRadius: 18, interactive: this.activeTabIdx === 0 }) {
-                    Row({ space: 12 }) {
-                      HarmonyPluginCardIcon({
-                        iconUrl: pl.iconUrl,
-                        pluginName: pl.pluginName
-                      })
-
-                      Column({ space: 4 }) {
-                        Row({ space: 6 }) {
-                          Text(pl.pluginName).fontSize(15).fontWeight(FontWeight.Bold)
-                            .fontColor(mpPrimaryText(this.isDark)).maxLines(1).layoutWeight(1)
-                          if (pl.pluginVersion.length > 0) {
-                            NativeAdaptiveBadge({ text: `v${pl.pluginVersion}`, tintHex: this.accentHex })
-                          }
-                        }.width('100%')
-                        Text(pl.pluginDesc || pl.id).fontSize(12).fontColor(mpSecondaryText(this.isDark))
-                          .maxLines(2).width('100%')
-                        Row({ space: 8 }) {
-                          Text(`作者：${pl.pluginAuthor || 'MoviePilot'}`).fontSize(11).fontColor(mpSecondaryText(this.isDark))
-                          if (pl.hasPage) {
-                            NativeAdaptiveBadge({ text: '数据页', tintHex: '#5AC8FA' })
-                          }
-                        }
-                      }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-
-                      if (this.activeTabIdx === 0) {
-                        NativeAdaptiveBadge({
-                          text: pl.state ? '已启用' : '配置',
-                          tintHex: pl.state ? '#34C759' : this.accentHex
-                        })
-                      } else if (pl.installed || this.isInstalledInList(pl.id)) {
-                        NativeAdaptiveBadge({ text: '已安装', tintHex: '#34C759' })
-                      } else {
-                        Button(this.installingId === pl.id ? '安装中…' : '安装')
-                          .height(30).padding({ left: 12, right: 12 }).borderRadius(15)
-                          .fontSize(12).fontWeight(FontWeight.Bold)
-                          .backgroundColor(this.accentHex).fontColor(Color.White)
-                          .enabled(this.installingId.length === 0)
-                          .onClick(() => { this.handleInstallPlugin(pl); })
-                      }
-                    }.width('100%')
-                  }
-                }
-                .width('100%')
-                .onClick(() => {
-                  if (this.activeTabIdx === 0) {
-                    this.openPluginDetail(pl);
-                  } else if (this.isInstalledInList(pl.id)) {
-                    const installed = this.installedPlugins.find((x: MpPluginItem) => x.id === pl.id);
-                    if (installed) { this.openPluginDetail(installed); }
-                  }
-                })
-              }
-            }, (pl: MpPluginItem) => `${this.activeTabIdx}_${pl.id}_${this.isInstalledInList(pl.id)}`)
-          }
-          .columnsTemplate(HarmonyAdaptiveLayout.cardGridTemplate(this.windowWidthVp))
-          .columnsGap(10)
-          .rowsGap(10)
-          .padding({ left: 16, right: 16, top: 2, bottom: 44 })
-          .scrollBar(BarState.Off)
-          .layoutWeight(1)
+          this.pluginListBodyBuilder(this.filteredPlugins())
         }
+
+        Blank().width(0).height(0).bindSheet($$this.showPluginActionSheet, this.pluginActionSheetBuilder(), {
+          detents: HarmonyAdaptiveLayout.adaptiveSheetDetents(this.windowHeightVp),
+          preferType: HarmonyAdaptiveLayout.sheetPreferType(this.windowWidthVp),
+          blurStyle: BlurStyle.COMPONENT_THIN,
+          dragBar: true,
+          showClose: false,
+          backgroundColor: HarmonyThemeColors.overlayFallback(this.isDark)
+        })
+
+        Blank().width(0).height(0).bindSheet($$this.showPluginLogSheet, this.pluginLogSheetBuilder(), {
+          detents: [SheetSize.LARGE],
+          preferType: HarmonyAdaptiveLayout.sheetPreferType(this.windowWidthVp),
+          blurStyle: BlurStyle.COMPONENT_THIN,
+          dragBar: true,
+          showClose: false,
+          backgroundColor: HarmonyThemeColors.overlayFallback(this.isDark)
+        })
+
+        Blank().width(0).height(0).bindSheet($$this.showMarketDetailSheet, this.marketDetailSheetBuilder(), {
+          detents: HarmonyAdaptiveLayout.adaptiveSheetDetents(this.windowHeightVp),
+          preferType: HarmonyAdaptiveLayout.sheetPreferType(this.windowWidthVp),
+          blurStyle: BlurStyle.COMPONENT_THIN,
+          dragBar: true,
+          showClose: false,
+          backgroundColor: HarmonyThemeColors.overlayFallback(this.isDark)
+        })
       }
       .width('100%')
       .height('100%')
@@ -870,7 +1517,7 @@ export struct HarmonySettingsHubPage {
         repo.fetchDirectories(),
         repo.fetchStorages(),
         repo.fetchSystemSettingList('Notifications'),
-        repo.fetchAuthorizations(),
+        repo.fetchAuthorizations().catch(() => this.authorizations),
         repo.fetchSystemSettingString('RECOGNIZE_SOURCE', 'themoviedb'),
         repo.fetchSystemSettingString('SCRAP_SOURCE', 'themoviedb'),
         repo.fetchSystemSettingBool('MEDIASERVER_SYNC', true),
@@ -1131,6 +1778,33 @@ export struct HarmonySettingsHubPage {
     }
   }
 
+  /** 授权请求失败时保留已加载列表并提示，不将失败显示为空成员。 */
+  private async reloadAuthorizations(): Promise<void> {
+    this.loadingAuth = true;
+    try {
+      this.authorizations = await MoviePilotRepository.shared().fetchAuthorizations();
+    } catch (error) {
+      this.authCodeHint = (error as Error).message || '加载渠道授权失败';
+    } finally {
+      this.loadingAuth = false;
+    }
+  }
+
+  /** 生成绑定码后刷新成员，网络错误也必须恢复按钮状态。 */
+  private async generateBindingCode(): Promise<void> {
+    this.authGenerating = true;
+    try {
+      const result = await MoviePilotRepository.shared().generateAuthorizationCode();
+      this.authCode = result.code;
+      this.authCodeHint = result.message;
+      await this.reloadAuthorizations();
+    } catch (error) {
+      this.authCodeHint = (error as Error).message || '生成关联码失败';
+    } finally {
+      this.authGenerating = false;
+    }
+  }
+
   @Builder
   authorizationSheetBuilder() {
     Column({ space: 12 }) {
@@ -1143,13 +1817,7 @@ export struct HarmonySettingsHubPage {
         actionEnabled: !this.loadingAuth,
         onCancel: () => { this.showAuthorizationSheet = false; },
         onAction: async () => {
-          this.loadingAuth = true;
-          try {
-            this.authorizations = await MoviePilotRepository.shared().fetchAuthorizations();
-          } catch {
-            // keep existing authorizations
-          }
-          this.loadingAuth = false;
+          await this.reloadAuthorizations();
         }
       })
 
@@ -1192,12 +1860,7 @@ export struct HarmonySettingsHubPage {
                 .fontColor(this.accentHex).fontWeight(FontWeight.Bold)
                 .enabled(!this.authGenerating)
                 .onClick(async () => {
-                  this.authGenerating = true;
-                  const res = await MoviePilotRepository.shared().generateAuthorizationCode();
-                  this.authGenerating = false;
-                  this.authCode = res.code;
-                  this.authCodeHint = res.message;
-                  this.authorizations = await MoviePilotRepository.shared().fetchAuthorizations();
+                  await this.generateBindingCode();
                 })
             }
           }
@@ -1230,7 +1893,7 @@ export struct HarmonySettingsHubPage {
                     Row({ space: 6 }) {
                       Text(auth.name).fontSize(14.5).fontWeight(FontWeight.Bold).fontColor(mpPrimaryText(this.isDark))
                       NativeAdaptiveBadge({
-                        text: auth.approved ? '已授权' : '待审批',
+                        text: auth.status === 'pending' ? '待审批' : (auth.status === 'approved' ? '已授权' : (auth.status === 'disabled' ? '已停用' : '已拒绝')),
                         tintHex: auth.approved ? '#34C759' : '#F29B38'
                       })
                     }
@@ -1244,9 +1907,9 @@ export struct HarmonySettingsHubPage {
                       .fontSize(12).fontWeight(FontWeight.Bold)
                       .backgroundColor('#34C759').fontColor(Color.White)
                       .onClick(async () => {
-                        const ok = await MoviePilotRepository.shared().approveAuthorization(auth.id);
+                        const ok = await MoviePilotRepository.shared().approveAuthorization(auth.id).catch(() => false);
                         this.authCodeHint = ok ? `已批准「${auth.name}」` : '审批失败';
-                        this.authorizations = await MoviePilotRepository.shared().fetchAuthorizations();
+                        await this.reloadAuthorizations();
                       })
                   }
                   Button('撤销')
@@ -1265,8 +1928,8 @@ export struct HarmonySettingsHubPage {
                           action: () => {
                             MoviePilotRepository.shared().revokeAuthorization(auth.id).then(async (ok: boolean) => {
                               this.authCodeHint = ok ? `已撤销「${auth.name}」` : '撤销失败';
-                              this.authorizations = await MoviePilotRepository.shared().fetchAuthorizations();
-                            });
+                              await this.reloadAuthorizations();
+                            }).catch(() => { this.authCodeHint = '撤销失败'; });
                           }
                         }
                       });

@@ -117,7 +117,9 @@ export interface MpCommunityState {
   medals: MpCommunityMedal[];
 }
 
+/** 展开的日历事件；保留订阅归属以复用正确来源的详情入口。 */
 export interface MpCalendarEpisodeItem {
+  subscribeId?: number;
   id: string;
   title: string;
   episodeTitle: string;
@@ -197,6 +199,7 @@ export interface MpSubscribeItem {
   customWords?: string;
   searchImdbid?: boolean;
   interval?: number;
+  date?: string;
   rawJson?: string;
 }
 
@@ -222,6 +225,14 @@ export interface MpSiteItem {
   rawJson?: string;
 }
 
+/** 后端媒体搜索来源目录项（对应 `GET /api/v1/media/source`）。 */
+export interface MpMediaSearchSource {
+  id: string;
+  name: string;
+  displayName: string;
+  mediaTypes: string[];
+}
+
 export interface MpResourceItem {
   title: string;
   description: string;
@@ -237,6 +248,13 @@ export interface MpResourceItem {
   pageUrl: string;
   siteId?: number;
   pubdate?: string;
+  edition?: string;
+  audioEncode?: string;
+  resourceTeam?: string;
+  seasonEpisode?: string;
+  labels?: string[];
+  downloadVolumeFactor?: number;
+  uploadVolumeFactor?: number;
   rawJson?: string;
 }
 
@@ -306,6 +324,11 @@ export interface MpPluginItem {
   iconUrl: string;
   renderMode: string;
   repoUrl?: string;
+  hasUpdate?: boolean;
+  installCount?: number;
+  addTime?: number;
+  averageRating?: number;
+  pluginLabel?: string;
 }
 
 export interface MpUserItem {
@@ -736,6 +759,19 @@ export interface MpAgentAttachment {
   mimeType: string;
   url: string;
   sizeBytes: number;
+}
+
+/** 插件通过 `ChainEventType.RecommendSource` 动态注册的推荐榜单来源（`GET /api/v1/recommend/source`）。 */
+export interface MpRecommendSource {
+  name: string;
+  apiPath: string;
+  type: string;
+}
+
+/** 通用布尔执行结果与提示消息。 */
+export interface MpOperationOutcome {
+  ok: boolean;
+  message: string;
 }
 
 export interface MpAgentChoiceButton {
@@ -1226,27 +1262,35 @@ export class MoviePilotRepository {
   userAvatar: string = '';
   userLevel: number = 1;
 
-  /** 从 JWT Payload 提取签发时的 `level`（用于重启恢复与 `/user/current` 未返回该字段时回退）。 */
-  static parseJwtLevel(token: string): number | null {
+  /** 从不可变 sub 派生存储归属；无法确认账号时不使用共享桶。 */
+  accountStorageScope(): string {
+    const claims = MoviePilotRepository.jwtClaims(this.token);
+    const subject = claims ? strVal(claims, 'sub') : '';
+    if (!/^[1-9][0-9]*$/.test(subject)) { return ''; }
+    return encodeURIComponent(JSON.stringify([RustCoreBridge.normalizeServerAddress(this.baseUrl), subject]));
+  }
+
+  /** 解码已认证令牌的业务声明，仅用于展示和存储归属，不作为权限验证。 */
+  private static jwtClaims(token: string): Record<string, Object> | null {
     const parts = token.split('.');
     if (parts.length !== 3) { return null; }
     try {
       let payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-      const pad = (4 - (payload.length % 4)) % 4;
-      for (let i = 0; i < pad; i++) {
-        payload += '=';
-      }
-      const b64 = new util.Base64Helper();
-      const bytes = b64.decodeSync(payload);
-      const dec = util.TextDecoder.create('utf-8', { ignoreBOM: true });
-      const text = dec.decodeToString(bytes);
-      const rec = asRec(parseJsonSafe(text));
-      if (!rec || rec['level'] === undefined || rec['level'] === null) { return null; }
-      const lv = Number(rec['level']);
-      return Number.isFinite(lv) && lv >= 0 ? Math.trunc(lv) : null;
+      payload += '='.repeat((4 - payload.length % 4) % 4);
+      const bytes = new util.Base64Helper().decodeSync(payload);
+      const text = util.TextDecoder.create('utf-8', { ignoreBOM: true }).decodeToString(bytes);
+      return asRec(parseJsonSafe(text));
     } catch {
       return null;
     }
+  }
+
+  /** 读取签发等级供重启展示，缺失时使用调用方既有回退。 */
+  static parseJwtLevel(token: string): number | null {
+    const claims = MoviePilotRepository.jwtClaims(token);
+    if (!claims || claims['level'] === undefined || claims['level'] === null) { return null; }
+    const level = Number(claims['level']);
+    return Number.isFinite(level) && level >= 0 ? Math.trunc(level) : null;
   }
 
   static shared(): MoviePilotRepository {
@@ -1261,10 +1305,143 @@ export class MoviePilotRepository {
   }
 
   private siteIconCache: Map<number, string> = new Map<number, string>();
+  globalImageCache: boolean = false;
+  tmdbImageDomain: string = 'image.tmdb.org';
+  bangumiProxyEnable: boolean = false;
+  bangumiImageDomain: string = '';
+  private imageContextReadyOrigin: string = '';
+  private imageContextInflight: Promise<void> | null = null;
+
+  private imageConfigStorageKey(origin: string): string {
+    return `mp_global_img_cfg_v1_${encodeURIComponent(origin)}`;
+  }
+
+  private resetImageConfigState(nextOrigin: string): void {
+    this.globalImageCache = false;
+    this.tmdbImageDomain = 'image.tmdb.org';
+    this.bangumiProxyEnable = false;
+    this.bangumiImageDomain = '';
+    this.imageContextReadyOrigin = '';
+    this.imageContextInflight = null;
+    if (nextOrigin.length > 0) {
+      this.restoreCachedImageConfig(nextOrigin).catch(() => {});
+    }
+  }
+
+  private async restoreCachedImageConfig(origin: string): Promise<void> {
+    if (!origin || origin !== this.baseUrl) { return; }
+    try {
+      const raw = await NativeHuksStore.shared().loadString(this.imageConfigStorageKey(origin));
+      if (!raw || origin !== this.baseUrl) { return; }
+      const rec = asRec(parseJsonSafe(raw));
+      if (!rec) { return; }
+      this.applyGlobalImageRecord(rec, false);
+    } catch {
+      // ignore cache load errors
+    }
+  }
+
+  private applyGlobalImageRecord(rec: Record<string, Object>, persist: boolean): void {
+    if (rec['GLOBAL_IMAGE_CACHE'] !== undefined && rec['GLOBAL_IMAGE_CACHE'] !== null) {
+      this.globalImageCache = boolVal(rec, 'GLOBAL_IMAGE_CACHE', false);
+    }
+    const tmdbDom = strVal(rec, 'TMDB_IMAGE_DOMAIN').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+    if (tmdbDom.length > 0) {
+      this.tmdbImageDomain = tmdbDom;
+    } else if (rec['TMDB_IMAGE_DOMAIN'] !== undefined) {
+      this.tmdbImageDomain = 'image.tmdb.org';
+    }
+    if (rec['BANGUMI_PROXY_ENABLE'] !== undefined && rec['BANGUMI_PROXY_ENABLE'] !== null) {
+      this.bangumiProxyEnable = boolVal(rec, 'BANGUMI_PROXY_ENABLE', false);
+    }
+    if (rec['BANGUMI_IMAGE_DOMAIN'] !== undefined) {
+      this.bangumiImageDomain = strVal(rec, 'BANGUMI_IMAGE_DOMAIN').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+    }
+    if (persist && this.baseUrl.length > 0) {
+      const snap: Record<string, Object> = {};
+      snap['GLOBAL_IMAGE_CACHE'] = this.globalImageCache;
+      snap['TMDB_IMAGE_DOMAIN'] = this.tmdbImageDomain;
+      snap['BANGUMI_PROXY_ENABLE'] = this.bangumiProxyEnable;
+      snap['BANGUMI_IMAGE_DOMAIN'] = this.bangumiImageDomain;
+      NativeHuksStore.shared().saveString(this.imageConfigStorageKey(this.baseUrl), JSON.stringify(snap)).catch(() => {});
+    }
+  }
+
+  /** 拉取后端全局图片缓存与自定义图片域名配置（对齐 Web 端 `/api/v1/system/global?token=moviepilot`）。 */
+  async refreshGlobalImageSettings(): Promise<void> {
+    const origin = this.baseUrl;
+    if (!origin) { return; }
+    try {
+      const url = RustCoreBridge.buildV3EndpointUrl(origin, ['system', 'global'], { 'token': 'moviepilot' });
+      const resp = await this.transport.execute(url, 'GET', '');
+      if (origin !== this.baseUrl) { return; }
+      if (resp.status === 200) {
+        const root = unwrapObject(parseJsonSafe(resp.body));
+        if (root) {
+          this.applyGlobalImageRecord(root, true);
+          return;
+        }
+      }
+    } catch {
+      // fallback below
+    }
+    if (origin === this.baseUrl && this.token.length > 0 && this.isSuperuser) {
+      try {
+        const envResp = await this.get(['system', 'env']);
+        if (origin === this.baseUrl && envResp.status === 200) {
+          const envObj = unwrapObject(parseJsonSafe(envResp.body));
+          if (envObj) {
+            this.applyGlobalImageRecord(envObj, true);
+          }
+        }
+      } catch {
+        // ignore fallback errors
+      }
+    }
+  }
+
+  /** 确保当前实例已同步全局图片缓存开关并持有同源 `MoviePilot` 资源 Cookie（并发去重）。 */
+  async ensureImageContextReady(): Promise<void> {
+    const origin = this.baseUrl;
+    if (!origin) { return; }
+    if (this.imageContextReadyOrigin === origin && (this.token.length === 0 || this.transport.hasCookie('MoviePilot'))) {
+      return;
+    }
+    if (this.imageContextInflight) {
+      await this.imageContextInflight;
+      return;
+    }
+    const task = this.runImageContextBootstrap(origin);
+    this.imageContextInflight = task;
+    try {
+      await task;
+    } finally {
+      if (this.imageContextInflight === task) {
+        this.imageContextInflight = null;
+      }
+    }
+  }
+
+  private async runImageContextBootstrap(origin: string): Promise<void> {
+    await this.restoreCachedImageConfig(origin);
+    const jobs: Promise<void>[] = [this.refreshGlobalImageSettings()];
+    if (this.token.length > 0 && !this.transport.hasCookie('MoviePilot')) {
+      jobs.push(this.get(['media', 'source']).then(() => {}).catch(() => {}));
+    }
+    await Promise.all(jobs);
+    if (origin === this.baseUrl) {
+      this.imageContextReadyOrigin = origin;
+    }
+  }
 
   configure(baseUrl: string, token: string, userName: string, isSuperuser: boolean, avatar: string = ''): void {
-    this.baseUrl = RustCoreBridge.normalizeServerAddress(baseUrl);
+    const normalizedBase = RustCoreBridge.normalizeServerAddress(baseUrl);
+    const originChanged = normalizedBase !== this.baseUrl;
+    this.baseUrl = normalizedBase;
     this.transport.setBaseUrl(this.baseUrl);
+    if (originChanged) {
+      this.resetImageConfigState(this.baseUrl);
+    }
     CloudflareAccessOAuthManager.shared().hydrateOrigin(this.baseUrl).catch(() => {});
     this.token = token;
     this.userName = userName;
@@ -1276,9 +1453,14 @@ export class MoviePilotRepository {
 
   /** 配置当前实例地址与自签名 HTTPS 证书策略。 */
   configureServer(baseUrl: string, allowSelfSigned: boolean = false): void {
-    this.baseUrl = RustCoreBridge.normalizeServerAddress(baseUrl);
+    const normalizedBase = RustCoreBridge.normalizeServerAddress(baseUrl);
+    const originChanged = normalizedBase !== this.baseUrl;
+    this.baseUrl = normalizedBase;
     this.transport.setBaseUrl(this.baseUrl);
     this.transport.setAllowSelfSigned(allowSelfSigned);
+    if (originChanged) {
+      this.resetImageConfigState(this.baseUrl);
+    }
     CloudflareAccessOAuthManager.shared().hydrateOrigin(this.baseUrl).catch(() => {});
   }
 
@@ -1299,32 +1481,139 @@ export class MoviePilotRepository {
     this.cachedSubscriptions = null;
     this.siteIconCache.clear();
     this.danmakuCommentsCache.clear();
+    this.imageContextReadyOrigin = '';
+    this.imageContextInflight = null;
     this.transport.clearCookies();
   }
 
-  /** 将 TMDB/豆瓣/Bangumi/媒体服务器/本地相对路径解析为可靠可加载图片 URL（自动走 MoviePilot 图片代理）。 */
+  private normalizeExternalImageUrl(rawUrl: string): string {
+    const tmdbHost = (this.tmdbImageDomain || 'image.tmdb.org').trim() || 'image.tmdb.org';
+    let out = rawUrl
+      .replace('https://image.tmdb.org/t/p/original/', `https://${tmdbHost}/t/p/w780/`)
+      .replace('http://image.tmdb.org/t/p/original/', `https://${tmdbHost}/t/p/w780/`)
+      .replace('https://image.tmdb.org/', `https://${tmdbHost}/`)
+      .replace('http://image.tmdb.org/', `https://${tmdbHost}/`)
+      .replace('/t/p/original/', '/t/p/w780/');
+    if (this.bangumiImageDomain.length > 0 && out.includes('lain.bgm.tv')) {
+      out = out
+        .replace('https://lain.bgm.tv/', `https://${this.bangumiImageDomain}/`)
+        .replace('http://lain.bgm.tv/', `https://${this.bangumiImageDomain}/`);
+    }
+    return out;
+  }
+
+  private static isDoubanImageUrl(url: string): boolean {
+    return url.toLowerCase().includes('doubanio.com');
+  }
+
+  private static isBangumiDefaultImageUrl(url: string): boolean {
+    return url.toLowerCase().includes('lain.bgm.tv');
+  }
+
+  private static isMediaServerOrPlainHttpImage(url: string): boolean {
+    const lower = url.toLowerCase();
+    if (lower.startsWith('http://')) {
+      return !lower.includes('://127.0.0.1') && !lower.includes('://localhost');
+    }
+    return (lower.includes('/items/') && lower.includes('/images/')) || lower.includes('/photo/:/transcode');
+  }
+
+  /**
+   * 将 TMDB/豆瓣/Bangumi/媒体服务器/本地相对路径解析为与 Web 端一致的图片 URL：
+   * - 开启 `GLOBAL_IMAGE_CACHE` 时统一走 `/api/v1/system/cache/image?url=...` 复用后端代理与全局文件缓存；
+   * - 关闭 `GLOBAL_IMAGE_CACHE` 时，豆瓣/媒体服务器/HTTP 走 `/system/img/0`，Bangumi 代理走 `/system/img/1`，其余公网 HTTPS 直连并在失败时由加载器自动回退 `/system/img/1`。
+   */
   resolveImageUrl(rawPath: string, useCookies: boolean = false): string {
-    const clean = rawPath.trim();
+    const clean = (rawPath ?? '').trim();
     if (!clean || clean.toLowerCase() === 'null' || clean.toLowerCase() === 'none') { return ''; }
     if (clean.startsWith('data:image/')) { return clean; }
     if (!this.baseUrl) { return clean; }
-    if (clean.startsWith(this.baseUrl)) { return clean; }
+    if (this.transport.isSameOriginUrl(clean)) { return clean; }
     if (clean.startsWith('/api/')) {
       return `${this.baseUrl}${clean}`;
     }
-    const normalized = clean.replace('image.tmdb.org/t/p/original/', 'image.tmdb.org/t/p/w780/');
-    const cookieQuery = useCookies ? '&use_cookies=true' : '';
+    const tmdbHost = (this.tmdbImageDomain || 'image.tmdb.org').trim() || 'image.tmdb.org';
+    let normalized = clean;
     if (normalized.startsWith('/')) {
-      const tmdbFull = `https://image.tmdb.org/t/p/w500${normalized}`;
-      return `${this.baseUrl}/api/v1/system/img/0?imgurl=${encodeURIComponent(tmdbFull)}&cache=true${cookieQuery}`;
+      normalized = `https://${tmdbHost}/t/p/w500${normalized}`;
+    } else if (normalized.startsWith('http://') || normalized.startsWith('https://')) {
+      normalized = this.normalizeExternalImageUrl(normalized);
+    } else {
+      return `${this.baseUrl}/${normalized}`;
     }
-    if (normalized.startsWith('http://') || normalized.startsWith('https://')) {
-      if (normalized.includes('127.0.0.1') || normalized.includes('localhost')) {
-        return normalized;
+
+    if (normalized.includes('://127.0.0.1') || normalized.includes('://localhost')) {
+      return normalized;
+    }
+    if (useCookies) {
+      const cacheFlag = this.globalImageCache ? 'true' : 'false';
+      return `${this.baseUrl}/api/v1/system/img/1?imgurl=${encodeURIComponent(normalized)}&cache=${cacheFlag}&use_cookies=true`;
+    }
+    if (this.globalImageCache) {
+      return `${this.baseUrl}/api/v1/system/cache/image?url=${encodeURIComponent(normalized)}`;
+    }
+    if (MoviePilotRepository.isDoubanImageUrl(normalized) || MoviePilotRepository.isMediaServerOrPlainHttpImage(normalized)) {
+      return `${this.baseUrl}/api/v1/system/img/0?imgurl=${encodeURIComponent(normalized)}&cache=false`;
+    }
+    if (this.bangumiProxyEnable && this.bangumiImageDomain.length === 0 && MoviePilotRepository.isBangumiDefaultImageUrl(normalized)) {
+      return `${this.baseUrl}/api/v1/system/img/1?imgurl=${encodeURIComponent(normalized)}&cache=false`;
+    }
+    return normalized;
+  }
+
+  /** 在 `ensureImageContextReady` 完成后按最新 `GLOBAL_IMAGE_CACHE` / 域名配置修正待请求图片 URL。 */
+  upgradeImageUrlForCurrentConfig(url: string): string {
+    const clean = (url ?? '').trim();
+    if (!clean || !this.baseUrl || clean.startsWith('data:image/')) { return clean; }
+    if (this.transport.isSameOriginUrl(clean)) {
+      if (this.globalImageCache && clean.includes('/api/v1/system/img/') && !clean.includes('use_cookies=true')) {
+        const qIdx = clean.indexOf('?');
+        if (qIdx > 0) {
+          const pairs = clean.substring(qIdx + 1).split('&');
+          for (let i = 0; i < pairs.length; i++) {
+            if (pairs[i].startsWith('imgurl=')) {
+              try {
+                const rawTarget = decodeURIComponent(pairs[i].substring('imgurl='.length));
+                if (rawTarget.startsWith('http://') || rawTarget.startsWith('https://')) {
+                  return `${this.baseUrl}/api/v1/system/cache/image?url=${encodeURIComponent(this.normalizeExternalImageUrl(rawTarget))}`;
+                }
+              } catch {
+                return clean;
+              }
+            }
+          }
+        }
       }
-      return `${this.baseUrl}/api/v1/system/img/0?imgurl=${encodeURIComponent(normalized)}&cache=true${cookieQuery}`;
+      return clean;
     }
-    return `${this.baseUrl}/${normalized}`;
+    if (clean.startsWith('http://') || clean.startsWith('https://')) {
+      return this.resolveImageUrl(clean, false);
+    }
+    return clean;
+  }
+
+  /** 当客户端直连外部图片失败（如无本地代理环境）时，回退至后端带代理图片接口 `/api/v1/system/img/1`。 */
+  buildBackendProxyFallbackUrl(directUrl: string): string {
+    const clean = (directUrl ?? '').trim();
+    if (!clean || !this.baseUrl || this.transport.isSameOriginUrl(clean)) { return ''; }
+    if (!clean.startsWith('http://') && !clean.startsWith('https://')) { return ''; }
+    const cacheFlag = this.globalImageCache ? 'true' : 'false';
+    return `${this.baseUrl}/api/v1/system/img/1?imgurl=${encodeURIComponent(clean)}&cache=${cacheFlag}`;
+  }
+
+  /** 为锁屏播控中心生成始终同源的图片代理/缓存地址。 */
+  private resolveSameOriginArtworkUrl(rawPath: string): string {
+    const resolved = this.resolveImageUrl(rawPath, false);
+    if (!resolved || !this.baseUrl) { return ''; }
+    if (this.transport.isSameOriginUrl(resolved)) { return resolved; }
+    if (resolved.startsWith('http://') || resolved.startsWith('https://')) {
+      if (this.globalImageCache) {
+        return `${this.baseUrl}/api/v1/system/cache/image?url=${encodeURIComponent(resolved)}`;
+      }
+      const routeSeg = MoviePilotRepository.isDoubanImageUrl(resolved) ? '0' : '1';
+      return `${this.baseUrl}/api/v1/system/img/${routeSeg}?imgurl=${encodeURIComponent(resolved)}&cache=false`;
+    }
+    return '';
   }
 
   /** 解析插件图标 URL：兼容绝对地址、`data:image/` 与官方插件仓库相对文件名。 */
@@ -1372,6 +1661,31 @@ export class MoviePilotRepository {
     extraHeaders?: Record<string, string>
   ): Promise<NativeHttpResponse> {
     const url = this.buildEndpointUrlSafe(segments, query, trailingSlash);
+    return this.transport.execute(url, 'GET', this.token, '', 'application/json', extraHeaders);
+  }
+
+  /** 支持同名重复查询参数（如多个 `media_source` 或 `type`）的带鉴权 GET 请求。 */
+  async getMultiQuery(
+    segments: string[],
+    queryPairs: string[][],
+    trailingSlash: boolean = false,
+    extraHeaders?: Record<string, string>
+  ): Promise<NativeHttpResponse> {
+    const cleanBase = RustCoreBridge.normalizeServerAddress(this.baseUrl);
+    const encodedPath = segments.map((s: string) => encodeURIComponent(s)).join('/');
+    let url = `${cleanBase}/api/v1/${encodedPath}${trailingSlash ? '/' : ''}`;
+    if (queryPairs.length > 0) {
+      const encodedPairs: string[] = [];
+      for (let i = 0; i < queryPairs.length; i++) {
+        const kv = queryPairs[i];
+        if (kv.length >= 2 && kv[0].length > 0) {
+          encodedPairs.push(`${encodeURIComponent(kv[0])}=${encodeURIComponent(kv[1])}`);
+        }
+      }
+      if (encodedPairs.length > 0) {
+        url += `?${encodedPairs.join('&')}`;
+      }
+    }
     return this.transport.execute(url, 'GET', this.token, '', 'application/json', extraHeaders);
   }
 
@@ -1491,7 +1805,13 @@ export class MoviePilotRepository {
       // ignore
     }
     try {
-      await this.get(['media', 'source']);
+      await Promise.all([
+        this.get(['media', 'source']).then(() => {}).catch(() => {}),
+        this.refreshGlobalImageSettings()
+      ]);
+      if (this.baseUrl.length > 0) {
+        this.imageContextReadyOrigin = this.baseUrl;
+      }
     } catch {
       // ignore
     }
@@ -1778,29 +2098,86 @@ export class MoviePilotRepository {
     return out;
   }
 
+  /** 拉取后端已启用的媒体搜索数据源目录（`GET /api/v1/media/source`）。 */
+  async fetchMediaSearchSources(): Promise<MpMediaSearchSource[]> {
+    const resp = await this.get(['media', 'source']);
+    if (resp.status !== 200) { return []; }
+    const arr = unwrapArray(parseJsonSafe(resp.body));
+    const out: MpMediaSearchSource[] = [];
+    for (let i = 0; i < arr.length; i++) {
+      const r = asRec(arr[i]);
+      if (!r) { continue; }
+      const src = strVal(r, 'media_source').trim();
+      if (!src) { continue; }
+      const rawName = strVal(r, 'name').trim() || src;
+      const lowerName = rawName.toLowerCase();
+      const displayName = (lowerName === 'tmdb' || lowerName === 'themoviedb') ? 'TheMovieDB' : rawName;
+      const rawTypes = asArr(r['media_types']);
+      const types: string[] = [];
+      for (let k = 0; k < rawTypes.length; k++) {
+        const t = String(rawTypes[k] ?? '').trim();
+        if (t.length > 0 && t !== 'null') {
+          types.push(t);
+        }
+      }
+      out.push({
+        id: src,
+        name: rawName,
+        displayName: displayName,
+        mediaTypes: types.length > 0 ? types : ['电影', '电视剧']
+      });
+    }
+    out.sort((a: MpMediaSearchSource, b: MpMediaSearchSource) => a.displayName.localeCompare(b.displayName));
+    return out;
+  }
+
   /**
-   * 全局多域检索（修复 V3 参数契约）：
-   * - `library`：`GET /api/v1/mediaserver/search?keyword=...`
+   * 全局多域检索（对齐 V3 多选来源与媒体库类型筛选契约）：
+   * - `library`：`GET /api/v1/mediaserver/search?keyword=...&type=...`
    * - `media` / `person` / `collection` / `music`：`GET /api/v1/media/search?title=...&type=...&media_source=...`
    */
-  async searchMedia(keyword: string, kind: string = 'media', mediaSource: string = ''): Promise<MpMediaItem[]> {
+  async searchMedia(
+    keyword: string,
+    kind: string = 'media',
+    mediaSource: string = '',
+    mediaSources: string[] = [],
+    libraryTypes: string[] = []
+  ): Promise<MpMediaItem[]> {
     const cleanKw = keyword.trim();
     if (!cleanKw) { return []; }
-    const q: Record<string, string> = {};
-    let segments: string[] = ['media', 'search'];
+    let resp: NativeHttpResponse;
     if (kind === 'library') {
-      segments = ['mediaserver', 'search'];
-      q['keyword'] = cleanKw;
-    } else {
-      segments = ['media', 'search'];
-      q['title'] = cleanKw;
-      q['type'] = kind || 'media';
-      const src = mediaSource.trim() || (kind === 'music' ? 'musicbrainz' : '');
-      if (src.length > 0) {
-        q['media_source'] = src;
+      const pairs: string[][] = [['keyword', cleanKw], ['limit', '40']];
+      for (let i = 0; i < libraryTypes.length; i++) {
+        const t = libraryTypes[i].trim();
+        if (t.length > 0) {
+          pairs.push(['type', t]);
+        }
       }
+      resp = await this.getMultiQuery(['mediaserver', 'search'], pairs);
+    } else {
+      const pairs: string[][] = [
+        ['title', cleanKw],
+        ['type', kind || 'media'],
+        ['page', '1'],
+        ['count', '20']
+      ];
+      const mergedSources: string[] = [];
+      for (let i = 0; i < mediaSources.length; i++) {
+        const s = mediaSources[i].trim();
+        if (s.length > 0 && !mergedSources.includes(s)) {
+          mergedSources.push(s);
+        }
+      }
+      if (mergedSources.length === 0 && mediaSource.trim().length > 0) {
+        mergedSources.push(mediaSource.trim());
+      }
+      mergedSources.sort();
+      for (let i = 0; i < mergedSources.length; i++) {
+        pairs.push(['media_source', mergedSources[i]]);
+      }
+      resp = await this.getMultiQuery(['media', 'search'], pairs);
     }
-    const resp = await this.get(segments, q);
     if (resp.status !== 200) { return []; }
     const arr = unwrapArray(parseJsonSafe(resp.body));
     const out: MpMediaItem[] = [];
@@ -1842,20 +2219,55 @@ export class MoviePilotRepository {
     if (!cleanTmdb) { return []; }
     const resp = await this.get(['tmdb', 'seasons', cleanTmdb]);
     if (resp.status !== 200) { return []; }
-    const arr = unwrapArray(parseJsonSafe(resp.body));
+    return this.parseSeasonInfoArray(unwrapArray(parseJsonSafe(resp.body)));
+  }
+
+  /** 按任意数据源身份拉取剧集全部季信息（优先 TMDB，回落 `/api/v1/media/seasons`）。 */
+  async fetchMediaSeasonsForItem(item: MpMediaItem): Promise<MpSeasonInfo[]> {
+    if (item.tmdbId && item.tmdbId.trim().length > 0) {
+      const tmdbList = await this.fetchMediaSeasons(item.tmdbId);
+      if (tmdbList.length > 0) { return tmdbList; }
+    }
+    const resolved = this.resolveCanonicalMediaIdentity(item);
+    const q: Record<string, string> = {};
+    if (resolved.mediaSource.length > 0 && resolved.rawMediaId.length > 0) {
+      q['media_source'] = resolved.mediaSource;
+      q['media_id'] = resolved.rawMediaId;
+    } else if (item.title.trim().length > 0) {
+      q['title'] = item.title.trim();
+      if (item.year.trim().length > 0) {
+        q['year'] = item.year.trim();
+      }
+    } else {
+      return [];
+    }
+    const resp = await this.get(['media', 'seasons'], q);
+    if (resp.status !== 200) { return []; }
+    return this.parseSeasonInfoArray(unwrapArray(parseJsonSafe(resp.body)));
+  }
+
+  private parseSeasonInfoArray(arr: Object[]): MpSeasonInfo[] {
     const out: MpSeasonInfo[] = [];
     for (let i = 0; i < arr.length; i++) {
       const r = asRec(arr[i]);
       if (!r) { continue; }
+      const sn = Math.round(numVal(r, 'season_number', i + 1));
+      if (sn < 0) { continue; }
+      const fallbackName = sn === 0 ? '特别篇' : `第 ${sn} 季`;
       out.push({
-        seasonNumber: numVal(r, 'season_number', i + 1),
-        name: strVal(r, 'name', `第 ${i + 1} 季`),
-        episodeCount: numVal(r, 'episode_count', 0),
+        seasonNumber: sn,
+        name: strVal(r, 'name', fallbackName) || fallbackName,
+        episodeCount: Math.round(numVal(r, 'episode_count', 0)),
         airDate: strVal(r, 'air_date'),
         posterUrl: this.resolveImageUrl(strVal(r, 'poster_path')),
         overview: strVal(r, 'overview')
       });
     }
+    out.sort((a: MpSeasonInfo, b: MpSeasonInfo) => {
+      if (a.seasonNumber === 0 && b.seasonNumber !== 0) { return 1; }
+      if (b.seasonNumber === 0 && a.seasonNumber !== 0) { return -1; }
+      return a.seasonNumber - b.seasonNumber;
+    });
     return out;
   }
 
@@ -1871,23 +2283,159 @@ export class MoviePilotRepository {
     }
     const resp = await this.get(['tmdb', cleanTmdb, String(Math.max(0, Math.round(seasonNumber)))], q);
     if (resp.status !== 200) { return []; }
-    const arr = unwrapArray(parseJsonSafe(resp.body));
+    return this.parseEpisodeInfoArray(unwrapArray(parseJsonSafe(resp.body)), cleanTmdb, seasonNumber);
+  }
+
+  /** 智能拉取指定季分集元数据（优先 TMDB，回落已入库条目的 `/api/v1/mediaserver/episode-metadata`）。 */
+  async fetchSeasonEpisodesSmart(
+    item: MpMediaItem,
+    seasonNumber: number,
+    seriesItemId: string = '',
+    server: string = ''
+  ): Promise<MpTmdbEpisodeItem[]> {
+    if (item.tmdbId && item.tmdbId.trim().length > 0) {
+      const eps = await this.fetchTmdbSeasonEpisodes(item.tmdbId, seasonNumber);
+      if (eps.length > 0) { return eps; }
+    }
+    const sid = seriesItemId.trim();
+    if (sid.length > 0) {
+      const q: Record<string, string> = {};
+      q['itemid'] = sid;
+      q['season'] = String(Math.max(0, Math.round(seasonNumber)));
+      if (server.trim().length > 0) {
+        q['server'] = server.trim();
+      }
+      const resp = await this.get(['mediaserver', 'episode-metadata'], q);
+      if (resp.status === 200) {
+        const parsed = this.parseEpisodeInfoArray(unwrapArray(parseJsonSafe(resp.body)), sid, seasonNumber);
+        if (parsed.length > 0) { return parsed; }
+      }
+    }
+    return [];
+  }
+
+  private parseEpisodeInfoArray(arr: Object[], keySeed: string, seasonNumber: number): MpTmdbEpisodeItem[] {
     const out: MpTmdbEpisodeItem[] = [];
     for (let i = 0; i < arr.length; i++) {
       const r = asRec(arr[i]);
       if (!r) { continue; }
       const epNo = Math.round(numVal(r, 'episode_number', i + 1));
       out.push({
-        id: strVal(r, 'id', `${cleanTmdb}_${seasonNumber}_${epNo}`),
+        id: strVal(r, 'id', `${keySeed}_${seasonNumber}_${epNo}`),
         seasonNumber: Math.round(numVal(r, 'season_number', seasonNumber)),
         episodeNumber: epNo,
-        title: strVal(r, 'name', `第 ${epNo} 集`),
+        title: strVal(r, 'name', `第 ${epNo} 集`) || `第 ${epNo} 集`,
         overview: strVal(r, 'overview'),
         airDate: strVal(r, 'air_date'),
         runtimeMinutes: Math.round(numVal(r, 'runtime', 0)),
         vote: numVal(r, 'vote_average', 0),
         stillUrl: this.resolveImageUrl(strVal(r, 'still_path'))
       });
+    }
+    out.sort((a: MpTmdbEpisodeItem, b: MpTmdbEpisodeItem) => a.episodeNumber - b.episodeNumber);
+    return out;
+  }
+
+  /** 查询已入库电视剧各季可播放单集映射（`GET /api/v1/mediaserver/episodes?itemid=...`）。 */
+  async fetchPlayableSeriesEpisodes(seriesItemId: string, server: string = ''): Promise<Record<string, Record<string, string>>> {
+    const sid = seriesItemId.trim();
+    const out: Record<string, Record<string, string>> = {};
+    if (!sid) { return out; }
+    const q: Record<string, string> = {};
+    q['itemid'] = sid;
+    if (server.trim().length > 0) {
+      q['server'] = server.trim();
+    }
+    const resp = await this.get(['mediaserver', 'episodes'], q);
+    if (resp.status < 200 || resp.status >= 300) { return out; }
+    const root = unwrapObject(parseJsonSafe(resp.body));
+    if (!root) { return out; }
+    const seasonKeys = Object.keys(root);
+    for (let i = 0; i < seasonKeys.length; i++) {
+      const sKey = seasonKeys[i];
+      const epRec = asRec(root[sKey]);
+      if (!epRec) { continue; }
+      const inner: Record<string, string> = {};
+      const epKeys = Object.keys(epRec);
+      let count = 0;
+      for (let j = 0; j < epKeys.length; j++) {
+        const eKey = epKeys[j];
+        const epId = String(epRec[eKey] ?? '').trim();
+        if (epId.length > 0 && epId !== 'null') {
+          inner[eKey] = epId;
+          count += 1;
+        }
+      }
+      if (count > 0) {
+        out[sKey] = inner;
+      }
+    }
+    return out;
+  }
+
+  /** 查询指定季的可播放单集映射（`GET /api/v1/mediaserver/episodes/{itemid}/{season}`）。 */
+  async fetchPlayableSeasonEpisodes(seriesItemId: string, seasonNumber: number, server: string = ''): Promise<Record<string, string>> {
+    const sid = seriesItemId.trim();
+    const out: Record<string, string> = {};
+    if (!sid) { return out; }
+    const q: Record<string, string> = {};
+    if (server.trim().length > 0) {
+      q['server'] = server.trim();
+    }
+    const resp = await this.get(['mediaserver', 'episodes', sid, String(Math.max(0, Math.round(seasonNumber)))], q);
+    if (resp.status < 200 || resp.status >= 300) { return out; }
+    const root = unwrapObject(parseJsonSafe(resp.body));
+    if (!root) { return out; }
+    const epKeys = Object.keys(root);
+    for (let i = 0; i < epKeys.length; i++) {
+      const eKey = epKeys[i];
+      const epId = String(root[eKey] ?? '').trim();
+      if (epId.length > 0 && epId !== 'null') {
+        out[eKey] = epId;
+      }
+    }
+    return out;
+  }
+
+  /** 查询远程媒体服务器已入库的季集编号（`POST /api/v1/mediaserver/exists_remote`）。 */
+  async fetchRemoteExistingEpisodes(item: MpMediaItem, seasonNumber?: number): Promise<Record<string, number[]>> {
+    const out: Record<string, number[]> = {};
+    const resolved = this.resolveCanonicalMediaIdentity(item);
+    const payload: Record<string, Object> = {};
+    payload['type'] = '电视剧';
+    payload['title'] = item.title.trim();
+    if (item.year.trim().length > 0) {
+      payload['year'] = item.year.trim();
+    }
+    if (seasonNumber !== undefined && seasonNumber >= 0) {
+      payload['season'] = Math.round(seasonNumber);
+    }
+    if (resolved.mediaSource.length > 0 && resolved.rawMediaId.length > 0) {
+      payload['media_source'] = resolved.mediaSource;
+      payload['media_id'] = resolved.rawMediaId;
+    }
+    const cleanTmdb = Number(stripKnownMediaPrefix(item.tmdbId));
+    if (Number.isFinite(cleanTmdb) && cleanTmdb > 0) {
+      payload['tmdbid'] = Math.round(cleanTmdb);
+    }
+    const resp = await this.postJson(['mediaserver', 'exists_remote'], JSON.stringify(payload));
+    if (resp.status < 200 || resp.status >= 300) { return out; }
+    const root = unwrapObject(parseJsonSafe(resp.body));
+    if (!root) { return out; }
+    const sKeys = Object.keys(root);
+    for (let i = 0; i < sKeys.length; i++) {
+      const sKey = sKeys[i];
+      const arr = asArr(root[sKey]);
+      const nums: number[] = [];
+      for (let j = 0; j < arr.length; j++) {
+        const n = Number(arr[j]);
+        if (Number.isFinite(n) && n > 0) {
+          nums.push(Math.round(n));
+        }
+      }
+      if (nums.length > 0) {
+        out[sKey] = nums;
+      }
     }
     return out;
   }
@@ -2193,8 +2741,9 @@ export class MoviePilotRepository {
   }
 
   /** 拉取真实 `/api/v1/github/community` 社区勋章并映射解锁条件、贡献记录与佩戴状态。 */
-  async fetchCommunityMedals(): Promise<MpCommunityState> {
-    const resp = await this.get(['github', 'community']);
+  async fetchCommunityMedals(refresh: boolean = false): Promise<MpCommunityState> {
+    const scope = this.accountStorageScope();
+    const resp = await this.get(['github', 'community'], refresh ? { 'refresh': 'true' } : {});
     const out: MpCommunityState = {
       githubLogin: this.userName || 'MoviePilot',
       earnedCount: 0,
@@ -2212,7 +2761,7 @@ export class MoviePilotRepository {
     } else if (userRec) {
       out.githubLogin = strVal(userRec, 'login', out.githubLogin);
     }
-    const globalWorn = strVal(root, 'worn_medal') || strVal(root, 'wearing') || (userRec ? strVal(userRec, 'worn_medal') : '');
+    const globalWorn = scope.length > 0 ? await NativeHuksStore.shared().loadUsagePreference('mp_worn_medal_v2_' + scope) : '';
     if (globalWorn.length > 0) {
       out.wornMedalId = globalWorn;
     }
@@ -2254,7 +2803,7 @@ export class MoviePilotRepository {
       const title = strVal(m, 'name') || strVal(m, 'title') || (titleMap[id] ?? id);
       const sub = strVal(m, 'description') || strVal(m, 'tier_label') || (isTiered ? `Tier ${tier}` : '荣耀勋章');
       const dateStr = strVal(m, 'at') || strVal(m, 'earned_at') || strVal(m, 'date') || '2026-11';
-      const isWorn = boolVal(m, 'worn', boolVal(m, 'is_worn', globalWorn === id));
+      const isWorn = earned && globalWorn === id;
       if (isWorn && (!out.wornMedalId || out.wornMedalId.length === 0)) {
         out.wornMedalId = id;
       }
@@ -2293,20 +2842,23 @@ export class MoviePilotRepository {
     return out;
   }
 
-  /** 佩戴或取消佩戴指定社区勋章（`POST /api/v1/github/medals/wear`）。 */
+  /** 按实例和本地账号隔离偏好，不调用不存在的服务端佩戴接口。 */
   async wearCommunityMedal(medalId: string): Promise<boolean> {
-    const payloadObj: Record<string, string> = {};
-    payloadObj['medal'] = medalId;
-    payloadObj['medal_id'] = medalId;
-    payloadObj['key'] = medalId;
-    const resp = await this.postJson(['github', 'medals', 'wear'], JSON.stringify(payloadObj));
-    return resp.status >= 200 && resp.status < 300;
+    if (this.token.length === 0 || this.userName.length === 0) { return false; }
+    const scope = this.accountStorageScope();
+    if (scope.length === 0) { return false; }
+    const state = await this.fetchCommunityMedals();
+    if (scope !== this.accountStorageScope()) { return false; }
+    if (medalId.length > 0 && !state.medals.some((medal: MpCommunityMedal) => medal.id === medalId && medal.earned)) {
+      return false;
+    }
+    await NativeHuksStore.shared().saveUsagePreference('mp_worn_medal_v2_' + scope, medalId);
+    return true;
   }
 
-  /** 刷新 GitHub 社区勋章同步状态（`POST /api/v1/github/medals/refresh`）。 */
+  /** 当前真实后端通过 refresh 查询参数强制同步社区资料。 */
   async refreshCommunityMedals(): Promise<MpCommunityState> {
-    await this.postJson(['github', 'medals', 'refresh'], '{}');
-    return this.fetchCommunityMedals();
+    return this.fetchCommunityMedals(true);
   }
 
   private parseSubscribeRecord(r: Record<string, Object> | null): MpSubscribeItem | null {
@@ -2351,6 +2903,7 @@ export class MoviePilotRepository {
       customWords: strVal(r, 'custom_words'),
       searchImdbid: boolVal(r, 'search_imdbid', false),
       interval: numVal(r, 'interval', numVal(r, 'search_interval', 0)),
+      date: strVal(r, 'date'),
       rawJson: JSON.stringify(r)
     };
   }
@@ -2469,34 +3022,52 @@ export class MoviePilotRepository {
     return this.toggleSubscribeStatus(sub);
   }
 
-  /** 拉取真实追剧日历排期（`GET /api/v1/subscribe/calendar`）。 */
+  /** 使用本地日期格式，避免 UTC 转换令日历窗口偏移一天。 */
+  private calendarDate(date: Date): string {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  }
+
+  /** 读取未来 31 天的分页日历，按真实嵌套订阅和分集响应展开。 */
   async fetchSubscribeCalendar(): Promise<MpCalendarEpisodeItem[]> {
-    const resp = await this.get(['subscribe', 'calendar']);
-    if (resp.status !== 200) { return []; }
-    const arr = unwrapArray(parseJsonSafe(resp.body));
+    const start = new Date();
+    const end = new Date(start.getTime());
+    end.setDate(end.getDate() + 31);
+    const subscriptions = await this.fetchSubscriptions();
     const out: MpCalendarEpisodeItem[] = [];
-    for (let i = 0; i < arr.length; i++) {
-      const r = asRec(arr[i]);
-      if (!r) { continue; }
-      const showTitle = strVal(r, 'show_name') || strVal(r, 'title') || strVal(r, 'name');
-      const epTitle = strVal(r, 'episode_name') || strVal(r, 'subtitle') || '';
-      const airDate = strVal(r, 'air_date') || strVal(r, 'release_date') || '';
-      const sn = Math.round(numVal(r, 'season_number', numVal(r, 'season', 1)));
-      const en = Math.round(numVal(r, 'episode_number', numVal(r, 'episode', 1)));
-      const posterRaw = strVal(r, 'poster_path') || strVal(r, 'poster') || strVal(r, 'still_path') || strVal(r, 'backdrop');
-      out.push({
-        id: `${showTitle}_${sn}_${en}_${i}`,
-        title: showTitle,
-        episodeTitle: epTitle,
-        airDate: airDate,
-        seasonNumber: sn,
-        episodeNumber: en,
-        posterUrl: this.resolveImageUrl(posterRaw),
-        overview: strVal(r, 'overview') || strVal(r, 'description'),
-        tmdbId: strVal(r, 'tmdb_id') || strVal(r, 'tmdbid')
-      });
+    let page = 1;
+    let consumed = 0;
+    while (true) {
+      const query: Record<string, string> = {
+        'start': this.calendarDate(start), 'end': this.calendarDate(end), 'page': String(page), 'count': '200'
+      };
+      const resp = await this.get(['subscribe', 'calendar'], query);
+      if (resp.status !== 200) { throw new Error(`加载日历失败（HTTP ${resp.status}）`); }
+      const root = unwrapObject(parseJsonSafe(resp.body));
+      if (!root) { throw new Error('日历响应格式无效'); }
+      const events = asArr(root['items']);
+      for (let i = 0; i < events.length; i++) {
+        const event = asRec(events[i]);
+        const sub = event ? asRec(event['subscribe']) : null;
+        if (!sub) { continue; }
+        const details = subscriptions.find((item: MpSubscribeItem) => item.id === numVal(sub, 'id'));
+        const episodes = event ? asArr(event['episodes']) : [];
+        const count = Math.max(1, episodes.length);
+        for (let j = 0; j < count; j++) {
+          const ep = j < episodes.length ? asRec(episodes[j]) : null;
+          const episodeNumber = numVal(ep, 'episode_number', 0);
+          out.push({
+            id: `${numVal(sub, 'id')}_${strVal(event, 'date')}_${episodeNumber}`, subscribeId: numVal(sub, 'id'),
+            title: strVal(sub, 'name'), episodeTitle: strVal(ep, 'name'),
+            airDate: strVal(event, 'date'), seasonNumber: numVal(sub, 'season', 1),
+            episodeNumber: episodeNumber, posterUrl: this.resolveImageUrl(strVal(sub, 'poster')),
+            overview: details ? details.description : '', tmdbId: details ? strVal(asRec(parseJsonSafe(details.rawJson ?? '{}')), 'tmdbid') : ''
+          });
+        }
+      }
+      consumed += events.length;
+      if (events.length === 0 || consumed >= numVal(root, 'total')) { break; }
+      page++;
     }
-    out.sort((a: MpCalendarEpisodeItem, b: MpCalendarEpisodeItem) => a.airDate.localeCompare(b.airDate));
     return out;
   }
 
@@ -2580,6 +3151,44 @@ export class MoviePilotRepository {
     return out;
   }
 
+  /** 解析单条站点资源上下文（完整保留 9 维元数据供 Rust 筛选与分组引擎消费）。 */
+  private parseResourceRecord(r: Record<string, Object>): MpResourceItem {
+    const ti = asRec(r['torrent_info']) ?? r;
+    const mi = asRec(r['meta_info']);
+    const rawLabels = asArr(ti['labels']);
+    const labels: string[] = [];
+    for (let k = 0; k < rawLabels.length; k++) {
+      const lbl = String(rawLabels[k] ?? '').trim();
+      if (lbl.length > 0 && lbl !== 'null') {
+        labels.push(lbl);
+      }
+    }
+    return {
+      title: strVal(ti, 'title') || strVal(r, 'title'),
+      description: strVal(ti, 'description'),
+      siteName: strVal(ti, 'site_name', '未知站点'),
+      sizeBytes: Math.round(numVal(ti, 'size', 0)),
+      seeders: Math.round(numVal(ti, 'seeders', 0)),
+      peers: Math.round(numVal(ti, 'peers', 0)),
+      resolution: strVal(mi, 'resource_pix') || strVal(ti, 'resource_pix'),
+      resourceType: strVal(mi, 'resource_type') || strVal(ti, 'resource_type'),
+      videoEncode: strVal(mi, 'video_encode') || strVal(ti, 'video_encode'),
+      volumeFactor: strVal(ti, 'volume_factor'),
+      enclosure: strVal(ti, 'enclosure'),
+      pageUrl: strVal(ti, 'page_url'),
+      siteId: Math.round(numVal(ti, 'site', 0)),
+      pubdate: strVal(ti, 'pubdate'),
+      edition: strVal(mi, 'edition') || strVal(ti, 'edition'),
+      audioEncode: strVal(mi, 'audio_encode') || strVal(ti, 'audio_encode'),
+      resourceTeam: strVal(mi, 'resource_team') || strVal(ti, 'resource_team'),
+      seasonEpisode: strVal(mi, 'season_episode'),
+      labels: labels,
+      downloadVolumeFactor: numVal(ti, 'downloadvolumefactor', -1),
+      uploadVolumeFactor: numVal(ti, 'uploadvolumefactor', -1),
+      rawJson: JSON.stringify(r)
+    };
+  }
+
   async fetchCachedResources(): Promise<MpResourceItem[]> {
     const resp = await this.get(['search', 'last']);
     if (resp.status !== 200) { return []; }
@@ -2588,25 +3197,7 @@ export class MoviePilotRepository {
     for (let i = 0; i < arr.length; i++) {
       const r = asRec(arr[i]);
       if (!r) { continue; }
-      const ti = asRec(r['torrent_info']) ?? r;
-      const mi = asRec(r['meta_info']);
-      out.push({
-        title: strVal(ti, 'title') || strVal(r, 'title'),
-        description: strVal(ti, 'description'),
-        siteName: strVal(ti, 'site_name', '未知站点'),
-        sizeBytes: Math.round(numVal(ti, 'size', 0)),
-        seeders: Math.round(numVal(ti, 'seeders', 0)),
-        peers: Math.round(numVal(ti, 'peers', 0)),
-        resolution: strVal(mi, 'resource_pix') || strVal(ti, 'resource_pix'),
-        resourceType: strVal(mi, 'resource_type') || strVal(ti, 'resource_type'),
-        videoEncode: strVal(mi, 'video_encode'),
-        volumeFactor: strVal(ti, 'volume_factor'),
-        enclosure: strVal(ti, 'enclosure'),
-        pageUrl: strVal(ti, 'page_url'),
-        siteId: Math.round(numVal(ti, 'site', 0)),
-        pubdate: strVal(ti, 'pubdate'),
-        rawJson: JSON.stringify(r)
-      });
+      out.push(this.parseResourceRecord(r));
     }
     return out;
   }
@@ -2830,16 +3421,94 @@ export class MoviePilotRepository {
   async fetchPlugins(state: string = 'installed'): Promise<MpPluginItem[]> {
     const q: Record<string, string> = {};
     q['state'] = state;
+    const remotesPromise: Promise<Set<string>> = state === 'installed'
+      ? this.get(['plugin', 'remotes'], { 'token': 'moviepilot' })
+        .then((remResp) => {
+          const ids = new Set<string>();
+          if (remResp.status === 200) {
+            const remArr = unwrapArray(parseJsonSafe(remResp.body));
+            for (let j = 0; j < remArr.length; j++) {
+              const remRec = asRec(remArr[j]);
+              if (!remRec) { continue; }
+              const rid = strVal(remRec, 'id').toLowerCase();
+              const rsrc = strVal(remRec, 'source_plugin_id').toLowerCase();
+              if (rid.length > 0) { ids.add(rid); }
+              if (rsrc.length > 0) { ids.add(rsrc); }
+            }
+          }
+          return ids;
+        })
+        .catch(() => new Set<string>())
+      : Promise.resolve(new Set<string>());
+    const statsPromise: Promise<Map<string, number>> = state === 'market'
+      ? this.get(['plugin', 'statistic'])
+        .then((stResp) => {
+          const counts = new Map<string, number>();
+          if (stResp.status === 200) {
+            const stObj = unwrapObject(parseJsonSafe(stResp.body));
+            if (stObj) {
+              const keys = Object.keys(stObj);
+              for (let j = 0; j < keys.length; j++) {
+                const k = keys[j];
+                const cnt = numVal(stObj, k, 0);
+                if (cnt > 0) { counts.set(k.toLowerCase(), Math.round(cnt)); }
+              }
+            }
+          }
+          return counts;
+        })
+        .catch(() => new Map<string, number>())
+      : Promise.resolve(new Map<string, number>());
+    const ratingsPromise: Promise<Map<string, number>> = state === 'market'
+      ? this.get(['plugin', 'rating'])
+        .then((rtResp) => {
+          const avgMap = new Map<string, number>();
+          if (rtResp.status === 200) {
+            const rtObj = unwrapObject(parseJsonSafe(rtResp.body));
+            if (rtObj) {
+              const keys = Object.keys(rtObj);
+              for (let j = 0; j < keys.length; j++) {
+                const k = keys[j];
+                const entry = asRec(rtObj[k]);
+                if (entry) {
+                  const avg = numVal(entry, 'average_rating', 0);
+                  if (avg > 0) { avgMap.set(k.toLowerCase(), avg); }
+                }
+              }
+            }
+          }
+          return avgMap;
+        })
+        .catch(() => new Map<string, number>())
+      : Promise.resolve(new Map<string, number>());
+
     const resp = await this.get(['plugin'], q, true);
+    const remoteVueIds = await remotesPromise;
+    const statsMap = await statsPromise;
+    const ratingsMap = await ratingsPromise;
     if (resp.status !== 200) { return []; }
     const arr = unwrapArray(parseJsonSafe(resp.body));
     const out: MpPluginItem[] = [];
     for (let i = 0; i < arr.length; i++) {
       const r = asRec(arr[i]);
       if (!r) { continue; }
+      const pid = strVal(r, 'id');
+      if (!pid) { continue; }
+      const lowerId = pid.toLowerCase();
+      const srcId = strVal(r, 'source_plugin_id').toLowerCase();
+      const rawMode = strVal(r, 'render_mode', 'vuetify');
+      const resolvedMode = (rawMode.toLowerCase() === 'vue'
+        || remoteVueIds.has(lowerId)
+        || (srcId.length > 0 && remoteVueIds.has(srcId)))
+        ? 'vue'
+        : rawMode;
+      const rawInstalls = Math.round(numVal(r, 'install_count', 0));
+      const statInstalls = Math.max(statsMap.get(lowerId) ?? 0, srcId.length > 0 ? (statsMap.get(srcId) ?? 0) : 0);
+      const rawRating = numVal(r, 'average_rating', 0);
+      const mergedRating = rawRating > 0 ? rawRating : (ratingsMap.get(lowerId) ?? (srcId.length > 0 ? (ratingsMap.get(srcId) ?? 0) : 0));
       out.push({
-        id: strVal(r, 'id'),
-        pluginName: strVal(r, 'plugin_name') || strVal(r, 'id'),
+        id: pid,
+        pluginName: strVal(r, 'plugin_name') || pid,
         pluginDesc: strVal(r, 'plugin_desc'),
         pluginVersion: strVal(r, 'plugin_version'),
         pluginAuthor: strVal(r, 'plugin_author'),
@@ -2847,18 +3516,23 @@ export class MoviePilotRepository {
         state: boolVal(r, 'state', false),
         hasPage: boolVal(r, 'has_page', false),
         iconUrl: this.resolvePluginIconUrl(strVal(r, 'plugin_icon')),
-        renderMode: strVal(r, 'render_mode', 'vuetify'),
-        repoUrl: strVal(r, 'repo_url')
+        renderMode: resolvedMode,
+        repoUrl: strVal(r, 'repo_url'),
+        hasUpdate: boolVal(r, 'has_update', false),
+        installCount: Math.max(rawInstalls, statInstalls),
+        addTime: Math.round(numVal(r, 'add_time', 0)),
+        averageRating: mergedRating,
+        pluginLabel: strVal(r, 'plugin_label')
       });
     }
     return out;
   }
 
-  /** 从插件市场安装插件（`GET /api/v1/plugin/install/{pluginId}`）。 */
-  async installPlugin(pluginId: string, repoUrl: string = ''): Promise<boolean> {
+  /** 从插件市场安装或更新/重装插件（`GET /api/v1/plugin/install/{pluginId}`）。 */
+  async installPlugin(pluginId: string, repoUrl: string = '', force: boolean = false): Promise<boolean> {
     const q: Record<string, string> = {};
     if (repoUrl.length > 0) { q['repo_url'] = repoUrl; }
-    q['force'] = 'false';
+    q['force'] = force ? 'true' : 'false';
     const resp = await this.get(['plugin', 'install', pluginId], q);
     return resp.status >= 200 && resp.status < 300;
   }
@@ -2873,6 +3547,195 @@ export class MoviePilotRepository {
   async resetPlugin(pluginId: string): Promise<boolean> {
     const resp = await this.get(['plugin', 'reset', pluginId]);
     return resp.status >= 200 && resp.status < 300;
+  }
+
+  /** 重新加载插件运行时（`POST /api/v1/plugin/reload/{pluginId}`）。 */
+  async reloadPlugin(pluginId: string): Promise<MpOperationOutcome> {
+    const resp = await this.postJson(['plugin', 'reload', pluginId], '{}');
+    const rec = asRec(parseJsonSafe(resp.body));
+    const ok = rec && rec['success'] !== undefined
+      ? boolVal(rec, 'success', false)
+      : (resp.status >= 200 && resp.status < 300);
+    const msg = strVal(rec, 'message') || (ok ? '插件已重新加载' : '重新加载插件失败，请查看插件日志');
+    return { ok: ok, message: msg };
+  }
+
+  /** 读取有限插件日志快照；正数 length 会开启持续 SSE，使用 -1 后在本地截取最新行。 */
+  async fetchPluginLogs(pluginId: string, length: number = 200): Promise<string[]> {
+    const cleanId = (pluginId ?? '').trim().toLowerCase();
+    if (!cleanId || cleanId.includes('..') || cleanId.includes('/')) {
+      return [];
+    }
+    const q: Record<string, string> = {};
+    q['length'] = '-1';
+    q['logfile'] = `plugins/${cleanId}.log`;
+    const resp = await this.get(['system', 'logging'], q);
+    if (resp.status < 200 || resp.status >= 300) {
+      return [];
+    }
+    const raw = (resp.body ?? '').trim();
+    if (!raw) {
+      return [];
+    }
+    let textContent = raw;
+    const parsed = parseJsonSafe(raw);
+    if (typeof parsed === 'string') {
+      textContent = parsed;
+    } else {
+      const rec = asRec(parsed);
+      if (rec && typeof rec['data'] === 'string') {
+        textContent = rec['data'] as string;
+      }
+    }
+    return textContent
+      .split(/\r?\n/)
+      .map((ln: string) => ln.trimEnd())
+      .filter((ln: string) => ln.trim().length > 0)
+      .slice(0, Math.max(20, Math.min(500, Math.trunc(length))));
+  }
+
+  /** 拉取插件动态注册的推荐榜单来源列表（`GET /api/v1/recommend/source`）。 */
+  async fetchRecommendSources(): Promise<MpRecommendSource[]> {
+    const resp = await this.get(['recommend', 'source']);
+    if (resp.status < 200 || resp.status >= 300) {
+      return [];
+    }
+    const arr = unwrapArray(parseJsonSafe(resp.body));
+    const seen = new Set<string>();
+    const out: MpRecommendSource[] = [];
+    for (let i = 0; i < arr.length; i++) {
+      const r = asRec(arr[i]);
+      if (!r) { continue; }
+      const name = strVal(r, 'name').trim();
+      const safePath = this.sanitizeRelativeRecommendApiPath(strVal(r, 'api_path'));
+      if (!name || !safePath || seen.has(safePath)) { continue; }
+      seen.add(safePath);
+      out.push({
+        name: name,
+        apiPath: safePath,
+        type: strVal(r, 'type').trim()
+      });
+    }
+    return out;
+  }
+
+  /** 按受控相对 `api_path` 拉取插件推荐榜单媒体条目（严禁外部 URL 与 `..` 路径穿越）。 */
+  async fetchRecommendByApiPath(apiPath: string, page: number = 1): Promise<MpMediaItem[]> {
+    const safe = this.sanitizeRelativeRecommendApiPath(apiPath);
+    if (!safe) { return []; }
+    const qIdx = safe.indexOf('?');
+    const pathPart = qIdx >= 0 ? safe.substring(0, qIdx) : safe;
+    const queryPart = qIdx >= 0 ? safe.substring(qIdx + 1) : '';
+    const segments: string[] = [];
+    const rawSegs = pathPart.split('/');
+    for (let i = 0; i < rawSegs.length; i++) {
+      if (!rawSegs[i]) { continue; }
+      let dec = rawSegs[i];
+      try { dec = decodeURIComponent(rawSegs[i]); } catch { /* keep raw */ }
+      if (!dec || dec === '.' || dec === '..' || dec.includes('/') || dec.includes('\\')) {
+        return [];
+      }
+      segments.push(dec);
+    }
+    if (segments.length === 0) { return []; }
+    const pairs: string[][] = [];
+    if (queryPart.length > 0) {
+      const rawPairs = queryPart.split('&');
+      for (let i = 0; i < rawPairs.length; i++) {
+        const kv = rawPairs[i];
+        if (!kv) { continue; }
+        const eqIdx = kv.indexOf('=');
+        const kRaw = eqIdx >= 0 ? kv.substring(0, eqIdx) : kv;
+        const vRaw = eqIdx >= 0 ? kv.substring(eqIdx + 1) : '';
+        let k = kRaw;
+        let v = vRaw;
+        try { k = decodeURIComponent(kRaw); } catch { /* keep */ }
+        try { v = decodeURIComponent(vRaw); } catch { /* keep */ }
+        if (k.length > 0 && (page <= 1 || k !== 'page')) {
+          pairs.push([k, v]);
+        }
+      }
+    }
+    if (page > 1) {
+      pairs.push(['page', String(Math.trunc(page))]);
+    }
+    const resp = await this.getMultiQuery(segments, pairs);
+    if (resp.status < 200 || resp.status >= 300) {
+      return [];
+    }
+    const arr = unwrapArray(parseJsonSafe(resp.body));
+    const lowerPath = pathPart.toLowerCase();
+    const fallbackSrc = lowerPath.includes('douban')
+      ? 'douban'
+      : (lowerPath.includes('bangumi') ? 'bangumi' : (lowerPath.includes('imdb') ? 'imdb' : 'themoviedb'));
+    const out: MpMediaItem[] = [];
+    for (let i = 0; i < arr.length; i++) {
+      const it = this.parseMediaItem(arr[i], fallbackSrc);
+      if (it) { out.push(it); }
+    }
+    return out;
+  }
+
+  /** 从海报卡片快捷订阅影视/音乐条目（`POST /api/v1/subscribe/`）。 */
+  async quickSubscribeMedia(item: MpMediaItem): Promise<MpOperationOutcome> {
+    const ident = this.resolveCanonicalMediaIdentity(item);
+    const mtype = normalizeMediaTypeForV3(item.type);
+    const payload: Record<string, Object> = {};
+    payload['name'] = item.title;
+    payload['type'] = mtype;
+    if (item.year.trim().length > 0) {
+      payload['year'] = item.year.trim();
+    }
+    if (ident.mediaSource.length > 0 && ident.rawMediaId.length > 0) {
+      payload['media_source'] = ident.mediaSource;
+      payload['media_id'] = ident.rawMediaId;
+      if (ident.mediaSource === 'themoviedb') {
+        const numId = Number(ident.rawMediaId);
+        if (Number.isFinite(numId) && numId > 0) {
+          payload['tmdbid'] = Math.trunc(numId);
+        }
+      } else if (ident.mediaSource === 'douban' || ident.mediaSource === 'doubanmusic') {
+        payload['doubanid'] = ident.rawMediaId;
+      }
+    }
+    if (mtype === '电视剧') {
+      payload['season'] = 1;
+    }
+    const resp = await this.postJson(['subscribe'], JSON.stringify(payload), true);
+    const rec = asRec(parseJsonSafe(resp.body));
+    const ok = rec && rec['success'] !== undefined
+      ? boolVal(rec, 'success', false)
+      : (resp.status >= 200 && resp.status < 300);
+    if (ok) {
+      this.cachedSubscriptions = null;
+    }
+    const msg = strVal(rec, 'message') || (ok ? `已添加订阅「${item.title}」` : `添加订阅失败（HTTP ${resp.status}）`);
+    return { ok: ok, message: msg };
+  }
+
+  private sanitizeRelativeRecommendApiPath(raw: string): string {
+    const trimmed = (raw ?? '').trim();
+    if (!trimmed || trimmed.length > 4096) { return ''; }
+    if (trimmed.includes('://') || trimmed.startsWith('//') || trimmed.includes('\\') || trimmed.includes('#')) {
+      return '';
+    }
+    const qIdx = trimmed.indexOf('?');
+    let pathPart = (qIdx >= 0 ? trimmed.substring(0, qIdx) : trimmed).replace(/^\/+/, '');
+    if (pathPart.startsWith('api/v1/')) {
+      pathPart = pathPart.substring('api/v1/'.length);
+    }
+    const queryPart = qIdx >= 0 ? trimmed.substring(qIdx + 1) : '';
+    if (!pathPart || pathPart.includes('//')) { return ''; }
+    const segs = pathPart.split('/').filter((s: string) => s.length > 0);
+    if (segs.length === 0) { return ''; }
+    for (let i = 0; i < segs.length; i++) {
+      let dec = segs[i];
+      try { dec = decodeURIComponent(segs[i]); } catch { /* keep */ }
+      if (dec === '.' || dec === '..' || dec.includes('/') || dec.includes('\\')) {
+        return '';
+      }
+    }
+    return queryPart.length > 0 ? `${segs.join('/')}?${queryPart}` : segs.join('/');
   }
 
   async fetchPluginFormJson(pluginId: string): Promise<string> {
@@ -3134,12 +3997,13 @@ export class MoviePilotRepository {
     return out;
   }
 
+  /** 读取系统日志快照；后端已按新到旧返回，保留开头 50 行并避免等待 SSE。 */
   async fetchLiveLogs(): Promise<string[]> {
     const q: Record<string, string> = {};
-    q['length'] = '60';
+    q['length'] = '-1';
     const resp = await this.get(['system', 'logging'], q);
     if (resp.status !== 200) { return []; }
-    return resp.body.split('\n').filter((line: string) => line.trim().length > 0).slice(-50);
+    return resp.body.split(/\r?\n/).filter((line: string) => line.trim().length > 0).slice(0, 50);
   }
 
   async fetchSystemSettingList(key: string): Promise<MpSimpleSettingItem[]> {
@@ -3780,8 +4644,12 @@ export class MoviePilotRepository {
     durationMs: number,
     isPaused: boolean,
     state: string,
-    options?: MpProgressReportOptions
+    options?: MpProgressReportOptions,
+    requestBase: string = this.baseUrl,
+    requestToken: string = this.token
   ): Promise<boolean> {
+    // 串行队列等待期间若已切换会话，只保留原桶记录，不用新会话发起旧上报。
+    if (requestBase !== this.baseUrl || requestToken !== this.token) { return false; }
     const cleanItem = itemId.trim();
     const cleanSrv = server.trim();
     if (
@@ -3840,7 +4708,8 @@ export class MoviePilotRepository {
       payload['seq'] = Math.round(options.seq);
     }
     try {
-      const resp = await this.postJson(['mediaserver', 'progress'], JSON.stringify(payload));
+      const url = RustCoreBridge.buildV3EndpointUrl(requestBase, ['mediaserver', 'progress'], {});
+      const resp = await this.transport.execute(url, 'POST', requestToken, JSON.stringify(payload), 'application/json');
       return resp.status >= 200 && resp.status < 300;
     } catch {
       return false;
@@ -3950,37 +4819,61 @@ export class MoviePilotRepository {
   }
 
   /**
-   * 拉取同源外挂字幕（上限 16MB）或 LRC 歌词文本（上限 2MB），自动兼容 UTF-8 与 UTF-16 BOM 解码。
+   * 拉取同源外挂字幕（上限 64MB、超时 90 秒，兼容实时字体子集化大体积 ASS）或 LRC 歌词文本（上限 2MB），
+   * 支持 UTF-8 BOM、UTF-16 LE/BE、严格 UTF-8 与 GB18030 / GBK 中文回退解码。
    */
   async fetchSubtitleOrLyricsText(url: string, isLyrics: boolean = false): Promise<string> {
     const trusted = this.resolveTrustedSameOriginUrl(url);
     if (!trusted) {
       return '';
     }
-    const maxBytes = isLyrics ? (2 * 1024 * 1024) : (16 * 1024 * 1024);
-    const buf = await this.transport.fetchBytesBounded(trusted, this.token, maxBytes);
+    const maxBytes = isLyrics ? (2 * 1024 * 1024) : (64 * 1024 * 1024);
+    const readTimeoutMs = isLyrics ? 30000 : 90000;
+    const buf = await this.transport.fetchBytesBounded(trusted, this.token, maxBytes, readTimeoutMs);
     if (!buf || buf.byteLength === 0) {
       return '';
     }
     const bytes = new Uint8Array(buf);
-    try {
-      if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
-        const dec16Le = util.TextDecoder.create('utf-16le', { ignoreBOM: true });
-        return dec16Le.decodeToString(bytes);
-      }
-      if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
-        const dec16Be = util.TextDecoder.create('utf-16be', { ignoreBOM: true });
-        return dec16Be.decodeToString(bytes);
-      }
-      const dec8 = util.TextDecoder.create('utf-8', { ignoreBOM: true });
-      return dec8.decodeToString(bytes);
-    } catch {
+    if (bytes.byteLength >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
       try {
-        const fallbackDec = util.TextDecoder.create('utf-16le', { ignoreBOM: true });
-        return fallbackDec.decodeToString(bytes);
+        return util.TextDecoder.create('utf-8', { ignoreBOM: true }).decodeToString(bytes);
       } catch {
-        return '';
+        // continue
       }
+    }
+    if (bytes.byteLength >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+      try {
+        return util.TextDecoder.create('utf-16le', { ignoreBOM: true }).decodeToString(bytes);
+      } catch {
+        // continue
+      }
+    }
+    if (bytes.byteLength >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+      try {
+        return util.TextDecoder.create('utf-16be', { ignoreBOM: true }).decodeToString(bytes);
+      } catch {
+        // continue
+      }
+    }
+    try {
+      return util.TextDecoder.create('utf-8', { fatal: true, ignoreBOM: true }).decodeToString(bytes);
+    } catch {
+      // 非 UTF-8 字节流回退 GB18030 / GBK 中文编码解码
+    }
+    try {
+      return util.TextDecoder.create('gb18030', { ignoreBOM: true }).decodeToString(bytes);
+    } catch {
+      // continue
+    }
+    try {
+      return util.TextDecoder.create('gbk', { ignoreBOM: true }).decodeToString(bytes);
+    } catch {
+      // continue
+    }
+    try {
+      return util.TextDecoder.create('utf-8', { ignoreBOM: true }).decodeToString(bytes);
+    } catch {
+      return '';
     }
   }
 
@@ -4093,19 +4986,20 @@ export class MoviePilotRepository {
   }
 
   /**
-   * 通过当前实例受信任图片代理（`/api/v1/system/img/0?imgurl=...&cache=true`）拉取并降采样解码 `<= 512px` 封面 `PixelMap`，供 `AVSession` 锁屏播控中心展示。
+   * 通过当前实例受信任图片代理/全局缓存接口拉取并降采样解码 `<= 512px` 封面 `PixelMap`，供 `AVSession` 锁屏播控中心展示。
    */
   async fetchArtworkPixelMap(artworkUrl: string): Promise<image.PixelMap | null> {
     const raw = (artworkUrl ?? '').trim();
     if (!raw || !this.baseUrl) {
       return null;
     }
-    const proxied = this.resolveImageUrl(raw);
+    await this.ensureImageContextReady();
+    const proxied = this.resolveSameOriginArtworkUrl(raw);
     const trusted = this.resolveTrustedSameOriginUrl(proxied);
     if (!trusted) {
       return null;
     }
-    const bytes = await this.transport.fetchBytesBounded(trusted, this.token, 8 * 1024 * 1024);
+    const bytes = await this.transport.fetchBinary(trusted, this.token);
     if (!bytes || bytes.byteLength === 0) {
       return null;
     }
@@ -4683,6 +5577,109 @@ export class MoviePilotRepository {
     return resp.status >= 200 && resp.status < 300;
   }
 
+  /** 分页拉取订阅历史记录（`GET /api/v1/subscribe/history/{mtype}?page=&count=`）。 */
+  async fetchSubscribeHistory(mtype: string = '电影', page: number = 1, count: number = 30): Promise<MpSubscribeItem[]> {
+    const normalizedType = mtype.trim().length > 0 ? mtype.trim() : '电影';
+    const q: Record<string, string> = {};
+    q['page'] = String(Math.max(1, Math.round(page)));
+    q['count'] = String(Math.max(1, Math.round(count)));
+    const resp = await this.get(['subscribe', 'history', normalizedType], q);
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+    const arr = unwrapArray(parseJsonSafe(resp.body));
+    const out: MpSubscribeItem[] = [];
+    for (let i = 0; i < arr.length; i++) {
+      const parsed = this.parseSubscribeRecord(asRec(arr[i]));
+      if (parsed) { out.push(parsed); }
+    }
+    return out;
+  }
+
+  /** 删除单条订阅历史记录（`DELETE /api/v1/subscribe/history/{history_id}`）。 */
+  async deleteSubscribeHistory(historyId: number): Promise<boolean> {
+    if (!Number.isFinite(historyId) || historyId <= 0) { return false; }
+    const resp = await this.deleteReq(['subscribe', 'history', String(Math.round(historyId))]);
+    if (resp.status < 200 || resp.status >= 300) { return false; }
+    const parsed = asRec(parseJsonSafe(resp.body));
+    if (parsed && parsed['success'] !== undefined) {
+      return boolVal(parsed, 'success', true);
+    }
+    return true;
+  }
+
+  /** 从订阅历史记录重新发起订阅（`POST /api/v1/subscribe/`），剔除只读字段并保留原规则配置。 */
+  async reSubscribeFromHistory(sub: MpSubscribeItem, fallbackType: string = '电影'): Promise<MpSubscribeMutationResult> {
+    const excludedKeys: string[] = [
+      'id', 'tmdbid', 'doubanid', 'bangumiid', 'mediaid',
+      'poster', 'backdrop', 'vote', 'description', 'lack_episode',
+      'completed_episode', 'completed_tracks', 'note', 'state', 'last_update',
+      'username', 'current_priority', 'episode_priority', 'date',
+      'current_audio_format', 'current_bitrate', 'current_bit_depth', 'current_sample_rate',
+      'classification_rule_id', 'classification_policy_revision', 'classification_source',
+      'execution_status', 'last_search'
+    ];
+    let rawRec: Record<string, Object> | null = null;
+    if (sub.rawJson && sub.rawJson.length > 2) {
+      rawRec = asRec(parseJsonSafe(sub.rawJson));
+    }
+    const cleanPayload: Record<string, Object> = {};
+    if (rawRec) {
+      const keys = Object.keys(rawRec);
+      for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        if (excludedKeys.indexOf(k) >= 0) { continue; }
+        const val = rawRec[k];
+        if (val === undefined || val === null) { continue; }
+        if (k === 'search_interval' && Number(val) <= 0) { continue; }
+        cleanPayload[k] = val;
+      }
+    }
+    const resolvedType = (sub.type && sub.type.trim().length > 0) ? sub.type.trim() : fallbackType;
+    cleanPayload['name'] = sub.name.trim();
+    cleanPayload['type'] = resolvedType;
+    if (sub.year && sub.year.trim().length > 0) {
+      cleanPayload['year'] = sub.year.trim();
+    }
+    if (resolvedType === '电视剧' && sub.season > 0) {
+      cleanPayload['season'] = Math.round(sub.season);
+    }
+    const existingSource = String(cleanPayload['media_source'] ?? '').trim();
+    const existingMid = String(cleanPayload['media_id'] ?? '').trim();
+    if (existingSource.length === 0 || existingMid.length === 0) {
+      if (rawRec) {
+        const tmdb = numVal(rawRec, 'tmdbid', 0);
+        const douban = strVal(rawRec, 'doubanid').trim();
+        const bangumi = numVal(rawRec, 'bangumiid', 0);
+        if (tmdb > 0) {
+          cleanPayload['media_source'] = 'themoviedb';
+          cleanPayload['media_id'] = String(Math.round(tmdb));
+        } else if (douban.length > 0) {
+          cleanPayload['media_source'] = 'douban';
+          cleanPayload['media_id'] = douban;
+        } else if (bangumi > 0) {
+          cleanPayload['media_source'] = 'bangumi';
+          cleanPayload['media_id'] = String(Math.round(bangumi));
+        }
+      }
+    }
+
+    const resp = await this.postJson(['subscribe'], JSON.stringify(cleanPayload), true);
+    const parsed = asRec(parseJsonSafe(resp.body));
+    const ok = resp.status >= 200 && resp.status < 300 && parsed !== null && boolVal(parsed, 'success', false) === true;
+    const dataRec = parsed ? asRec(parsed['data']) : null;
+    const subId = numVal(dataRec, 'id', 0);
+    const msg = strVal(parsed, 'message');
+    if (ok) {
+      this.invalidateSubscriptionsCache();
+    }
+    return {
+      ok: ok,
+      message: msg.length > 0 ? msg : (ok ? `已重新订阅「${sub.name}」` : '重新订阅失败，请稍后重试'),
+      id: subId
+    };
+  }
+
   /** 获取用户优先级规则组列表。 */
   async fetchFilterRuleGroups(): Promise<MpFilterRuleGroup[]> {
     const resp = await this.get(['system', 'setting', 'UserFilterRuleGroups']);
@@ -4720,27 +5717,10 @@ export class MoviePilotRepository {
     for (let i = 0; i < arr.length; i++) {
       const r = asRec(arr[i]);
       if (!r) { continue; }
-      const ti = asRec(r['torrent_info']) ?? r;
-      const mi = asRec(r['meta_info']);
-      const sid = Math.round(numVal(ti, 'site', 0));
+      const parsedItem = this.parseResourceRecord(r);
+      const sid = parsedItem.siteId ?? 0;
       if (siteIds.length > 1 && sid > 0 && !siteIds.includes(sid)) { continue; }
-      out.push({
-        title: strVal(ti, 'title') || strVal(r, 'title'),
-        description: strVal(ti, 'description'),
-        siteName: strVal(ti, 'site_name', '未知站点'),
-        sizeBytes: Math.round(numVal(ti, 'size', 0)),
-        seeders: Math.round(numVal(ti, 'seeders', 0)),
-        peers: Math.round(numVal(ti, 'peers', 0)),
-        resolution: strVal(mi, 'resource_pix') || strVal(ti, 'resource_pix'),
-        resourceType: strVal(mi, 'resource_type') || strVal(ti, 'resource_type'),
-        videoEncode: strVal(mi, 'video_encode'),
-        volumeFactor: strVal(ti, 'volume_factor'),
-        enclosure: strVal(ti, 'enclosure'),
-        pageUrl: strVal(ti, 'page_url'),
-        siteId: sid,
-        pubdate: strVal(ti, 'pubdate'),
-        rawJson: JSON.stringify(r)
-      });
+      out.push(parsedItem);
     }
     return out;
   }
@@ -5334,7 +6314,18 @@ export class MoviePilotRepository {
   /** 保存单值系统设置（自动序列化字符串或布尔值）。 */
   async saveSystemSettingScalar(key: string, rawJsonLiteral: string): Promise<boolean> {
     const resp = await this.postJson(['system', 'setting', key], rawJsonLiteral);
-    return resp.status >= 200 && resp.status < 300;
+    const ok = resp.status >= 200 && resp.status < 300;
+    if (
+      ok && (
+        key === 'GLOBAL_IMAGE_CACHE' ||
+        key === 'TMDB_IMAGE_DOMAIN' ||
+        key === 'BANGUMI_PROXY_ENABLE' ||
+        key === 'BANGUMI_IMAGE_DOMAIN'
+      )
+    ) {
+      await this.refreshGlobalImageSettings();
+    }
+    return ok;
   }
 
   /** 新增或编辑通知渠道配置（无损维护 `Notifications` 系统数组）。 */
@@ -5382,68 +6373,74 @@ export class MoviePilotRepository {
     return this.saveRawSettingArray('Notifications', next);
   }
 
-  /** 查询真实渠道授权与待审批列表（`GET /api/v1/authorization`）。 */
+  /** 读取当前后端 `data.members`，尾斜杠避免认证请求重定向。 */
+  private async authorizationMembers(): Promise<Object[]> {
+    const resp = await this.get(['authorization'], {}, true);
+    if (resp.status !== 200) { throw new Error(`加载渠道授权失败（HTTP ${resp.status}）`); }
+    const root = unwrapObject(parseJsonSafe(resp.body));
+    return root ? asArr(root['members']) : [];
+  }
+
+  /** 展示渠道真实发送者和审批状态，不将拒绝或停用记录归为已授权。 */
   async fetchAuthorizations(): Promise<MpAuthorizationItem[]> {
-    let resp = await this.get(['authorization']);
-    if (resp.status === 404) {
-      resp = await this.get(['authorization', 'sessions']);
-    }
-    if (resp.status !== 200) { return []; }
-    const parsed = parseJsonSafe(resp.body);
-    let arr = unwrapArray(parsed);
-    if (arr.length === 0) {
-      const root = unwrapObject(parsed);
-      if (root) {
-        arr = asArr(root['sessions']).concat(asArr(root['pending'])).concat(asArr(root['authorizations']));
-      }
-    }
+    const arr = await this.authorizationMembers();
     const out: MpAuthorizationItem[] = [];
     for (let i = 0; i < arr.length; i++) {
       const r = asRec(arr[i]);
       if (!r) { continue; }
-      const st = strVal(r, 'status', boolVal(r, 'approved', true) ? 'authorized' : 'pending');
+      const st = strVal(r, 'status');
       out.push({
-        id: strVal(r, 'id') || strVal(r, 'session_id') || strVal(r, 'code', `auth_${i}`),
-        channel: strVal(r, 'channel') || strVal(r, 'source') || strVal(r, 'type', 'telegram'),
-        name: strVal(r, 'name') || strVal(r, 'username') || strVal(r, 'user_id') || strVal(r, 'title', '外部会话'),
+        id: strVal(r, 'id'),
+        channel: strVal(r, 'channel'),
+        name: strVal(r, 'display_name') || strVal(r, 'sender_id'),
         status: st,
-        createdAt: strVal(r, 'created_at') || strVal(r, 'time'),
-        expiresAt: strVal(r, 'expires_at'),
-        approved: st === 'authorized' || st === 'approved' || st === 'active' || boolVal(r, 'approved', false)
+        createdAt: new Date(numVal(r, 'created_at') * 1000).toISOString(),
+        expiresAt: '',
+        approved: st === 'approved'
       });
     }
     return out;
   }
 
-  /** 生成 5 分钟渠道关联绑定码（`POST /api/v1/authorization/code` / `POST /api/v1/authorization`）。 */
+  /** 从一次性关联码接口读取绝对到期时间，保留失败状态供界面展示。 */
   async generateAuthorizationCode(): Promise<MpAuthorizationCode> {
-    let resp = await this.postJson(['authorization', 'code'], '{}');
-    if (resp.status === 404 || resp.status === 405) {
-      resp = await this.postJson(['authorization'], '{}');
-    }
+    const resp = await this.postJson(['authorization', 'binding'], '{}');
     const root = unwrapObject(parseJsonSafe(resp.body));
-    const code = root ? (strVal(root, 'code') || strVal(root, 'bind_code') || strVal(root, 'token')) : '';
-    const expires = root ? Math.round(numVal(root, 'expires_in', 300)) : 300;
-    const rawRoot = asRec(parseJsonSafe(resp.body));
-    const msg = strVal(rawRoot, 'message') || (code.length > 0 ? '已生成渠道授权绑定码' : '当前实例暂未启用绑定码接口或无待绑定请求');
+    const code = strVal(root, 'code');
+    if (resp.status < 200 || resp.status >= 300 || code.length === 0) {
+      throw new Error(`生成渠道关联码失败（HTTP ${resp.status}）`);
+    }
     return {
       code: code,
-      expiresIn: expires,
-      message: msg
+      expiresIn: Math.max(0, Math.floor(numVal(root, 'expires_at') - Date.now() / 1000)),
+      message: '请在本人渠道私聊中发送 /bind ' + code
     };
   }
 
-  /** 审批通过待授权渠道请求（`POST /api/v1/authorization/approve`）。 */
-  async approveAuthorization(idOrCode: string): Promise<boolean> {
-    const payloadObj: Record<string, string> = {};
-    payloadObj['id'] = idOrCode;
-    payloadObj['code'] = idOrCode;
-    payloadObj['session_id'] = idOrCode;
-    let resp = await this.postJson(['authorization', 'approve'], JSON.stringify(payloadObj));
-    if (resp.status === 404) {
-      resp = await this.postJson(['authorization', idOrCode, 'approve'], '{}');
+  /** 仅更新成员状态，保留原角色与能力，避免审批或停用时重置授权。 */
+  private async updateAuthorizationStatus(id: string, status: string): Promise<boolean> {
+    const requestBase = this.baseUrl;
+    const requestToken = this.token;
+    const members = await this.authorizationMembers();
+    if (requestBase !== this.baseUrl || requestToken !== this.token) { return false; }
+    for (let i = 0; i < members.length; i++) {
+      const member = asRec(members[i]);
+      if (member && strVal(member, 'id') === id) {
+        const payload: Record<string, Object> = {};
+        payload['status'] = status;
+        payload['role'] = member['role'];
+        payload['scopes'] = member['scopes'];
+        const resp = await this.putJson(['authorization', id], JSON.stringify(payload));
+        const root = asRec(parseJsonSafe(resp.body));
+        return resp.status >= 200 && resp.status < 300 && boolVal(root, 'success', false);
+      }
     }
-    return resp.status >= 200 && resp.status < 300;
+    return false;
+  }
+
+  /** 通过当前成员状态更新契约批准申请。 */
+  async approveAuthorization(idOrCode: string): Promise<boolean> {
+    return this.updateAuthorizationStatus(idOrCode, 'approved');
   }
 
   /** 读取当前实例的匿名版本统计开关与统计服务地址（`GET /api/v1/system/env`）。 */
@@ -5472,10 +6469,9 @@ export class MoviePilotRepository {
     }
   }
 
-  /** 撤销已授权的渠道绑定（`DELETE /api/v1/authorization/{id}`）。 */
+  /** 撤销对应停用不可变成员记录，后端不提供 DELETE。 */
   async revokeAuthorization(sessionId: string): Promise<boolean> {
-    const resp = await this.deleteReq(['authorization', sessionId]);
-    return resp.status >= 200 && resp.status < 300;
+    return this.updateAuthorizationStatus(sessionId, 'disabled');
   }
 
   private danmakuCommentsCache: Map<number, MpDanmakuCachedEntry> = new Map<number, MpDanmakuCachedEntry>();
