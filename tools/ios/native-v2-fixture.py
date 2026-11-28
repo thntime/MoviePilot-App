@@ -121,6 +121,7 @@ class NativeFixture(ThreadingHTTPServer):
                     },
                 ],
                 "user_configs": {},
+                "mediaserver_bindings": {},
                 "market_plugins": [
                     {
                         "id": "AutoSignIn", "plugin_name": "站点自动签到", "plugin_desc": "定时执行站点签到与刷流任务",
@@ -349,6 +350,7 @@ class NativeHandler(BaseHTTPRequestHandler):
                         "VERSION": "v3.0.0-synthetic",
                     }
                     profile["user_configs"] = {}
+                    profile["mediaserver_bindings"] = {}
                     profile["market_plugins"] = [
                         {
                             "id": "AutoSignIn", "plugin_name": "站点自动签到", "plugin_desc": "定时执行站点签到与刷流任务",
@@ -406,7 +408,7 @@ class NativeHandler(BaseHTTPRequestHandler):
                 or re.fullmatch(r"api/v1/download/(?:start|stop)/[a-z0-9]+", endpoint)
                 or re.fullmatch(r"api/v1/site/(?:test|icon)/[0-9]+", endpoint)
                 or re.fullmatch(r"api/v1/search/media/1[0-9]{2}", endpoint)
-                or re.fullmatch(r"api/v1/media/[0-9]+", endpoint)
+                or re.fullmatch(r"api/v1/media/(?:[0-9]+|tt[0-9]+)", endpoint)
                 or re.fullmatch(r"api/v1/tmdb/(?:credits|recommend|similar)/[0-9]+/(?:电影|电视剧)", endpoint)
                 or re.fullmatch(r"api/v1/tmdb/person(?:/credits)?/[0-9]{3}", endpoint)
                 or re.fullmatch(r"api/v1/user/config/[A-Za-z0-9_.-]+", endpoint)
@@ -511,6 +513,9 @@ class NativeHandler(BaseHTTPRequestHandler):
                     self.server.profiles[name]["counts"]["POST api/v1/mediaserver/progress"] += 1
                 self.reply(200, {"success": True, "message": "", "data": {"reported": True}})
                 return
+            if endpoint == "api/v1/mediaserver/account-bindings":
+                self.mediaserver_account_bind_endpoint(name, body)
+                return
             if endpoint == "api/v1/notification/app":
                 with self.server.lock:
                     self.server.profiles[name]["counts"]["POST api/v1/notification/app"] += 1
@@ -565,11 +570,15 @@ class NativeHandler(BaseHTTPRequestHandler):
             if re.fullmatch(r"api/v1/message/agent/sessions/[A-Za-z0-9_-]+", endpoint):
                 self.agent_session_delete_endpoint(name, endpoint)
                 return
+            if re.fullmatch(r"api/v1/mediaserver/account-bindings/[^/]+", endpoint):
+                self.mediaserver_account_unbind_endpoint(name, endpoint)
+                return
         allowed = {
             ("GET", "api/v1/login/initialization"),
             ("POST", "api/v1/login/initialization"),
             ("POST", "api/v1/login/access-token"),
             ("GET", "api/v1/user/current"),
+            ("GET", "api/v1/auth/providers"),
         }
         if name not in self.server.profiles or (self.command, endpoint) not in allowed:
             with self.server.lock:
@@ -588,6 +597,22 @@ class NativeHandler(BaseHTTPRequestHandler):
             self.initialization(name, mode, body)
         elif endpoint.endswith("access-token"):
             self.login(name, mode, body)
+        elif endpoint == "api/v1/auth/providers":
+            self.reply(
+                200,
+                {
+                    "success": True,
+                    "message": "",
+                    "data": [
+                        {
+                            "id": "system:passkey",
+                            "type": "system",
+                            "method": "passkey",
+                            "enabled": True,
+                        }
+                    ],
+                },
+            )
         else:
             self.current(name, mode)
 
@@ -670,11 +695,14 @@ class NativeHandler(BaseHTTPRequestHandler):
         requires_discovery = (
             endpoint.startswith("api/v1/discover/")
             or endpoint.startswith("api/v1/recommend/")
-            or endpoint.startswith("api/v1/mediaserver/")
+            or (
+                endpoint.startswith("api/v1/mediaserver/")
+                and endpoint != "api/v1/mediaserver/account-bindings"
+            )
             or endpoint.startswith("api/v1/tmdb/")
             or endpoint.startswith("api/v1/music/")
             or endpoint == "api/v1/media/search"
-            or re.fullmatch(r"api/v1/media/[0-9]+", endpoint)
+            or re.fullmatch(r"api/v1/media/(?:[0-9]+|tt[0-9]+)", endpoint)
         )
         if requires_discovery and not self.permissions(mode)["discovery"]:
             self.reply(403, {"success": False})
@@ -776,6 +804,8 @@ class NativeHandler(BaseHTTPRequestHandler):
             value = {"enabled": False, "sources": []}
         elif re.fullmatch(r"api/v1/subscribe/media/[A-Za-z0-9_-]+", endpoint):
             value = None
+        elif endpoint == "api/v1/mediaserver/account-bindings":
+            value = self.list_mediaserver_account_bindings(name)
         elif endpoint.startswith("api/v1/mediaserver/"):
             value = self.mediaserver_fixture(endpoint, query, mode)
         elif endpoint.startswith("api/v1/user/config/"):
@@ -965,12 +995,15 @@ class NativeHandler(BaseHTTPRequestHandler):
         elif re.fullmatch(r"api/v1/tmdb/person/credits/[0-9]{3}", endpoint):
             value = [self.media(101, "电影"), self.media(111, "电视剧")]
         else:
-            item_id = int(endpoint.rsplit("/", 1)[-1])
+            raw_id = endpoint.rsplit("/", 1)[-1]
+            media_src = query.get("media_source", [""])[0]
             media_type = query.get("type_name", [""])[0]
-            if query.get("media_source") != ["themoviedb"] or media_type not in {"电影", "电视剧"}:
+            if media_src not in {"themoviedb", "imdb", "douban", "bangumi"} or media_type not in {"电影", "电视剧"}:
                 self.reply(422, {"success": False})
                 return
-            value = self.media(item_id, media_type)
+            digits = "".join(ch for ch in raw_id if ch.isdigit()) or "101"
+            item_id = int(digits[-3:]) if len(digits) > 3 else int(digits)
+            value = self.media(item_id, media_type, media_source=media_src, raw_id=raw_id)
         self.reply(200, {"success": True, "message": "", "data": value}, self.resource_headers(name))
 
     def media_status_endpoint(self, name, body):
@@ -2392,6 +2425,80 @@ export async function get(moduleName) {
                 profile["counts"]["image-served"] += 1
             self.reply_image(reference)
 
+    def list_mediaserver_account_bindings(self, name):
+        """返回当前登录账号的个人媒体服务器绑定列表（对齐后端 verify_token 语义，无需超管或发现权限）。"""
+        with self.server.lock:
+            saved = dict(self.server.profiles[name]["mediaserver_bindings"].get("Emby") or {})
+        bound = bool(saved.get("bound"))
+        return [
+            {
+                "server": "Emby",
+                "server_type": "emby",
+                "sync_mode": "session" if bound else "userdata",
+                "supports_binding": True,
+                "bound": bound,
+                "status": "bound" if bound else "unbound",
+                "remote_username": saved.get("remote_username") if bound else None,
+                "source": "manual" if bound else None,
+                "updated_at": saved.get("updated_at") if bound else None,
+            }
+        ]
+
+    def mediaserver_account_bind_endpoint(self, name, body):
+        """验证当前登录令牌并记录个人媒体服务器绑定，不要求超级管理员或特定业务权限。"""
+        with self.server.lock:
+            profile = self.server.profiles[name]
+            profile["counts"]["POST api/v1/mediaserver/account-bindings"] += 1
+            mode = profile["mode"]
+        if mode == "expired" or self.headers.get("Authorization") != f"Bearer synthetic-native-{name}":
+            self.reply(401, {"success": False})
+            return
+        try:
+            payload = json.loads(body)
+            server = str(payload.get("server") or "").strip()
+            username = str(payload.get("username") or "").strip()
+            password = str(payload.get("password") or "")
+            token = str(payload.get("token") or "").strip()
+        except (ValueError, TypeError, AttributeError):
+            self.reply(422, {"detail": "invalid payload"})
+            return
+        if server != "Emby":
+            self.reply(404, {"detail": "未找到对应的已启用媒体服务器"})
+            return
+        if not token and (not username or not password):
+            self.reply(422, {"detail": "请填写媒体服务器用户名和密码"})
+            return
+        remote_user = username or f"native-{name}"
+        with self.server.lock:
+            self.server.profiles[name]["mediaserver_bindings"]["Emby"] = {
+                "bound": True,
+                "remote_username": remote_user,
+                "updated_at": 1795827600,
+            }
+        updated = self.list_mediaserver_account_bindings(name)[0]
+        self.reply(200, {"success": True, "message": "媒体服务器账号绑定成功", "data": updated})
+
+    def mediaserver_account_unbind_endpoint(self, name, endpoint):
+        """解除当前登录账号在指定媒体服务器上的个人同步令牌绑定。"""
+        with self.server.lock:
+            profile = self.server.profiles[name]
+            profile["counts"][f"DELETE {endpoint}"] += 1
+            mode = profile["mode"]
+        if mode == "expired" or self.headers.get("Authorization") != f"Bearer synthetic-native-{name}":
+            self.reply(401, {"success": False})
+            return
+        server = endpoint.rsplit("/", 1)[-1]
+        with self.server.lock:
+            removed = self.server.profiles[name]["mediaserver_bindings"].pop(server, None) is not None
+        self.reply(
+            200,
+            {
+                "success": True,
+                "message": "已解除媒体服务器账号绑定" if removed else "当前服务器未绑定账号",
+                "data": None,
+            },
+        )
+
     @staticmethod
     def mediaserver_fixture(endpoint, query, mode):
         """在 mediaserver 验收模式下返回多维 Emby 风格媒体库浏览、三层详情与播前选轨夹具。"""
@@ -2405,8 +2512,6 @@ export async function get(moduleName) {
         server = query.get("server", ["Emby"])[0] or "Emby"
         if endpoint == "api/v1/mediaserver/clients":
             return [{"name": "Emby", "type": "emby"}]
-        if endpoint == "api/v1/mediaserver/account-bindings":
-            return []
         if endpoint == "api/v1/mediaserver/library":
             return [
                 {
@@ -2613,7 +2718,11 @@ export async function get(moduleName) {
                     "title": "星际迷航：新世界", "original_title": "Star Trek: Strange New Worlds",
                     "tagline": "探索未知星海的壮丽航程",
                     "overview": "讲述派克船长带领进取号探索银河系中全新世界的经典科幻剧集，每集呈现独立而震撼的星际冒险。",
-                    "year": "2025", "premiere_date": "2024-05-05", "rating": 8.9,
+                    "year": "2025", "premiere_date": "2024-05-05", "rating": 8.9, "critic_rating": 98.0,
+                    "ratings": [
+                        {"source": "imdb", "value": 8.9, "scale": "ten"},
+                        {"source": "rottentomatoes", "value": 98.0, "scale": "percent"},
+                    ],
                     "genres": ["科幻", "冒险", "剧情"], "studios": ["Paramount+"],
                     "poster": "https://images.example.test/301/poster.png",
                     "backdrop": "https://images.example.test/301/backdrop.png",
@@ -2640,7 +2749,11 @@ export async function get(moduleName) {
                 "title": "陌生新世界", "series_id": "series-100", "series_name": "星际迷航：新世界",
                 "season_id": "season-1", "season_name": "第 1 季",
                 "season_number": 1, "episode_number": 1,
-                "year": "2024", "premiere_date": "2024-05-05", "rating": 9.1,
+                "year": "2024", "premiere_date": "2024-05-05", "rating": 9.1, "critic_rating": 96.0,
+                "ratings": [
+                    {"source": "imdb", "value": 9.1, "scale": "ten"},
+                    {"source": "rottentomatoes", "value": 96.0, "scale": "percent"},
+                ],
                 "duration_ms": 3120000, "resume_position_ms": 1310000, "played_percentage": 42.0,
                 "overview": "进取号在未知星系收到神秘求救信号，派克船长必须决定是否介入这颗行星的首次接触事件。",
                 "genres": ["科幻", "冒险"], "tmdb_id": "103516",
@@ -2767,10 +2880,12 @@ export async function get(moduleName) {
                 pass
 
     @staticmethod
-    def media(item_id, media_type):
-        """提供显式标记的合成记录，编号区分搜索、发现与详情请求。"""
+    def media(item_id, media_type, media_source="themoviedb", raw_id=None):
+        """提供显式标记的合成记录，编号区分搜索、发现与详情请求，并附带多来源评分字段。"""
+        vote_by_source = {"imdb": 8.5, "douban": 8.6, "bangumi": 8.4}
         base = {
-            "media_source": "themoviedb", "media_id": str(item_id), "tmdb_id": item_id,
+            "media_source": media_source, "media_id": str(raw_id or item_id), "tmdb_id": item_id,
+            "imdb_id": f"tt0000{item_id}", "douban_id": f"3000{item_id}",
             "type": media_type, "title": f"合成{media_type} {item_id}", "year": "2025",
             "release_date": "2025-07-15",
             "tagline": "跨越边界的原生体验",
@@ -2780,7 +2895,8 @@ export async function get(moduleName) {
             "directors": [{"id": 503, "name": "合成导演", "source": "themoviedb"}],
             "poster_path": f"https://images.example.test/{item_id}/poster.png",
             "backdrop_path": f"https://images.example.test/{item_id}/backdrop.png",
-            "overview": "本条记录用于验证原生客户端的检索与详情直连。", "vote_average": 8.3,
+            "overview": "本条记录用于验证原生客户端的检索与详情直连。",
+            "vote_average": vote_by_source.get(media_source, 8.3),
         }
         if media_type == "电视剧":
             base["season_info"] = [

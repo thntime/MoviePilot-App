@@ -4,12 +4,14 @@ import { PlaybackRouteCandidate, RustCoreBridge } from '../bridge/RustCoreBridge
 import { NativeRcpTransport, NativeHttpResponse, SseEventChunk, ByteRangeFetchResult } from '../network/NativeRcpTransport';
 import { NativeHuksStore } from '../security/NativeHuksStore';
 import { CloudflareAccessOAuthManager } from './CloudflareAccessOAuthManager';
+import { PasskeyAuthManager } from './PasskeyAuthManager';
 import { HarmonyPlaybackProgressReporter } from './HarmonyPlaybackProgressReporter';
 import { HarmonyPlaybackRouteResolver } from './HarmonyPlaybackRouteResolver';
 
 export interface MpLoginResult {
   success: boolean;
   requiresOtp: boolean;
+  canceled?: boolean;
   token: string;
   userName: string;
   isSuperuser: boolean;
@@ -998,6 +1000,12 @@ export interface MpMediaServerEpisode {
   resumePositionMs: number;
 }
 
+/** 单来源媒体评分微标展示模型（如 IMDb / TMDB / 烂番茄新鲜度 / 豆瓣 / Bangumi）。 */
+export interface MpMediaRatingBadge {
+  source: string;
+  label: string;
+}
+
 /** 媒体服务器单个条目完整详情模型（`/api/v1/mediaserver/detail`）。 */
 export interface MpMediaServerDetail {
   itemId: string;
@@ -1013,6 +1021,8 @@ export interface MpMediaServerDetail {
   year: string;
   premiereDate: string;
   rating: number;
+  criticRating?: number;
+  ratings?: MpMediaRatingBadge[];
   officialRating: string;
   durationMs: number;
   posterUrl: string;
@@ -1255,6 +1265,7 @@ export function formatSpeed(bytesPerSec: number): string {
 export class MoviePilotRepository {
   private static instance: MoviePilotRepository | null = null;
   readonly transport: NativeRcpTransport = new NativeRcpTransport();
+  private multiRatingsCache: Map<string, MpMediaRatingBadge[]> = new Map<string, MpMediaRatingBadge[]>();
   baseUrl: string = '';
   token: string = '';
   userName: string = '';
@@ -1766,6 +1777,192 @@ export class MoviePilotRepository {
       return {
         success: false, requiresOtp: false, token: '', userName: name, isSuperuser: su, avatar: '', userLevel: 1,
         message: '服务器未返回有效访问令牌'
+      };
+    }
+    this.configure(cleanUrl, token, name, su, avatar);
+    this.userLevel = level;
+    await this.hydrateSession();
+    return {
+      success: true, requiresOtp: false, token: token, userName: this.userName,
+      isSuperuser: this.isSuperuser, avatar: this.userAvatar, userLevel: this.userLevel, message: ''
+    };
+  }
+
+  /** 探测当前实例是否已启用系统通行密钥（`GET /api/v1/auth/providers`）。 */
+  async probePasskeyEnabled(serverUrl: string): Promise<boolean> {
+    try {
+      const cleanUrl = RustCoreBridge.normalizeServerAddress(serverUrl);
+      this.transport.setBaseUrl(cleanUrl);
+      await CloudflareAccessOAuthManager.shared().hydrateOrigin(cleanUrl);
+      await CloudflareAccessOAuthManager.shared().refreshIfNeeded(cleanUrl, this.transport.isAllowSelfSigned());
+      const url = RustCoreBridge.buildV3EndpointUrl(cleanUrl, ['auth', 'providers']);
+      const resp = await this.transport.execute(url, 'GET', '');
+      if (resp.status !== 200 || !resp.body) {
+        return false;
+      }
+      return RustCoreBridge.parsePasskeyProviderEnabled(resp.body);
+    } catch {
+      return false;
+    }
+  }
+
+  /** 使用系统浏览器完成 `moviepilot.passkey` v1 通行密钥登录并激活会话。 */
+  async loginWithPasskey(
+    serverUrl: string,
+    username: string,
+    launchBrowser: (authorizeUrl: string) => void
+  ): Promise<MpLoginResult> {
+    let cleanUrl = '';
+    try {
+      cleanUrl = RustCoreBridge.normalizeServerAddress(serverUrl);
+    } catch {
+      return {
+        success: false, requiresOtp: false, token: '', userName: username, isSuperuser: false, avatar: '',
+        message: '服务地址格式无效，请检查后重试。'
+      };
+    }
+    if (!RustCoreBridge.isPasskeySecureOrigin(cleanUrl)) {
+      return {
+        success: false, requiresOtp: false, token: '', userName: username, isSuperuser: false, avatar: '',
+        message: '当前连接或系统不支持通行密钥，请使用 HTTPS 地址和支持的系统。'
+      };
+    }
+    this.baseUrl = cleanUrl;
+    this.transport.setBaseUrl(cleanUrl);
+    await CloudflareAccessOAuthManager.shared().hydrateOrigin(cleanUrl);
+    await CloudflareAccessOAuthManager.shared().refreshIfNeeded(cleanUrl, this.transport.isAllowSelfSigned());
+
+    const markerUrl = `${cleanUrl}/native-passkey.json`;
+    const markerResp = await this.transport.execute(markerUrl, 'GET', '');
+    if (RustCoreBridge.detectCloudflareAccessChallenge(
+      markerResp.status, markerResp.headers ?? {}, markerResp.body, markerUrl
+    ).isChallenge) {
+      return {
+        success: false, requiresOtp: false, token: '', userName: username, isSuperuser: false, avatar: '',
+        message: '检测到 Cloudflare Access 网关拦截，请先完成 Cloudflare Access 认证。'
+      };
+    }
+    if (markerResp.status !== 200 || !RustCoreBridge.supportsPasskeyFrontendMarker(markerResp.body)) {
+      return {
+        success: false, requiresOtp: false, token: '', userName: username, isSuperuser: false, avatar: '',
+        message: '请更新实例的前端资源后，再使用 App 通行密钥登录。'
+      };
+    }
+
+    let stateHex = '';
+    try {
+      stateHex = PasskeyAuthManager.shared().generateStateHex32();
+    } catch {
+      return {
+        success: false, requiresOtp: false, token: '', userName: username, isSuperuser: false, avatar: '',
+        message: '未能完成通行密钥验证，请重新尝试。'
+      };
+    }
+
+    const trimmedUser = (username ?? '').trim();
+    const startPayload: Record<string, string> = {};
+    if (trimmedUser.length > 0) {
+      startPayload['username'] = trimmedUser;
+    }
+    const startUrl = RustCoreBridge.buildV3EndpointUrl(cleanUrl, ['mfa', 'passkey', 'authenticate', 'start']);
+    const startResp = await this.transport.execute(
+      startUrl,
+      'POST',
+      '',
+      JSON.stringify(startPayload),
+      'application/json'
+    );
+    if (RustCoreBridge.detectCloudflareAccessChallenge(
+      startResp.status, startResp.headers ?? {}, startResp.body, startUrl
+    ).isChallenge) {
+      return {
+        success: false, requiresOtp: false, token: '', userName: username, isSuperuser: false, avatar: '',
+        message: '检测到 Cloudflare Access 网关拦截，请先完成 Cloudflare Access 认证。'
+      };
+    }
+    if (startResp.status < 200 || startResp.status >= 300) {
+      return {
+        success: false, requiresOtp: false, token: '', userName: username, isSuperuser: false, avatar: '',
+        message: '未能完成通行密钥验证，请重新尝试。'
+      };
+    }
+
+    let finishBodyJson = '';
+    try {
+      const prepared = RustCoreBridge.preparePasskeyRequest(startResp.body, cleanUrl, stateHex);
+      const callbackUrl = await PasskeyAuthManager.shared().waitForCallback(
+        prepared.authorizationUrl,
+        prepared.timeoutSecs,
+        launchBrowser
+      );
+      const verified = RustCoreBridge.verifyPasskeyCallback(
+        callbackUrl,
+        cleanUrl,
+        prepared.state,
+        prepared.challenge,
+        prepared.transactionToken
+      );
+      if (!verified.ok || !verified.finishBodyJson) {
+        if (verified.errorCode === 'canceled') {
+          return {
+            success: false, requiresOtp: false, canceled: true, token: '', userName: username,
+            isSuperuser: false, avatar: '', message: ''
+          };
+        }
+        return {
+          success: false, requiresOtp: false, token: '', userName: username, isSuperuser: false, avatar: '',
+          message: verified.errorMessageZh || '未能完成通行密钥验证，请重新尝试。'
+        };
+      }
+      finishBodyJson = verified.finishBodyJson;
+    } catch (e) {
+      const code = ((e as Error).message ?? '').trim();
+      if (code === 'canceled') {
+        return {
+          success: false, requiresOtp: false, canceled: true, token: '', userName: username,
+          isSuperuser: false, avatar: '', message: ''
+        };
+      }
+      const msg = code === 'expired'
+        ? '通行密钥验证已过期，请重新尝试。'
+        : (code === 'unsupported'
+          ? '当前连接或系统不支持通行密钥，请使用 HTTPS 地址和支持的系统。'
+          : (code === 'invalid'
+            ? '通行密钥验证结果无效，请重新尝试。'
+            : '未能完成通行密钥验证，请重新尝试。'));
+      return {
+        success: false, requiresOtp: false, token: '', userName: username, isSuperuser: false, avatar: '',
+        message: msg
+      };
+    }
+
+    const finishUrl = RustCoreBridge.buildV3EndpointUrl(cleanUrl, ['mfa', 'passkey', 'authenticate', 'finish']);
+    const finishResp = await this.transport.execute(
+      finishUrl,
+      'POST',
+      '',
+      finishBodyJson,
+      'application/json'
+    );
+    if (finishResp.status < 200 || finishResp.status >= 300) {
+      return {
+        success: false, requiresOtp: false, token: '', userName: username, isSuperuser: false, avatar: '',
+        message: '未能完成通行密钥验证，请重新尝试。'
+      };
+    }
+    const parsedFinish = parseJsonSafe(finishResp.body);
+    const rec = unwrapObject(parsedFinish) ?? asRec(parsedFinish);
+    const token = strVal(rec, 'access_token');
+    const name = strVal(rec, 'user_name', trimmedUser);
+    const su = boolVal(rec, 'super_user', true);
+    const avatar = strVal(rec, 'avatar');
+    const rawLevel = rec && rec['level'] !== undefined && rec['level'] !== null ? Number(rec['level']) : NaN;
+    const jwtLevel = MoviePilotRepository.parseJwtLevel(token);
+    const level = Number.isFinite(rawLevel) && rawLevel >= 0 ? Math.trunc(rawLevel) : (jwtLevel ?? 1);
+    if (token.length === 0) {
+      return {
+        success: false, requiresOtp: false, token: '', userName: name, isSuperuser: su, avatar: '', userLevel: 1,
+        message: '未能完成通行密钥验证，请重新尝试。'
       };
     }
     this.configure(cleanUrl, token, name, su, avatar);
@@ -2510,6 +2707,217 @@ export class MoviePilotRepository {
       });
     }
     return { item: mergedItem, cast: cast, seasons: seasons };
+  }
+
+  private normalizeRatingSourceKey(raw: string): string {
+    const clean = (raw ?? '').trim().toLowerCase();
+    if (clean === 'imdb') { return 'imdb'; }
+    if (clean === 'themoviedb' || clean === 'tmdb') { return 'tmdb'; }
+    if (clean === 'rottentomatoes' || clean === 'rotten_tomatoes' || clean === 'rt' || clean === 'critic') {
+      return 'rottentomatoes';
+    }
+    if (clean === 'douban' || clean === 'douban_movie') { return 'douban'; }
+    if (clean === 'bangumi' || clean === 'bgm') { return 'bangumi'; }
+    if (clean === 'anilist') { return 'anilist'; }
+    if (clean === 'community') { return 'community'; }
+    return '';
+  }
+
+  private orderRatingBadges(scores: Map<string, string>): MpMediaRatingBadge[] {
+    const order: string[] = ['imdb', 'tmdb', 'rottentomatoes', 'douban', 'bangumi', 'anilist'];
+    const out: MpMediaRatingBadge[] = [];
+    for (let i = 0; i < order.length; i++) {
+      const k = order[i];
+      const v = scores.get(k);
+      if (v && v.length > 0) {
+        out.push({ source: k, label: v });
+      }
+    }
+    const hasNamedTenScale = out.some((b: MpMediaRatingBadge) => b.source !== 'rottentomatoes');
+    if (!hasNamedTenScale) {
+      const comm = scores.get('community');
+      if (comm && comm.length > 0) {
+        out.unshift({ source: 'community', label: comm });
+      }
+    }
+    return out;
+  }
+
+  /** 基于手头已有的媒体或媒体库评分构造零延迟初始多元评分列表。 */
+  seedRatingsForItem(
+    item: MpMediaItem,
+    criticRating: number = 0,
+    serverRatings: MpMediaRatingBadge[] = []
+  ): MpMediaRatingBadge[] {
+    const scores: Map<string, string> = new Map<string, string>();
+    for (let i = 0; i < serverRatings.length; i++) {
+      const norm = this.normalizeRatingSourceKey(serverRatings[i].source);
+      if (norm.length > 0 && serverRatings[i].label.length > 0 && !scores.has(norm)) {
+        scores.set(norm, serverRatings[i].label);
+      }
+    }
+    if (!scores.has('rottentomatoes') && Number.isFinite(criticRating) && criticRating > 0) {
+      scores.set('rottentomatoes', `${Math.max(1, Math.min(100, Math.round(criticRating)))}%`);
+    }
+    if (Number.isFinite(item.vote) && item.vote > 0) {
+      const norm = this.normalizeRatingSourceKey(item.source) || 'community';
+      if (!scores.has(norm)) {
+        scores.set(norm, Math.min(10, item.vote).toFixed(1));
+      }
+    }
+    return this.orderRatingBadges(scores);
+  }
+
+  private async recognizeRatingBySource(
+    title: string,
+    year: string,
+    expectedType: string,
+    mediaSource: string
+  ): Promise<string> {
+    const cleanTitle = title.trim();
+    if (!cleanTitle) { return ''; }
+    const queryTitle = year.trim().length >= 4 ? `${cleanTitle} ${year.trim().substring(0, 4)}` : cleanTitle;
+    const q: Record<string, string> = {
+      'title': queryTitle,
+      'media_source': mediaSource
+    };
+    const resp = await this.get(['media', 'recognize'], q);
+    if (resp.status !== 200) { return ''; }
+    const env = unwrapObject(parseJsonSafe(resp.body));
+    const media = env ? asRec(env['media_info']) : null;
+    if (!media) { return ''; }
+    const vote = numVal(media, 'vote_average', 0);
+    if (vote <= 0) { return ''; }
+    const rawType = strVal(media, 'type');
+    if (rawType.length > 0 && normalizeMediaTypeForV3(rawType) !== expectedType) {
+      return '';
+    }
+    if (year.trim().length >= 4) {
+      const reqY = Number(year.trim().substring(0, 4));
+      const gotYearStr = strVal(media, 'year');
+      const gotY = gotYearStr.length >= 4 ? Number(gotYearStr.substring(0, 4)) : NaN;
+      if (Number.isFinite(reqY) && Number.isFinite(gotY) && Math.abs(reqY - gotY) > 1) {
+        return '';
+      }
+    }
+    return Math.min(10, vote).toFixed(1);
+  }
+
+  /**
+   * 异步并发聚合免配置多元评分（IMDb / TMDB / 烂番茄影评新鲜度 / 豆瓣 / Bangumi），带实例隔离内存缓存。
+   */
+  async fetchMultiSourceRatings(
+    item: MpMediaItem,
+    criticRating: number = 0,
+    serverRatings: MpMediaRatingBadge[] = [],
+    serverItemId: string = '',
+    serverName: string = ''
+  ): Promise<MpMediaRatingBadge[]> {
+    const typeName = normalizeMediaTypeForV3(item.type);
+    const idKey = item.tmdbId.trim().length > 0
+      ? `tmdb:${item.tmdbId.trim()}`
+      : ((item.imdbId && item.imdbId.trim().length > 0)
+        ? `imdb:${item.imdbId.trim()}`
+        : (item.doubanId.trim().length > 0 ? `douban:${item.doubanId.trim()}` : `${item.source}:${item.id}`));
+    const cacheKey = `${this.baseUrl}|${typeName}|${idKey}`;
+    const cached = this.multiRatingsCache.get(cacheKey);
+    if (cached && cached.length > 0) {
+      return cached;
+    }
+
+    const scores: Map<string, string> = new Map<string, string>();
+    const seeded = this.seedRatingsForItem(item, criticRating, serverRatings);
+    for (let i = 0; i < seeded.length; i++) {
+      scores.set(seeded[i].source, seeded[i].label);
+    }
+
+    let tmdbId = stripKnownMediaPrefix(item.tmdbId);
+    if (!tmdbId && normalizeMediaSourceCode(item.source) === 'themoviedb') {
+      tmdbId = stripKnownMediaPrefix(item.mediaId || item.id);
+    }
+    let imdbId = stripKnownMediaPrefix(item.imdbId ?? '');
+    let doubanId = stripKnownMediaPrefix(item.doubanId);
+    if (!doubanId && normalizeMediaSourceCode(item.source) === 'douban') {
+      doubanId = stripKnownMediaPrefix(item.mediaId || item.id);
+    }
+    const isBangumiSrc = normalizeMediaSourceCode(item.source) === 'bangumi';
+    const bangumiId = isBangumiSrc ? stripKnownMediaPrefix(item.mediaId || item.id) : '';
+    let title = item.title.trim();
+    let year = item.year.trim();
+
+    if (tmdbId.length > 0 && (!scores.has('tmdb') || imdbId.length === 0)) {
+      try {
+        const q: Record<string, string> = { 'media_source': 'themoviedb', 'type_name': typeName };
+        const resp = await this.get(['media', tmdbId], q);
+        if (resp.status === 200) {
+          const r = unwrapObject(parseJsonSafe(resp.body));
+          if (r) {
+            const v = numVal(r, 'vote_average', 0);
+            if (v > 0 && !scores.has('tmdb')) {
+              scores.set('tmdb', Math.min(10, v).toFixed(1));
+            }
+            if (!imdbId) { imdbId = stripKnownMediaPrefix(strVal(r, 'imdb_id')); }
+            if (!doubanId) { doubanId = stripKnownMediaPrefix(strVal(r, 'douban_id')); }
+            if (!title) { title = strVal(r, 'title'); }
+            if (!year) { year = strVal(r, 'year'); }
+          }
+        }
+      } catch {
+        // ignore tmdb enrichment failure
+      }
+    }
+
+    const fetchById = async (src: string, rawId: string): Promise<string> => {
+      if (!rawId || rawId === '0') { return ''; }
+      try {
+        const q: Record<string, string> = { 'media_source': src, 'type_name': typeName };
+        const resp = await this.get(['media', rawId], q);
+        if (resp.status !== 200) { return ''; }
+        const r = unwrapObject(parseJsonSafe(resp.body));
+        const v = r ? numVal(r, 'vote_average', 0) : 0;
+        return v > 0 ? Math.min(10, v).toFixed(1) : '';
+      } catch {
+        return '';
+      }
+    };
+
+    const tasks = await Promise.all([
+      (!scores.has('imdb') && imdbId.toLowerCase().startsWith('tt'))
+        ? fetchById('imdb', imdbId)
+        : Promise.resolve(''),
+      !scores.has('douban')
+        ? (doubanId.length > 0 ? fetchById('douban', doubanId) : this.recognizeRatingBySource(title, year, typeName, 'douban'))
+        : Promise.resolve(''),
+      (!scores.has('bangumi') && bangumiId.length > 0)
+        ? fetchById('bangumi', bangumiId)
+        : Promise.resolve(''),
+      (!scores.has('rottentomatoes') && serverItemId.trim().length > 0)
+        ? this.fetchMediaServerDetail(serverItemId.trim(), serverName)
+        : Promise.resolve(null as MpMediaServerDetail | null)
+    ]);
+
+    if (tasks[0].length > 0 && !scores.has('imdb')) { scores.set('imdb', tasks[0]); }
+    if (tasks[1].length > 0 && !scores.has('douban')) { scores.set('douban', tasks[1]); }
+    if (tasks[2].length > 0 && !scores.has('bangumi')) { scores.set('bangumi', tasks[2]); }
+    const srvDetail = tasks[3];
+    if (srvDetail) {
+      const srvRatings = srvDetail.ratings ?? [];
+      for (let i = 0; i < srvRatings.length; i++) {
+        const norm = this.normalizeRatingSourceKey(srvRatings[i].source);
+        if (norm.length > 0 && srvRatings[i].label.length > 0 && !scores.has(norm)) {
+          scores.set(norm, srvRatings[i].label);
+        }
+      }
+      if (!scores.has('rottentomatoes') && srvDetail.criticRating && srvDetail.criticRating > 0) {
+        scores.set('rottentomatoes', `${Math.max(1, Math.min(100, Math.round(srvDetail.criticRating)))}%`);
+      }
+    }
+
+    const ordered = this.orderRatingBadges(scores);
+    if (ordered.length > 0) {
+      this.multiRatingsCache.set(cacheKey, ordered);
+    }
+    return ordered;
   }
 
   /**
@@ -4334,15 +4742,18 @@ export class MoviePilotRepository {
     return out;
   }
 
-  /** 将相对路径规范化为同源绝对地址并执行 `RustCoreBridge.serverAddressContains` 严格同源守卫。 */
+  /** 将相对路径或反代协议失配的 `/api/v1/...` 绝对地址安全对齐至当前实例根地址，并执行严格同源守卫。 */
   private resolveTrustedSameOriginUrl(rawUrl: string): string {
     const trimmed = (rawUrl ?? '').trim();
     if (!trimmed || !this.baseUrl) {
       return '';
     }
-    const candidate = (trimmed.startsWith('http://') || trimmed.startsWith('https://'))
-      ? trimmed
-      : `${this.baseUrl}${trimmed.startsWith('/') ? '' : '/'}${trimmed}`;
+    const rebased = RustCoreBridge.rebaseInstanceApiUrl(this.baseUrl, trimmed);
+    const candidate = rebased.length > 0
+      ? rebased
+      : ((trimmed.startsWith('http://') || trimmed.startsWith('https://'))
+        ? trimmed
+        : `${this.baseUrl}${trimmed.startsWith('/') ? '' : '/'}${trimmed}`);
     if (!RustCoreBridge.serverAddressContains(this.baseUrl, candidate)) {
       return '';
     }
@@ -5264,6 +5675,21 @@ export class MoviePilotRepository {
       doubanId = rawMediaIdVal;
     }
 
+    const parsedRatings: MpMediaRatingBadge[] = [];
+    const ratingsRaw = asArr(r['ratings']);
+    for (let i = 0; i < ratingsRaw.length; i++) {
+      const rr = asRec(ratingsRaw[i]);
+      if (!rr) { continue; }
+      const normSrc = this.normalizeRatingSourceKey(strVal(rr, 'source'));
+      const val = numVal(rr, 'value', 0);
+      if (!normSrc || val <= 0) { continue; }
+      const scale = strVal(rr, 'scale', 'ten').toLowerCase();
+      const label = scale === 'percent'
+        ? `${Math.max(1, Math.min(100, Math.round(val)))}%`
+        : Math.min(10, val).toFixed(1);
+      parsedRatings.push({ source: normSrc, label: label });
+    }
+
     return {
       itemId: strVal(r, 'item_id', cleanId),
       server: strVal(r, 'server', server),
@@ -5278,6 +5704,8 @@ export class MoviePilotRepository {
       year: strVal(r, 'year'),
       premiereDate: strVal(r, 'premiere_date'),
       rating: numVal(r, 'rating', 0),
+      criticRating: numVal(r, 'critic_rating', 0),
+      ratings: parsedRatings,
       officialRating: strVal(r, 'official_rating'),
       durationMs: Math.round(numVal(r, 'duration_ms', 0)),
       posterUrl: this.resolveImageUrl(strVal(r, 'poster') || strVal(r, 'image'), useCookies),
@@ -5538,6 +5966,45 @@ export class MoviePilotRepository {
     return out.slice(0, 18);
   }
 
+  /** 将订阅质量、分辨率、特效的界面短标签展开为与 Web `constants.ts` 一致的正则，保留自定义正则。 */
+  static normalizeSubscribeFilterOption(field: string, raw: string): string {
+    const trimmed = (raw ?? '').trim();
+    if (trimmed.length === 0) { return ''; }
+    const lower = trimmed.toLowerCase();
+    if (lower === '全部' || lower === 'all') { return ''; }
+    if (field === 'quality') {
+      if (lower === '蓝光原盘' || lower === '藍光原盤' || lower === 'blu-ray original' || lower === 'bluray original') {
+        return 'Blu-?Ray.+VC-?1|Blu-?Ray.+AVC|UHD.+blu-?ray.+HEVC|MiniBD';
+      }
+      if (lower === 'remux') { return 'Remux'; }
+      if (lower === 'bluray' || lower === 'blu-ray') { return 'Blu-?Ray'; }
+      if (lower === 'uhd') { return 'UHD|UltraHD'; }
+      if (lower === 'web-dl' || lower === 'webdl') { return 'WEB-?DL|WEB-?RIP'; }
+      if (lower === 'hdtv') { return 'HDTV'; }
+      if (lower === 'h265' || lower === 'h.265' || lower === 'hevc') { return '[Hx].?265|HEVC'; }
+      if (lower === 'h264' || lower === 'h.264' || lower === 'avc') { return '[Hx].?264|AVC'; }
+      return raw;
+    }
+    if (field === 'resolution') {
+      if (lower === '4k') { return '4K|2160p|x2160'; }
+      if (lower === '1080p') { return '1080[pi]|x1080'; }
+      if (lower === '720p') { return '720[pi]|x720'; }
+      return raw;
+    }
+    if (field === 'effect') {
+      if (lower === '杜比视界' || lower === '杜比視界' || lower === 'dolby vision' || lower === 'dovi' || lower === 'dv') {
+        return 'Dolby[\\s.]+Vision|DOVI|[\\s.]+DV[\\s.]+';
+      }
+      if (lower === '杜比全景声' || lower === '杜比全景聲' || lower === 'dolby atmos' || lower === 'atmos') {
+        return 'Dolby[\\s.]*\\+?Atmos|Atmos';
+      }
+      if (lower === 'hdr') { return '[\\s.]+HDR[\\s.]+|HDR10|HDR10\\+'; }
+      if (lower === 'sdr') { return '[\\s.]+SDR[\\s.]+'; }
+      return raw;
+    }
+    return raw;
+  }
+
   /** 无损保存/更新订阅规则（保留未编辑服务端字段）。 */
   async saveSubscription(sub: MpSubscribeItem): Promise<boolean> {
     let payloadObj: Record<string, Object> = {};
@@ -5550,9 +6017,9 @@ export class MoviePilotRepository {
     payloadObj['year'] = sub.year;
     payloadObj['type'] = sub.type;
     payloadObj['state'] = sub.state;
-    payloadObj['quality'] = sub.quality;
-    payloadObj['resolution'] = sub.resolution;
-    payloadObj['effect'] = sub.effect ?? '';
+    payloadObj['quality'] = MoviePilotRepository.normalizeSubscribeFilterOption('quality', sub.quality);
+    payloadObj['resolution'] = MoviePilotRepository.normalizeSubscribeFilterOption('resolution', sub.resolution);
+    payloadObj['effect'] = MoviePilotRepository.normalizeSubscribeFilterOption('effect', sub.effect ?? '');
     payloadObj['best_version'] = sub.bestVersion ? 1 : 0;
     payloadObj['save_path'] = sub.savePath;
     if (sub.season > 0) { payloadObj['season'] = sub.season; }

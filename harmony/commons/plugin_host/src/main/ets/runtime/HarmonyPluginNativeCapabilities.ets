@@ -971,15 +971,42 @@ export class HarmonyPluginNativeCapabilities {
     this.playbackLoop = loop;
     this.playbackVolume = volume;
     this.playbackRate = rate;
-    this.playbackState = 'loading';
+    this.playbackState = 'buffering';
     this.playbackDurationMs = 0;
-    this.playbackPositionMs = 0;
+    this.playbackPositionMs = startPosMs;
+    if (showInStatusBar && playTitle.length > 0) {
+      this.applyNowPlayingSession(
+        playTitle,
+        playArtist,
+        playAlbum,
+        playArtworkUrl,
+        0,
+        startPosMs,
+        true,
+        rate
+      ).catch(() => {});
+    }
+    this.emitPlaybackState();
 
     try {
       const player = await media.createAVPlayer();
       this.avPlayer = player;
       let responded = false;
 
+      player.on('bufferingUpdate', (infoType: media.BufferingInfoType, _val: number) => {
+        if (this.playbackId !== playId) { return; }
+        if (infoType === media.BufferingInfoType.BUFFERING_START) {
+          if (this.playbackState === 'playing') {
+            this.playbackState = 'buffering';
+            this.emitPlaybackState();
+          }
+        } else if (infoType === media.BufferingInfoType.BUFFERING_END) {
+          if (this.playbackState === 'buffering' && player.state === 'playing') {
+            this.playbackState = 'playing';
+            this.emitPlaybackState();
+          }
+        }
+      });
       player.on('timeUpdate', (ms: number) => {
         if (this.playbackId === playId && Number.isFinite(ms) && ms >= 0) {
           this.playbackPositionMs = Math.floor(ms);
@@ -1352,6 +1379,8 @@ export class HarmonyPluginNativeCapabilities {
     }
     const artist = typeof payload['artist'] === 'string' ? (payload['artist'] as string).trim() : '';
     const album = typeof payload['album'] === 'string' ? (payload['album'] as string).trim() : '';
+    const capsuleTitle = typeof payload['capsuleTitle'] === 'string' ? (payload['capsuleTitle'] as string).trim() : '';
+    const capsuleArtist = typeof payload['capsuleArtist'] === 'string' ? (payload['capsuleArtist'] as string).trim() : '';
     const artworkUrl = typeof payload['artworkUrl'] === 'string' ? (payload['artworkUrl'] as string).trim() : '';
     const durationMs = typeof payload['durationMs'] === 'number' ? Math.max(0, Math.floor(payload['durationMs'] as number)) : this.playbackDurationMs;
     const positionMs = typeof payload['positionMs'] === 'number' ? Math.max(0, Math.floor(payload['positionMs'] as number)) : this.playbackPositionMs;
@@ -1385,7 +1414,18 @@ export class HarmonyPluginNativeCapabilities {
       this.nowPlayingLiked = payload['liked'] as boolean;
     }
 
-    await this.applyNowPlayingSession(title, artist, album, artworkUrl, durationMs, positionMs, isPlaying, rate);
+    await this.applyNowPlayingSession(
+      title,
+      artist,
+      album,
+      artworkUrl,
+      durationMs,
+      positionMs,
+      isPlaying,
+      rate,
+      capsuleTitle,
+      capsuleArtist
+    );
     this.sendOk(requestId, '{"registered":true}');
   }
 
@@ -1397,7 +1437,9 @@ export class HarmonyPluginNativeCapabilities {
     durationMs: number,
     positionMs: number,
     isPlaying: boolean,
-    rate: number
+    rate: number,
+    capsuleTitle: string = '',
+    capsuleArtist: string = ''
   ): Promise<void> {
     const ctx = this.getContext();
     if (!ctx) {
@@ -1503,9 +1545,11 @@ export class HarmonyPluginNativeCapabilities {
         meta.mediaImage = resolvedArtwork;
       }
       await this.pluginAvSession.setAVMetadata(meta);
+      const isBufferingNow = this.avPlayer !== null && (this.playbackState === 'buffering' || this.playbackState === 'loading');
+      const effectivePlaying = isPlaying && !isBufferingNow;
       await this.pluginAvSession.setAVPlaybackState({
-        state: isPlaying ? avSession.PlaybackState.PLAYBACK_STATE_PLAY : avSession.PlaybackState.PLAYBACK_STATE_PAUSE,
-        speed: isPlaying ? rate : 0,
+        state: effectivePlaying ? avSession.PlaybackState.PLAYBACK_STATE_PLAY : avSession.PlaybackState.PLAYBACK_STATE_PAUSE,
+        speed: effectivePlaying ? rate : 0,
         isFavorite: this.nowPlayingLiked,
         position: {
           elapsedTime: Math.max(0, positionMs),
@@ -1520,7 +1564,9 @@ export class HarmonyPluginNativeCapabilities {
       isPlaying,
       title,
       artist,
-      artworkUrl
+      artworkUrl,
+      capsuleTitle,
+      capsuleArtist
     );
     await this.syncNowPlayingWidgetStore(true, isPlaying, positionMs);
   }

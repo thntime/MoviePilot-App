@@ -182,6 +182,62 @@ struct MediaPlaybackManifest: Decodable, Sendable {
     guard strmDirectEnabled, let strmUrl else { return false }
     return strmUrl != contentUrl
   }
+
+  /// 将反代环境生成的 `http://.../api/v1/mediaserver/...` 地址统一对齐到当前已验证的实例地址（保留外部直连流原样）。
+  func rebased(for address: ServerAddress) -> MediaPlaybackManifest {
+    let rebasedContent = address.rebasingInstanceAPIURL(contentUrl)
+    let rebasedSubtitles = subtitles.map {
+      MediaPlaybackSubtitle(
+        subtitleId: $0.subtitleId,
+        title: $0.title,
+        language: $0.language,
+        url: address.rebasingInstanceAPIURL($0.url)
+      )
+    }
+    let rebasedLyrics = lyricsUrl.map { address.rebasingInstanceAPIURL($0) }
+    let rebasedRoutes = playbackRoutes.map { route -> PlaybackRouteCandidate in
+      guard route.kind == .mpProxy, let rawURL = URL(string: route.url) else { return route }
+      return PlaybackRouteCandidate(
+        kind: route.kind,
+        url: address.rebasingInstanceAPIURL(rawURL).absoluteString,
+        probeUrl: route.probeUrl,
+        headers: route.headers,
+        priority: route.priority,
+        requiresSameOriginAuth: route.requiresSameOriginAuth
+      )
+    }
+    return MediaPlaybackManifest(
+      itemId: itemId,
+      server: server,
+      serverType: serverType,
+      title: title,
+      contentUrl: rebasedContent,
+      strmUrl: strmUrl,
+      customHeaders: customHeaders,
+      mediaType: mediaType,
+      artist: artist,
+      album: album,
+      subtitles: rebasedSubtitles,
+      lyricsUrl: rebasedLyrics,
+      mediaSourceId: mediaSourceId,
+      playSessionId: playSessionId,
+      progressSyncMode: progressSyncMode,
+      resumePositionMs: resumePositionMs,
+      durationMs: durationMs,
+      danmakuEnabled: danmakuEnabled,
+      seriesName: seriesName,
+      seasonNumber: seasonNumber,
+      episodeNumber: episodeNumber,
+      year: year,
+      tmdbId: tmdbId,
+      fileName: fileName,
+      fileSize: fileSize,
+      playbackRoutes: rebasedRoutes,
+      resolvedTarget: resolvedTarget,
+      fallbackRoutes: fallbackRoutes,
+      fileNameHint: fileNameHint
+    )
+  }
 }
 
 /// 后端发现的一条同名外挂字幕；内嵌字幕由 VLCKit 读取。
@@ -302,12 +358,16 @@ final class MediaPlaybackClient {
     guard
       let envelope = try? decoder.decode(
         MediaPlaybackEnvelope<MediaPlaybackManifest>.self, from: data),
-      envelope.success, let manifest = envelope.data,
+      envelope.success, let rawManifest = envelope.data
+    else { throw MediaPlaybackError.unavailable }
+    let manifest = rawManifest.rebased(for: address)
+    guard
       manifest.itemId == itemId,
       manifest.mediaType == nil || manifest.mediaType == "video" || manifest.mediaType == "audio",
       isTrustedMediaURL(
         manifest.contentUrl, itemId: itemId, server: server, mediaSourceId: mediaSourceId)
     else { throw MediaPlaybackError.unavailable }
+    selectedServer = manifest.server ?? server
     resourceCookie = cookie
     guard
       manifest.subtitles.allSatisfy({
@@ -673,7 +733,10 @@ final class MediaPlaybackClient {
     guard
       let envelope = try? decoder.decode(
         MediaPlaybackEnvelope<MediaPlaybackManifest>.self, from: data),
-      envelope.success, let manifest = envelope.data,
+      envelope.success, let rawManifest = envelope.data
+    else { throw MediaPlaybackError.unavailable }
+    let manifest = rawManifest.rebased(for: address)
+    guard
       isTrustedMediaURL(manifest.contentUrl, itemId: manifest.itemId, server: manifest.server)
     else { throw MediaPlaybackError.unavailable }
     selectedServer = manifest.server
@@ -919,6 +982,7 @@ final class MediaPlaybackClient {
     let safeExternal = manifest.flatMap {
       ExternalPlayerLauncher.safeExternalURL(for: $0, activeURL: url)
     }
+    let mimeHint = EngineMediaSource.inferMimeType(url: url, fileNameHint: manifest?.fileNameHint)
     if address.contains(url) {
       guard let cookie = resourceCookie else {
         throw MediaPlaybackError.unavailable
@@ -942,7 +1006,8 @@ final class MediaPlaybackClient {
         headers: headers,
         isSameOriginInstance: true,
         sameOriginCookie: cookie,
-        rawExternalSafeURL: safeExternal
+        rawExternalSafeURL: safeExternal,
+        mimeTypeHint: mimeHint
       )
     }
     return EngineMediaSource(
@@ -950,7 +1015,8 @@ final class MediaPlaybackClient {
       headers: customHeaders,
       isSameOriginInstance: false,
       sameOriginCookie: nil,
-      rawExternalSafeURL: safeExternal
+      rawExternalSafeURL: safeExternal,
+      mimeTypeHint: mimeHint
     )
   }
 
@@ -1002,10 +1068,14 @@ final class MediaPlaybackClient {
       url.path == endpoint(["api", "v1", "mediaserver", "stream-subtitle"]).path,
       let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
     else { return false }
-    return queryItems.count == (server == nil ? 2 : 3)
-      && queryItems.first(where: { $0.name == "itemid" })?.value == itemId
-      && queryItems.first(where: { $0.name == "subtitle_id" })?.value != nil
-      && (server == nil || queryItems.first(where: { $0.name == "server" })?.value == server)
+    let allowedNames: Set<String> = ["itemid", "subtitle_id", "server"]
+    guard queryItems.allSatisfy({ allowedNames.contains($0.name) }),
+      Set(queryItems.map(\.name)).count == queryItems.count,
+      queryItems.first(where: { $0.name == "itemid" })?.value == itemId,
+      let subId = queryItems.first(where: { $0.name == "subtitle_id" })?.value, !subId.isEmpty,
+      server == nil || queryItems.first(where: { $0.name == "server" })?.value == server
+    else { return false }
+    return true
   }
 
   /// 校验歌词地址同源且只指向当前条目的 LRC 歌词路由。
@@ -1014,9 +1084,13 @@ final class MediaPlaybackClient {
       url.path == endpoint(["api", "v1", "mediaserver", "stream-lyrics"]).path,
       let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
     else { return false }
-    return queryItems.count == (server == nil ? 1 : 2)
-      && queryItems.first(where: { $0.name == "itemid" })?.value == itemId
-      && (server == nil || queryItems.first(where: { $0.name == "server" })?.value == server)
+    let allowedNames: Set<String> = ["itemid", "server"]
+    guard queryItems.allSatisfy({ allowedNames.contains($0.name) }),
+      Set(queryItems.map(\.name)).count == queryItems.count,
+      queryItems.first(where: { $0.name == "itemid" })?.value == itemId,
+      server == nil || queryItems.first(where: { $0.name == "server" })?.value == server
+    else { return false }
+    return true
   }
 
   /// 封面只能经当前实例图片代理或全局图片缓存端点；源站访问和 DNS 安全校验由后端负责。
@@ -1690,6 +1764,8 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
       pipTopButton.addAction(
         UIAction { [weak self] _ in self?.minimizePlayback() }, for: .touchUpInside)
 
+      let airPlayTopControl = makeVideoAirPlayControl(diameter: topButtonDiameter)
+
       configureGlassButton(
         videoMoreButton, symbol: "ellipsis", accessibility: L10n.text("更多播放选项"),
         diameter: topButtonDiameter, pointSize: topButtonPointSize)
@@ -1701,6 +1777,7 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
 
       let topActionsStack = UIStackView(arrangedSubviews: [
         fixedSquareControl(danmakuToggleButton, diameter: topButtonDiameter),
+        airPlayTopControl,
         fixedSquareControl(pipTopButton, diameter: topButtonDiameter),
         fixedSquareControl(videoMoreButton, diameter: topButtonDiameter),
       ])
@@ -1750,12 +1827,18 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
     ])
 
     // 仅横屏显示于右侧的纯图标锁屏/解锁按钮（紧凑横屏贴近顶栏下方以避让底部连播浮层，大屏居中）
+    // 注意：切勿在 iOS 26+ `UIButton.Configuration.glass()` 上置 `isSelected = true`，否则系统会将选中背景填为纯白（`tintColor`），
+    // 与白色前景图标叠成实心白圆。
     configureGlassButton(
       lockTopButton, symbol: "lock.open", accessibility: L10n.text("锁定屏幕"), diameter: 44,
       pointSize: 16)
+    lockTopButton.accessibilityIdentifier = "video-playback-lock"
+    lockTopButton.accessibilityValue = L10n.text("未锁定")
     lockTopButton.configurationUpdateHandler = { [weak self] button in
       guard let self, var config = button.configuration else { return }
       config.image = UIImage(systemName: self.isLocked ? "lock.fill" : "lock.open")
+      config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(
+        pointSize: 16, weight: .semibold)
       config.baseForegroundColor = .white
       button.configuration = config
     }
@@ -3658,12 +3741,14 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
       manifest.flatMap {
         ExternalPlayerLauncher.safeExternalURL(for: $0, activeURL: url)
       } ?? (PlaybackRoutePlanner.isSafeHttpURL(url.absoluteString) ? url : nil)
+    let mimeHint = EngineMediaSource.inferMimeType(url: url, fileNameHint: manifest?.fileNameHint)
     return EngineMediaSource(
       url: url,
       headers: customHeaders,
       isSameOriginInstance: false,
       sameOriginCookie: nil,
-      rawExternalSafeURL: safeExternal
+      rawExternalSafeURL: safeExternal,
+      mimeTypeHint: mimeHint
     )
   }
 
@@ -4208,6 +4293,46 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
     return button
   }
 
+  /// 创建与顶部玻璃按钮视觉一致的系统隔空播放（AirPlay 视频/音频）选择器容器。
+  private func makeVideoAirPlayControl(diameter: CGFloat) -> UIView {
+    let container = UIView()
+    container.translatesAutoresizingMaskIntoConstraints = false
+    container.backgroundColor = UIColor.black.withAlphaComponent(0.28)
+    container.layer.cornerRadius = diameter / 2
+    container.layer.cornerCurve = .continuous
+    container.layer.borderWidth = 0.7
+    container.layer.borderColor = UIColor.white.withAlphaComponent(0.20).cgColor
+    container.clipsToBounds = true
+
+    let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+    blur.isUserInteractionEnabled = false
+    blur.translatesAutoresizingMaskIntoConstraints = false
+    container.addSubview(blur)
+
+    let picker = AVRoutePickerView()
+    picker.translatesAutoresizingMaskIntoConstraints = false
+    picker.prioritizesVideoDevices = true
+    picker.tintColor = .white
+    picker.activeTintColor = .systemCyan
+    picker.accessibilityIdentifier = "video-playback-airplay"
+    picker.accessibilityLabel = L10n.text("投屏与隔空播放")
+    container.addSubview(picker)
+
+    NSLayoutConstraint.activate([
+      container.widthAnchor.constraint(equalToConstant: diameter),
+      container.heightAnchor.constraint(equalToConstant: diameter),
+      blur.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+      blur.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+      blur.topAnchor.constraint(equalTo: container.topAnchor),
+      blur.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+      picker.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+      picker.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+      picker.topAnchor.constraint(equalTo: container.topAnchor),
+      picker.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+    ])
+    return container
+  }
+
   /// 为指定控件设置磨砂玻璃背景、边线、图标尺寸和固定触控区域。
   private func configureGlassButton(
     _ button: UIButton, symbol: String, accessibility: String, diameter: CGFloat,
@@ -4575,14 +4700,16 @@ final class MediaPlaybackViewController: UIViewController, UIGestureRecognizerDe
     }
   }
 
-  /// 刷新右侧居中锁定/解锁纯图标按钮样式（锁定与解锁复用同一位置，无任何文字）。
+  /// 刷新右侧居中锁定/解锁纯图标按钮样式（保持半透明液态玻璃底色并切换锁头图标，避免 `isSelected` 在 iOS 26+ 将胶囊染成纯白）。
   private func updateLockButtonSymbol(locked: Bool) {
     let symbol = locked ? "lock.fill" : "lock.open"
     let accessibility = locked ? L10n.text("解锁屏幕") : L10n.text("锁定屏幕")
     lockTopButton.accessibilityLabel = accessibility
-    lockTopButton.isSelected = locked
+    lockTopButton.accessibilityValue = locked ? L10n.text("已锁定") : L10n.text("未锁定")
     if var config = lockTopButton.configuration {
       config.image = UIImage(systemName: symbol)
+      config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(
+        pointSize: 16, weight: .semibold)
       config.baseForegroundColor = .white
       lockTopButton.configuration = config
       lockTopButton.setNeedsUpdateConfiguration()

@@ -1,3 +1,4 @@
+import { display } from '@kit.ArkUI';
 import { vibrator } from '@kit.SensorServiceKit';
 import { MoviePilotRepository, MpRemoteImage } from '@moviepilot/core_rust_bridge';
 import {
@@ -29,10 +30,13 @@ export interface HarmonyPluginCapsuleState {
   isMinimized: boolean;
   title: string;
   subtitle: string;
+  capsuleTitle?: string;
+  capsuleArtist?: string;
   statusText: string;
   iconUrl: string;
   mode: string; // 'jump' | 'mini'
   isPlaying: boolean;
+  edgeSnapThresholdDp?: number;
   actions: HarmonyPluginCapsuleAction[];
 }
 
@@ -216,6 +220,11 @@ export class HarmonyPluginCapsuleManager {
       : inferredPlaying;
     const repoBase = (MoviePilotRepository.shared().baseUrl ?? '').replace(/\/+$/, '');
 
+    const rawSnap = typeof payload['edgeSnapThresholdDp'] === 'number'
+      ? (payload['edgeSnapThresholdDp'] as number)
+      : (typeof payload['snapThresholdDp'] === 'number' ? (payload['snapThresholdDp'] as number) : 24);
+    const resolvedSnap = Math.max(0, Math.min(72, Math.floor(rawSnap)));
+
     const next: HarmonyPluginCapsuleState = {
       pluginId: cur ? cur.pluginId : fallbackPluginId,
       pluginName: resolvedName,
@@ -226,12 +235,19 @@ export class HarmonyPluginCapsuleManager {
       isMinimized: true,
       title: resolvedTitle,
       subtitle: typeof payload['subtitle'] === 'string' ? (payload['subtitle'] as string) : (cur ? cur.subtitle : ''),
+      capsuleTitle: (typeof payload['capsuleTitle'] === 'string' && (payload['capsuleTitle'] as string).trim().length > 0)
+        ? (payload['capsuleTitle'] as string).trim()
+        : undefined,
+      capsuleArtist: (typeof payload['capsuleArtist'] === 'string' && (payload['capsuleArtist'] as string).trim().length > 0)
+        ? (payload['capsuleArtist'] as string).trim()
+        : undefined,
       statusText: typeof payload['statusText'] === 'string' ? (payload['statusText'] as string) : (cur ? cur.statusText : ''),
       iconUrl: (typeof payload['iconUrl'] === 'string' && (payload['iconUrl'] as string).trim().length > 0)
         ? (payload['iconUrl'] as string).trim()
         : (cur ? cur.iconUrl : ''),
       mode: resolvedMode,
       isPlaying: resolvedPlaying,
+      edgeSnapThresholdDp: resolvedSnap,
       actions: syncHarmonyPlayActions(effectiveActions, resolvedPlaying)
     };
     AppStorage.setOrCreate(HarmonyPluginCapsuleManager.KEY_MINI_EXPANDED, false);
@@ -249,6 +265,14 @@ export class HarmonyPluginCapsuleManager {
     }
     if (typeof payload['subtitle'] === 'string') {
       cur.subtitle = payload['subtitle'] as string;
+    }
+    if (typeof payload['capsuleTitle'] === 'string') {
+      const ct = (payload['capsuleTitle'] as string).trim();
+      cur.capsuleTitle = ct.length > 0 ? ct : undefined;
+    }
+    if (typeof payload['capsuleArtist'] === 'string') {
+      const ca = (payload['capsuleArtist'] as string).trim();
+      cur.capsuleArtist = ca.length > 0 ? ca : undefined;
     }
     if (typeof payload['statusText'] === 'string') {
       cur.statusText = payload['statusText'] as string;
@@ -275,17 +299,25 @@ export class HarmonyPluginCapsuleManager {
         }
       }
     }
+    if (typeof payload['edgeSnapThresholdDp'] === 'number' || typeof payload['snapThresholdDp'] === 'number') {
+      const rawSnap = typeof payload['edgeSnapThresholdDp'] === 'number'
+        ? (payload['edgeSnapThresholdDp'] as number)
+        : (payload['snapThresholdDp'] as number);
+      cur.edgeSnapThresholdDp = Math.max(0, Math.min(72, Math.floor(rawSnap)));
+    }
     cur.actions = syncHarmonyPlayActions(cur.actions, cur.isPlaying);
     this.saveState(cur);
   }
 
-  /** 原生音频播放状态变化或调用 `setNowPlaying` 时，实时同步胶囊播放图标与曲目信息。 */
+  /** 原生音频播放状态变化或调用 `setNowPlaying` 时，实时同步胶囊播放图标与曲目信息，并保留专用短标题。 */
   syncAudioPlaybackState(
     pluginId: string,
     isPlaying: boolean,
     title: string = '',
     subtitle: string = '',
-    iconUrl: string = ''
+    iconUrl: string = '',
+    capsuleTitle: string = '',
+    capsuleArtist: string = ''
   ): void {
     const cur = this.currentState();
     if (!cur) {
@@ -294,11 +326,23 @@ export class HarmonyPluginCapsuleManager {
     if (pluginId.length > 0 && cur.pluginId.toLowerCase() !== pluginId.toLowerCase()) {
       return;
     }
-    if (title.trim().length > 0) {
-      cur.title = title.trim();
+    const cleanTitle = title.trim();
+    const trackChanged = cleanTitle.length > 0 && cleanTitle !== cur.title;
+    if (cleanTitle.length > 0) {
+      cur.title = cleanTitle;
     }
     if (subtitle.trim().length > 0) {
       cur.subtitle = subtitle.trim();
+    }
+    if (capsuleTitle.trim().length > 0) {
+      cur.capsuleTitle = capsuleTitle.trim();
+    } else if (trackChanged) {
+      cur.capsuleTitle = undefined;
+    }
+    if (capsuleArtist.trim().length > 0) {
+      cur.capsuleArtist = capsuleArtist.trim();
+    } else if (trackChanged) {
+      cur.capsuleArtist = undefined;
     }
     if (iconUrl.trim().length > 0) {
       cur.iconUrl = iconUrl.trim();
@@ -453,19 +497,84 @@ export struct HarmonyGlobalVuePluginOverlay {
 
 /**
  * 鸿蒙跨页面紧凑单行横向悬浮胶囊组件：
- * `[圆形鉴权封面 (28vp)] + [标题/副标题文字区 (点击直接恢复完整插件窗口)] + [最多 3 个内联快捷图标按钮] + [关闭按钮 ✕]`。
+ * - 拖动与松手约束在安全区内并持久化位置，靠近左右边缘 `< edgeSnapThresholdDp`（默认 24vp）自动贴边收缩为半圆「超级最小化」；
+ * - 点击贴边半圆恢复完整单行胶囊，避免越界丢失。
  */
 @Component
 export struct HarmonyPluginFloatingCapsule {
   @StorageLink(HarmonyAppearanceStore.KEY_IS_DARK) isDark: boolean = true;
   @StorageLink(HarmonyAppearanceStore.KEY_PALETTE_ID) paletteId: string = 'harmony_blue';
   @StorageLink(HarmonyAppearanceStore.KEY_ACCENT_HEX) accentHex: string = '#317AF7';
+  @StorageLink(HarmonyAppearanceStore.KEY_SAFE_TOP_VP) safeTopVp: number = 38;
+  @StorageLink(HarmonyAppearanceStore.KEY_SAFE_BOTTOM_VP) safeBottomVp: number = 28;
   @StorageLink(HarmonyPluginCapsuleManager.KEY_STATE_JSON) capsuleJson: string = '';
+  @StorageLink('mp_harmony_capsule_norm_x') normX: number = 1.0;
+  @StorageLink('mp_harmony_capsule_norm_y') normY: number = 0.78;
+  @StorageLink('mp_harmony_capsule_docked_edge') dockedEdge: string = 'none';
 
-  @State private offsetX: number = 0;
-  @State private offsetY: number = 0;
-  private dragStartX: number = 0;
-  private dragStartY: number = 0;
+  @Prop bottomClearanceVp: number = 94;
+
+  @State private isDragging: boolean = false;
+  @State private liveDragX: number = 0;
+  @State private liveDragY: number = 0;
+  @State private pillWidthVp: number = 206;
+  @State private pillHeightVp: number = 38;
+  private dragBaseX: number = 0;
+  private dragBaseY: number = 0;
+
+  private isSuperMinimized(): boolean {
+    return this.dockedEdge === 'left' || this.dockedEdge === 'right';
+  }
+
+  private viewportSizeVp(): Array<number> {
+    try {
+      const disp = display.getDefaultDisplaySync();
+      const density = disp.densityPixels > 0 ? disp.densityPixels : 3.0;
+      return [Math.max(240, disp.width / density), Math.max(360, disp.height / density)];
+    } catch {
+      return [390, 844];
+    }
+  }
+
+  private resolvedOriginVp(st: HarmonyPluginCapsuleState): Array<number> {
+    const vp = this.viewportSizeVp();
+    const vpW = vp[0];
+    const vpH = vp[1];
+    const itemW = this.isSuperMinimized() ? 42 : Math.max(120, this.pillWidthVp);
+    const itemH = Math.max(36, this.pillHeightVp);
+    const minY = Math.max(8, this.safeTopVp + 8);
+    const maxY = Math.max(minY, vpH - Math.max(10, this.safeBottomVp) - this.bottomClearanceVp - itemH);
+    const clampedNormY = Math.max(0, Math.min(1, this.normY));
+    const y = Math.max(minY, Math.min(maxY, minY + (maxY - minY) * clampedNormY));
+
+    if (this.dockedEdge === 'left') {
+      return [0, y];
+    }
+    if (this.dockedEdge === 'right') {
+      return [Math.max(0, vpW - itemW), y];
+    }
+    const hMargin = 12;
+    const minFreeX = hMargin;
+    const maxFreeX = Math.max(minFreeX, vpW - hMargin - itemW);
+    const clampedNormX = Math.max(0, Math.min(1, this.normX));
+    const x = Math.max(minFreeX, Math.min(maxFreeX, minFreeX + (maxFreeX - minFreeX) * clampedNormX));
+    return [x, y];
+  }
+
+  private clampDragVp(rawX: number, rawY: number): Array<number> {
+    const vp = this.viewportSizeVp();
+    const vpW = vp[0];
+    const vpH = vp[1];
+    const itemW = this.isSuperMinimized() ? 42 : Math.max(120, this.pillWidthVp);
+    const itemH = Math.max(36, this.pillHeightVp);
+    const minY = Math.max(8, this.safeTopVp + 8);
+    const maxY = Math.max(minY, vpH - Math.max(10, this.safeBottomVp) - this.bottomClearanceVp - itemH);
+    const maxX = Math.max(0, vpW - itemW);
+    return [
+      Math.max(0, Math.min(maxX, rawX)),
+      Math.max(minY, Math.min(maxY, rawY))
+    ];
+  }
 
   private tapHaptic(): void {
     try {
@@ -566,8 +675,8 @@ export struct HarmonyPluginFloatingCapsule {
 
   build() {
     if (this.minimizedState() !== null) {
-      Row({ space: 4 }) {
-        Row({ space: 8 }) {
+      if (this.isSuperMinimized()) {
+        Row() {
           if (this.resolveCoverUrl(this.minimizedState()!).length > 0) {
             MpRemoteImage({
               src: this.resolveCoverUrl(this.minimizedState()!),
@@ -587,81 +696,211 @@ export struct HarmonyPluginFloatingCapsule {
                 .fontColor([this.accentHex])
             }
           }
-
-          Column({ space: 1 }) {
-            Text(this.minimizedState()!.title)
-              .fontSize(12.5)
-              .fontWeight(FontWeight.Medium)
-              .fontColor(mpPrimaryText(this.isDark))
-              .maxLines(1)
-              .constraintSize({ maxWidth: 148 })
-            if ((this.minimizedState()!.subtitle || this.minimizedState()!.statusText).length > 0) {
-              Text(this.minimizedState()!.subtitle || this.minimizedState()!.statusText)
-                .fontSize(10.5)
-                .fontColor(mpSecondaryText(this.isDark))
-                .maxLines(1)
-                .constraintSize({ maxWidth: 148 })
-            }
-          }
-          .alignItems(HorizontalAlign.Start)
         }
-        .padding({ right: 4 })
+        .padding({
+          left: this.dockedEdge === 'left' ? 6 : 8,
+          right: this.dockedEdge === 'right' ? 6 : 8,
+          top: 5,
+          bottom: 5
+        })
+        .borderRadius({
+          topLeft: this.dockedEdge === 'left' ? 0 : 999,
+          bottomLeft: this.dockedEdge === 'left' ? 0 : 999,
+          topRight: this.dockedEdge === 'right' ? 0 : 999,
+          bottomRight: this.dockedEdge === 'right' ? 0 : 999
+        })
+        .backgroundColor(HarmonyThemeColors.card(this.isDark, this.paletteId))
+        .border({ width: 1, color: HarmonyAppearanceStore.withAlpha(this.accentHex, '88') })
+        .shadow({ radius: 12, color: '#33000000', offsetY: 4 })
+        .position({
+          x: this.isDragging ? this.liveDragX : this.resolvedOriginVp(this.minimizedState()!)[0],
+          y: this.isDragging ? this.liveDragY : this.resolvedOriginVp(this.minimizedState()!)[1]
+        })
         .onClick(() => {
           this.tapHaptic();
-          HarmonyPluginCapsuleManager.shared().restoreFullWindow();
+          this.normX = this.dockedEdge === 'left' ? 0.0 : 1.0;
+          this.dockedEdge = 'none';
         })
-
-        ForEach(
-          this.inlineActions(this.minimizedState()!),
-          (act: HarmonyPluginCapsuleAction) => {
-            Button({ type: ButtonType.Circle }) {
-              this.renderInlineActionIcon(act, this.minimizedState()!.isPlaying)
-            }
-            .width(27)
-            .height(27)
-            .backgroundColor(Color.Transparent)
-            .accessibilityText(act.label)
-            .onClick(() => {
-              this.tapHaptic();
-              HarmonyPluginCapsuleManager.shared().dispatchAction(act.id);
+        .gesture(
+          PanGesture({ distance: 4 })
+            .onActionStart(() => {
+              const cur = this.resolvedOriginVp(this.minimizedState()!);
+              this.dragBaseX = cur[0];
+              this.dragBaseY = cur[1];
+              this.liveDragX = cur[0];
+              this.liveDragY = cur[1];
+              this.isDragging = true;
             })
-          },
-          (act: HarmonyPluginCapsuleAction) => `${act.id}_${act.active}_${this.minimizedState()!.isPlaying}`
+            .onActionUpdate((ev?: GestureEvent) => {
+              if (ev) {
+                const clamped = this.clampDragVp(this.dragBaseX + ev.offsetX, this.dragBaseY + ev.offsetY);
+                this.liveDragX = clamped[0];
+                this.liveDragY = clamped[1];
+              }
+            })
+            .onActionEnd(() => {
+              this.settleDragAt(this.liveDragX, this.liveDragY);
+            })
+            .onActionCancel(() => {
+              this.isDragging = false;
+            })
         )
-
-        Button({ type: ButtonType.Circle }) {
-          SymbolGlyph($r('sys.symbol.xmark'))
-            .fontSize(12)
-            .fontColor([mpSecondaryText(this.isDark)])
-        }
-        .width(25)
-        .height(25)
-        .backgroundColor(Color.Transparent)
-        .accessibilityText('关闭插件胶囊')
-        .onClick(() => {
-          this.tapHaptic();
-          HarmonyPluginCapsuleManager.shared().closeAndDestroy();
-        })
-      }
-      .padding({ left: 7, right: 6, top: 5.5, bottom: 5.5 })
-      .borderRadius(999)
-      .backgroundColor(HarmonyThemeColors.card(this.isDark, this.paletteId))
-      .border({ width: 1, color: HarmonyAppearanceStore.withAlpha(this.accentHex, '55') })
-      .shadow({ radius: 14, color: '#33000000', offsetY: 4 })
-      .offset({ x: this.offsetX, y: this.offsetY })
-      .gesture(
-        PanGesture({ distance: 4 })
-          .onActionStart(() => {
-            this.dragStartX = this.offsetX;
-            this.dragStartY = this.offsetY;
-          })
-          .onActionUpdate((ev?: GestureEvent) => {
-            if (ev) {
-              this.offsetX = this.dragStartX + ev.offsetX;
-              this.offsetY = this.dragStartY + ev.offsetY;
+      } else {
+        Row({ space: 2 }) {
+          Row({ space: 6 }) {
+            if (this.resolveCoverUrl(this.minimizedState()!).length > 0) {
+              MpRemoteImage({
+                src: this.resolveCoverUrl(this.minimizedState()!),
+                imgWidth: 26,
+                imgHeight: 26,
+                imgRadius: 13
+              })
+            } else {
+              Stack({ alignContent: Alignment.Center }) {
+                Column()
+                  .width(26)
+                  .height(26)
+                  .borderRadius(13)
+                  .backgroundColor(HarmonyAppearanceStore.withAlpha(this.accentHex, '28'))
+                SymbolGlyph($r('sys.symbol.puzzle'))
+                  .fontSize(13)
+                  .fontColor([this.accentHex])
+              }
             }
+
+            Column({ space: 1 }) {
+              Text(this.minimizedState()!.capsuleTitle || this.minimizedState()!.title)
+                .fontSize(12)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(mpPrimaryText(this.isDark))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .width(64)
+              if ((this.minimizedState()!.capsuleArtist || this.minimizedState()!.subtitle || this.minimizedState()!.statusText).length > 0) {
+                Text(this.minimizedState()!.capsuleArtist || this.minimizedState()!.subtitle || this.minimizedState()!.statusText)
+                  .fontSize(10)
+                  .fontColor(mpSecondaryText(this.isDark))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .width(64)
+              }
+            }
+            .width(64)
+            .alignItems(HorizontalAlign.Start)
+          }
+          .padding({ right: 2 })
+          .onClick(() => {
+            this.tapHaptic();
+            HarmonyPluginCapsuleManager.shared().restoreFullWindow();
           })
-      )
+
+          ForEach(
+            this.inlineActions(this.minimizedState()!),
+            (act: HarmonyPluginCapsuleAction) => {
+              Button({ type: ButtonType.Circle }) {
+                this.renderInlineActionIcon(act, this.minimizedState()!.isPlaying)
+              }
+              .width(25)
+              .height(25)
+              .backgroundColor(Color.Transparent)
+              .accessibilityText(act.label)
+              .onClick(() => {
+                this.tapHaptic();
+                HarmonyPluginCapsuleManager.shared().dispatchAction(act.id);
+              })
+            },
+            (act: HarmonyPluginCapsuleAction) => `${act.id}_${act.active}_${this.minimizedState()!.isPlaying}`
+          )
+
+          Button({ type: ButtonType.Circle }) {
+            SymbolGlyph($r('sys.symbol.xmark'))
+              .fontSize(11.5)
+              .fontColor([mpSecondaryText(this.isDark)])
+          }
+          .width(23)
+          .height(25)
+          .backgroundColor(Color.Transparent)
+          .accessibilityText('关闭插件胶囊')
+          .onClick(() => {
+            this.tapHaptic();
+            HarmonyPluginCapsuleManager.shared().closeAndDestroy();
+          })
+        }
+        .padding({ left: 6, right: 4, top: 5, bottom: 5 })
+        .borderRadius(999)
+        .backgroundColor(HarmonyThemeColors.card(this.isDark, this.paletteId))
+        .border({ width: 1, color: HarmonyAppearanceStore.withAlpha(this.accentHex, '55') })
+        .shadow({ radius: 14, color: '#33000000', offsetY: 4 })
+        .onAreaChange((_oldVal: Area, newVal: Area) => {
+          const w = Number(newVal.width);
+          const h = Number(newVal.height);
+          if (w > 40) { this.pillWidthVp = w; }
+          if (h > 20) { this.pillHeightVp = h; }
+        })
+        .position({
+          x: this.isDragging ? this.liveDragX : this.resolvedOriginVp(this.minimizedState()!)[0],
+          y: this.isDragging ? this.liveDragY : this.resolvedOriginVp(this.minimizedState()!)[1]
+        })
+        .gesture(
+          PanGesture({ distance: 4 })
+            .onActionStart(() => {
+              const cur = this.resolvedOriginVp(this.minimizedState()!);
+              this.dragBaseX = cur[0];
+              this.dragBaseY = cur[1];
+              this.liveDragX = cur[0];
+              this.liveDragY = cur[1];
+              this.isDragging = true;
+            })
+            .onActionUpdate((ev?: GestureEvent) => {
+              if (ev) {
+                const clamped = this.clampDragVp(this.dragBaseX + ev.offsetX, this.dragBaseY + ev.offsetY);
+                this.liveDragX = clamped[0];
+                this.liveDragY = clamped[1];
+              }
+            })
+            .onActionEnd(() => {
+              this.settleDragAt(this.liveDragX, this.liveDragY);
+            })
+            .onActionCancel(() => {
+              this.isDragging = false;
+            })
+        )
+      }
+    }
+  }
+
+  private settleDragAt(clampedX: number, clampedY: number): void {
+    const st = this.minimizedState();
+    const vp = this.viewportSizeVp();
+    const vpW = vp[0];
+    const vpH = vp[1];
+    const itemW = this.isSuperMinimized() ? 42 : Math.max(120, this.pillWidthVp);
+    const itemH = Math.max(36, this.pillHeightVp);
+    const minY = Math.max(8, this.safeTopVp + 8);
+    const maxY = Math.max(minY, vpH - Math.max(10, this.safeBottomVp) - this.bottomClearanceVp - itemH);
+    const nextNormY = maxY > minY ? Math.max(0, Math.min(1, (clampedY - minY) / (maxY - minY))) : 0.78;
+    const snapThreshold = (st && typeof st.edgeSnapThresholdDp === 'number') ? st.edgeSnapThresholdDp : 24;
+    const distLeft = Math.max(0, clampedX);
+    const distRight = Math.max(0, vpW - (clampedX + itemW));
+
+    this.isDragging = false;
+    this.normY = nextNormY;
+    if (snapThreshold > 0 && distLeft <= snapThreshold && distLeft <= distRight) {
+      if (this.dockedEdge !== 'left') { this.tapHaptic(); }
+      this.dockedEdge = 'left';
+      this.normX = 0.0;
+    } else if (snapThreshold > 0 && distRight <= snapThreshold) {
+      if (this.dockedEdge !== 'right') { this.tapHaptic(); }
+      this.dockedEdge = 'right';
+      this.normX = 1.0;
+    } else {
+      if (this.dockedEdge !== 'none') { this.tapHaptic(); }
+      this.dockedEdge = 'none';
+      const hMargin = 12;
+      const minFreeX = hMargin;
+      const maxFreeX = Math.max(minFreeX, vpW - hMargin - itemW);
+      const settledX = Math.max(minFreeX, Math.min(maxFreeX, clampedX));
+      this.normX = maxFreeX > minFreeX ? Math.max(0, Math.min(1, (settledX - minFreeX) / (maxFreeX - minFreeX))) : 1.0;
     }
   }
 }

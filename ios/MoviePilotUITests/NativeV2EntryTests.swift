@@ -999,8 +999,7 @@ final class NativeV2EntryTests: XCTestCase {
     XCTAssertTrue(app.scrollViews["native-downloads-scroll"].waitForExistence(timeout: 10))
     let dlToggle = app.buttons["native-download-toggle-abc123def456"]
     XCTAssertTrue(dlToggle.waitForExistence(timeout: 10))
-    let dlDeleteBtn = app.buttons["native-download-delete-abc123def456"]
-    XCTAssertTrue(dlDeleteBtn.waitForExistence(timeout: 8))
+    XCTAssertFalse(app.buttons["native-download-delete-abc123def456"].exists)
     capture("native-v2-fixture-downloads")
     tap(dlToggle, app: app)
     XCTAssertTrue(
@@ -1586,12 +1585,27 @@ final class NativeV2EntryTests: XCTestCase {
 
     let mascotBtn = app.buttons["native-agent-floating-mascot"]
     XCTAssertTrue(mascotBtn.waitForExistence(timeout: 8))
-    // 登录转场期间可访问性节点先出现，等浮动入口真正可点击后再打开对话。
-    let mascotReady = XCTNSPredicateExpectation(
-      predicate: NSPredicate(format: "hittable == true"), object: mascotBtn)
-    XCTAssertEqual(XCTWaiter.wait(for: [mascotReady], timeout: 15), .completed)
+    // 冷启动模拟器首次登录后，系统密码保存远端视图服务可能延迟数秒弹出并遮挡浮动助手按钮；轮询期间即时关闭该系统提示。
+    let mascotDeadline = Date().addingTimeInterval(20)
+    while Date() < mascotDeadline {
+      _ = dismissSystemPasswordSavePromptIfPresent(app)
+      if mascotBtn.exists && mascotBtn.isHittable {
+        break
+      }
+      try await Task.sleep(nanoseconds: 400_000_000)
+    }
+    _ = dismissSystemPasswordSavePromptIfPresent(app)
+    XCTAssertTrue(mascotBtn.isHittable, "浮动智能助手按钮被遮挡或不可点击")
     mascotBtn.tap()
-    XCTAssertTrue(app.scrollViews["native-agent-scroll"].waitForExistence(timeout: 10))
+    if !app.scrollViews["native-agent-scroll"].waitForExistence(timeout: 5) {
+      if dismissSystemPasswordSavePromptIfPresent(app), mascotBtn.waitForExistence(timeout: 5) {
+        mascotBtn.tap()
+      }
+    }
+    guard app.scrollViews["native-agent-scroll"].waitForExistence(timeout: 10) else {
+      XCTFail("智能助手对话面板未能在点击浮动入口后弹出")
+      return
+    }
 
     let input = app.textFields["native-agent-input"]
     XCTAssertTrue(input.waitForExistence(timeout: 10))
@@ -2027,7 +2041,7 @@ final class NativeV2EntryTests: XCTestCase {
     XCTAssertEqual(counts["unexpected"], [:])
   }
 
-  /// 单独授权 PT 搜索的普通账号仍能管理本身会话，影视和管理端点保持不可达。
+  /// 单独授权 PT 搜索的普通账号仍能管理本身会话并在设置中绑定个人媒体服务器账号，影视和管理端点保持不可达。
   func testNativeBusinessHidesUnpermittedEntries() async throws {
     let app = try await signInToNativeBusiness("b", mode: "resource-search-only")
     defer { app.terminate() }
@@ -2038,10 +2052,36 @@ final class NativeV2EntryTests: XCTestCase {
     XCTAssertFalse(tabButton("探索", app: app).exists)
     XCTAssertFalse(tabButton("搜索", app: app).exists)
     XCTAssertTrue(tabButton("更多", app: app).exists)
+
+    openSettingsHub(app: app)
+    XCTAssertFalse(app.buttons["native-settings-mediaservers"].exists)
+    let bindEntry = app.buttons["native-settings-mediaserver-bindings"]
+    XCTAssertTrue(bindEntry.waitForExistence(timeout: 8))
+    tap(bindEntry, app: app)
+    XCTAssertTrue(
+      app.scrollViews["native-mediaserver-bindings-scroll"].waitForExistence(timeout: 8))
+    let bindBtn = app.buttons["native-mediaserver-bind-Emby"]
+    XCTAssertTrue(bindBtn.waitForExistence(timeout: 8))
+    tap(bindBtn, app: app)
+    let pwdField = app.secureTextFields["native-mediaserver-bind-password"]
+    XCTAssertTrue(pwdField.waitForExistence(timeout: 8))
+    tap(pwdField, app: app)
+    pwdField.typeText("synthetic-emby-pass")
+    let submitBtn = app.buttons["native-mediaserver-bind-submit"]
+    XCTAssertTrue(submitBtn.waitForExistence(timeout: 5))
+    submitBtn.tap()
+    XCTAssertTrue(
+      app.descendants(matching: .any)["native-mediaserver-bindings-feedback"].firstMatch
+        .waitForExistence(timeout: 8))
+    XCTAssertTrue(app.buttons["native-mediaserver-unbind-Emby"].waitForExistence(timeout: 6))
+
     let counts = try await stats()
+    XCTAssertEqual(counts["b"]?["GET api/v1/mediaserver/account-bindings"], 1)
+    XCTAssertEqual(counts["b"]?["POST api/v1/mediaserver/account-bindings"], 1)
     XCTAssertTrue(
       counts["b"]?.keys.allSatisfy {
         !$0.contains("/discover/") && !$0.contains("/media/") && !$0.contains("/dashboard/")
+          && !$0.contains("/system/setting/")
       } == true)
     XCTAssertEqual(counts["unexpected"], [:])
   }
@@ -2237,6 +2277,18 @@ final class NativeV2EntryTests: XCTestCase {
         try await Task.sleep(nanoseconds: 400_000_000)
       }
       capture(step.shot)
+      if step.expectedValue == "enhanced" {
+        // 旋转至横屏并收起控制层，验证 MPV 全能内核竖屏转横屏后画面完整居中铺满而非裁切在左下角。
+        XCUIDevice.shared.orientation = .landscapeLeft
+        defer { XCUIDevice.shared.orientation = .portrait }
+        try await Task.sleep(nanoseconds: 1_600_000_000)
+        let landscapeWin = app.windows.firstMatch
+        if app.buttons["video-playback-more"].firstMatch.isHittable {
+          landscapeWin.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+          try await Task.sleep(nanoseconds: 500_000_000)
+        }
+        capture("multi-engine-04b-engine-mpv-landscape")
+      }
     }
 
     // 4. 关闭播放器并校验流清单、流切片请求均由回环夹具正常响应，无意外请求
@@ -3527,20 +3579,46 @@ final class NativeV2EntryTests: XCTestCase {
     XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 5), .completed)
   }
 
-  /// 新版系统会在登录转场后弹出密码保存 sheet；只拒绝该系统提示，避免遮挡业务控件或保存夹具凭据。
-  private func dismissSystemPasswordSavePrompt(_ app: XCUIApplication) {
-    let titles = ["Save Password?", "存储密码？", "存储密码?", "保存密码？", "儲存密碼？"]
-    let prompt = app.sheets.matching(NSPredicate(format: "label IN %@", titles)).firstMatch
-    guard prompt.waitForExistence(timeout: 3) else { return }
+  /// 新版系统会在登录转场后弹出密码保存 sheet（冷启动远端服务可能延迟数秒出现）；只拒绝该系统提示，避免遮挡业务控件或保存夹具凭据。
+  private func dismissSystemPasswordSavePrompt(
+    _ app: XCUIApplication, timeout: TimeInterval = 5
+  ) {
+    let prompt = systemPasswordSavePromptSheet(app)
+    guard prompt.waitForExistence(timeout: timeout) else { return }
+    dismissMatchedPasswordPrompt(prompt)
+  }
+
+  /// 零等待检查并关闭晚到的系统密码保存弹窗，供后续滚动揭示与点击流程兜底调用。
+  @discardableResult
+  private func dismissSystemPasswordSavePromptIfPresent(_ app: XCUIApplication) -> Bool {
+    let prompt = systemPasswordSavePromptSheet(app)
+    guard prompt.exists else { return false }
+    return dismissMatchedPasswordPrompt(prompt)
+  }
+
+  private func systemPasswordSavePromptSheet(_ app: XCUIApplication) -> XCUIElement {
+    app.sheets.matching(
+      NSPredicate(
+        format: "label CONTAINS[c] 'Password' OR label CONTAINS '密码' OR label CONTAINS '密碼'"
+      )
+    ).firstMatch
+  }
+
+  @discardableResult
+  private func dismissMatchedPasswordPrompt(_ prompt: XCUIElement) -> Bool {
     let decline = prompt.buttons.matching(
-      NSPredicate(format: "label IN %@", ["Not Now", "以后", "暂不", "稍后", "稍後", "現在不要"])
+      NSPredicate(
+        format: "label IN %@",
+        ["Not Now", "以后", "暂不", "稍后", "稍後", "現在不要", "不存储", "不儲存"]
+      )
     )
     .firstMatch
-    XCTAssertTrue(decline.waitForExistence(timeout: 5))
+    guard decline.waitForExistence(timeout: 5) else { return false }
     decline.tap()
     let dismissed = XCTNSPredicateExpectation(
       predicate: NSPredicate(format: "exists == false"), object: prompt)
-    XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 5), .completed)
+    _ = XCTWaiter.wait(for: [dismissed], timeout: 5)
+    return true
   }
 
   /// 大字/横屏通过滚动查找可触控控件，不使用坐标绕过被遮挡的按钮。
@@ -3551,6 +3629,7 @@ final class NativeV2EntryTests: XCTestCase {
 
   /// Form 延迟创建行且部分 SwiftUI 后代会误报 hittable，必须检查点击中心在可见区域内。
   private func reveal(_ element: XCUIElement, app: XCUIApplication) {
+    _ = dismissSystemPasswordSavePromptIfPresent(app)
     _ = element.waitForExistence(timeout: 2)
     // 键盘候选栏也是 CollectionView；正文继续取首个 Form，只有已打开选择弹层才取其末个 Form。
     let forms = app.collectionViews.allElementsBoundByIndex
@@ -3608,6 +3687,7 @@ final class NativeV2EntryTests: XCTestCase {
                       ?? app)
     for direction in [true, false] {
       for _ in 0..<12 {
+        _ = dismissSystemPasswordSavePromptIfPresent(app)
         if visible(element, app: app, scroll: scroll) { return }
         let upward =
           element.exists
@@ -3669,7 +3749,7 @@ final class NativeV2EntryTests: XCTestCase {
       "native-cron-field-apply", "native-combobox-apply", "native-combobox-cancel",
       "native-modules-save", "native-modules-cancel",
       "native-subscribe-editor-save", "native-subscribe-editor-cancel",
-      "native-agent-sessions-close",
+      "native-agent-new", "native-agent-sessions", "native-agent-sessions-close",
       "native-workflow-node-editor-apply", "native-workflow-node-editor-cancel",
       "native-workflow-catalog-close",
       "native-user-editor-save", "native-user-editor-cancel",

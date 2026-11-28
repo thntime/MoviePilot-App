@@ -53,7 +53,7 @@ data class SettingsSummarySnapshot(
 sealed interface LoginOutcome {
     data class Success(val identity: UserIdentity) : LoginOutcome
     data class OtpRequired(val message: String) : LoginOutcome
-    data class Failure(val message: String) : LoginOutcome
+    data class Failure(val message: String, val canceled: Boolean = false) : LoginOutcome
 }
 
 /** 认证会话状态机（与 iOS NativeSessionState 对齐）。 */
@@ -93,6 +93,7 @@ class MoviePilotRepository(context: Context) {
 
     private val siteIconCache = ConcurrentHashMap<Int, String>()
     private val mediaLogoCache = ConcurrentHashMap<String, String>()
+    private val multiRatingsCache = ConcurrentHashMap<String, List<MediaRatingBadgeDto>>()
     private val resourceRawCache = ConcurrentHashMap<String, JsonObject>()
     @Volatile
     private var resourceCookiePrimed = false
@@ -129,6 +130,7 @@ class MoviePilotRepository(context: Context) {
         cachedMarketPlugins = null
         siteIconCache.clear()
         mediaLogoCache.clear()
+        multiRatingsCache.clear()
         resourceRawCache.clear()
     }
 
@@ -413,6 +415,198 @@ class MoviePilotRepository(context: Context) {
         globalImageConfig = secretStore.loadGlobalImageConfig(serverUrl) ?: GlobalImageConfigSnapshot()
         refreshGlobalImageSettings(serverUrl)
         setSession(SessionState.Authenticated(serverUrl, token, identity, permissions))
+        primeResourceCookie()
+        return LoginOutcome.Success(identity)
+    }
+
+    /** 探测目标实例是否已启用系统通行密钥认证（`GET /api/v1/auth/providers`）。 */
+    suspend fun probePasskeyEnabled(serverUrl: String): Boolean {
+        val cleanUrl = RustCoreBridge.normalizeAddress(serverUrl).getOrNull() ?: return false
+        cloudflareOAuth.refreshIfNeeded(cleanUrl)
+        val url = runCatching {
+            RustCoreBridge.buildEndpointUrl(cleanUrl, listOf("auth", "providers"))
+        }.getOrNull() ?: return false
+        val resp = runCatching {
+            transport.execute(url = url, method = "GET", token = null)
+        }.getOrNull() ?: return false
+        if (resp.status != 200 || resp.body.isBlank()) return false
+        return RustCoreBridge.parsePasskeyProviderEnabled(resp.body)
+    }
+
+    /** 使用系统浏览器完成 `moviepilot.passkey` v1 通行密钥认证并激活实例会话。 */
+    suspend fun loginWithPasskey(
+        serverUrl: String,
+        username: String = "",
+        launchBrowser: (authorizeUrl: String) -> Unit,
+    ): LoginOutcome {
+        val cleanUrl = RustCoreBridge.normalizeAddress(serverUrl).getOrElse {
+            return LoginOutcome.Failure("服务地址无效：${it.message}")
+        }
+        if (!RustCoreBridge.isPasskeySecureOrigin(cleanUrl)) {
+            return LoginOutcome.Failure("当前连接或系统不支持通行密钥，请使用 HTTPS 地址和支持的系统。")
+        }
+        cloudflareOAuth.refreshIfNeeded(cleanUrl)
+
+        val markerUrl = "${cleanUrl.trimEnd('/')}/native-passkey.json"
+        val markerResp = runCatching {
+            transport.execute(url = markerUrl, method = "GET", token = null)
+        }.getOrElse {
+            return LoginOutcome.Failure("无法连接到服务：${it.message ?: "网络异常"}")
+        }
+        if (RustCoreBridge.detectCloudflareChallenge(markerResp.status, markerResp.headers, markerResp.body, markerUrl).isChallenge) {
+            return LoginOutcome.Failure("检测到 Cloudflare Access 网关拦截，请先完成 Cloudflare Access 认证")
+        }
+        if (markerResp.status != 200 || !RustCoreBridge.supportsPasskeyFrontendMarker(markerResp.body)) {
+            return LoginOutcome.Failure("请更新实例的前端资源后，再使用 App 通行密钥登录。")
+        }
+
+        val startUrl = runCatching {
+            RustCoreBridge.buildEndpointUrl(cleanUrl, listOf("mfa", "passkey", "authenticate", "start"))
+        }.getOrElse {
+            return LoginOutcome.Failure("未能完成通行密钥验证，请重新尝试。")
+        }
+        val trimmedUser = username.trim()
+        val startBodyJson = if (trimmedUser.isNotEmpty()) {
+            buildJsonObject { put("username", trimmedUser) }.toString()
+        } else {
+            "{}"
+        }
+        val startResp = runCatching {
+            transport.execute(
+                url = startUrl,
+                method = "POST",
+                body = startBodyJson,
+                contentType = "application/json",
+            )
+        }.getOrElse {
+            return LoginOutcome.Failure("无法连接到服务：${it.message ?: "网络异常"}")
+        }
+        if (RustCoreBridge.detectCloudflareChallenge(startResp.status, startResp.headers, startResp.body, startUrl).isChallenge) {
+            return LoginOutcome.Failure("检测到 Cloudflare Access 网关拦截，请先完成 Cloudflare Access 认证")
+        }
+        if (startResp.status !in 200..299) {
+            return LoginOutcome.Failure("未能完成通行密钥验证，请重新尝试。")
+        }
+
+        val stateHex = PasskeyAuthManager.generateStateHex32()
+        val prepared = RustCoreBridge.preparePasskeyRequest(startResp.body, cleanUrl, stateHex).getOrElse { err ->
+            val msg = when (err.message) {
+                "unsupported" -> "当前连接或系统不支持通行密钥，请使用 HTTPS 地址和支持的系统。"
+                "invalid" -> "通行密钥验证结果无效，请重新尝试。"
+                else -> "未能完成通行密钥验证，请重新尝试。"
+            }
+            return LoginOutcome.Failure(msg)
+        }
+
+        val callbackUri = PasskeyAuthManager.awaitBrowserCallback(
+            authorizeUrl = prepared.authorizationUrl,
+            timeoutSecs = prepared.timeoutSecs,
+            launchBrowser = launchBrowser,
+        ).getOrElse { err ->
+            if (err is PasskeyCanceledException || err.message == "canceled") {
+                return LoginOutcome.Failure("", canceled = true)
+            }
+            val msg = if (err.message == "expired") {
+                "通行密钥验证已过期，请重新尝试。"
+            } else {
+                "未能完成通行密钥验证，请重新尝试。"
+            }
+            return LoginOutcome.Failure(msg)
+        }
+
+        val verified = RustCoreBridge.verifyPasskeyCallback(
+            callbackUrl = callbackUri,
+            serverUrl = cleanUrl,
+            expectedState = prepared.state,
+            expectedChallenge = prepared.challenge,
+            transactionToken = prepared.transactionToken,
+        )
+        if (!verified.ok || verified.finishBodyJson.isNullOrBlank()) {
+            if (verified.errorCode == "canceled") {
+                return LoginOutcome.Failure("", canceled = true)
+            }
+            return LoginOutcome.Failure(verified.errorMessageZh ?: "未能完成通行密钥验证，请重新尝试。")
+        }
+
+        val finishUrl = runCatching {
+            RustCoreBridge.buildEndpointUrl(cleanUrl, listOf("mfa", "passkey", "authenticate", "finish"))
+        }.getOrElse {
+            return LoginOutcome.Failure("未能完成通行密钥验证，请重新尝试。")
+        }
+        val finishResp = runCatching {
+            transport.execute(
+                url = finishUrl,
+                method = "POST",
+                body = verified.finishBodyJson,
+                contentType = "application/json",
+            )
+        }.getOrElse {
+            return LoginOutcome.Failure("无法连接到服务：${it.message ?: "网络异常"}")
+        }
+        if (finishResp.status !in 200..299) {
+            return LoginOutcome.Failure("未能完成通行密钥验证，请重新尝试。")
+        }
+
+        val root = runCatching { json.parseToJsonElement(finishResp.body).asObj() }.getOrNull()
+            ?: return LoginOutcome.Failure("未能完成通行密钥验证，请重新尝试。")
+        val payloadObj = root["data"].asObj() ?: root
+        val token = payloadObj.str("access_token") ?: root.str("access_token")
+        if (token.isNullOrBlank()) {
+            return LoginOutcome.Failure("未能完成通行密钥验证，请重新尝试。")
+        }
+
+        val superUser = payloadObj.bool("super_user") ?: root.bool("super_user") ?: true
+        val userName = payloadObj.str("user_name") ?: root.str("user_name") ?: trimmedUser
+        val userLevel = payloadObj.int("level") ?: root.int("level") ?: 1
+        val avatar = payloadObj.str("avatar") ?: root.str("avatar")
+        val permsJson = payloadObj["permissions"]?.toString() ?: root["permissions"]?.toString() ?: "{}"
+
+        val identityResp = runCatching {
+            val meUrl = RustCoreBridge.buildEndpointUrl(cleanUrl, listOf("user", "current"))
+            transport.execute(url = meUrl, method = "GET", token = token)
+        }.getOrNull()
+
+        var identity = UserIdentity(name = userName, isSuperuser = superUser, level = userLevel, avatar = avatar)
+        var permissions = RustCoreBridge.evaluatePermissions(permsJson, superUser)
+
+        if (identityResp != null && identityResp.status == 200) {
+            val dataObj = extractObject(identityResp.body)
+            if (dataObj != null) {
+                val isSu = dataObj.bool("is_superuser") ?: superUser
+                identity = UserIdentity(
+                    id = dataObj.int("id") ?: 0,
+                    name = dataObj.str("name") ?: userName,
+                    email = dataObj.str("email") ?: "",
+                    isSuperuser = isSu,
+                    isActive = dataObj.bool("is_active") ?: true,
+                    isOtp = dataObj.bool("is_otp") ?: false,
+                    level = dataObj.int("level") ?: userLevel,
+                    avatar = dataObj.str("avatar") ?: avatar,
+                )
+                permissions = RustCoreBridge.evaluatePermissions(
+                    dataObj["permissions"]?.toString() ?: permsJson,
+                    isSu,
+                )
+            }
+        }
+
+        if (secretStore.keepLogin) {
+            secretStore.saveToken(cleanUrl, token)
+        }
+        secretStore.upsertServer(
+            SavedServerEntry(
+                id = cleanUrl.hashCode().toString(),
+                name = cleanUrl.substringAfter("://").substringBefore("/").substringBefore(":"),
+                url = cleanUrl,
+                username = identity.name,
+                lastUsedEpochMs = System.currentTimeMillis(),
+            ),
+        )
+        _savedServers.value = secretStore.loadServers()
+        resourceCookiePrimed = false
+        globalImageConfig = secretStore.loadGlobalImageConfig(cleanUrl) ?: GlobalImageConfigSnapshot()
+        refreshGlobalImageSettings(cleanUrl)
+        setSession(SessionState.Authenticated(cleanUrl, token, identity, permissions))
         primeResourceCookie()
         return LoginOutcome.Success(identity)
     }
@@ -859,6 +1053,199 @@ class MoviePilotRepository(context: Context) {
         val key = "${identity.first}:${identity.second}"
         mediaLogoCache[key]?.let { return it }
         return fetchMediaDetail(item)?.logoPath
+    }
+
+    /** 基于手头已有评分构造零延迟初始多元评分微标列表。 */
+    fun seedRatingsForCard(
+        item: MediaCardItem,
+        criticRating: Double = 0.0,
+        serverRatings: List<MediaRatingBadgeDto> = emptyList(),
+    ): List<MediaRatingBadgeDto> {
+        val bySrc = LinkedHashMap<String, String>()
+        serverRatings.forEach { badge ->
+            val norm = normalizeRatingSourceKey(badge.source)
+            if (badge.label.isNotBlank() && norm != null && !bySrc.containsKey(norm)) {
+                bySrc[norm] = badge.label
+            }
+        }
+        if (!bySrc.containsKey("rottentomatoes") && criticRating > 0.0) {
+            bySrc["rottentomatoes"] = "${criticRating.roundToInt().coerceIn(1, 100)}%"
+        }
+        if (item.voteAverage > 0.0) {
+            val norm = normalizeRatingSourceKey(item.source) ?: "community"
+            bySrc.putIfAbsent(norm, String.format(java.util.Locale.US, "%.1f", item.voteAverage.coerceAtMost(10.0)))
+        }
+        return orderRatingBadges(bySrc)
+    }
+
+    private fun normalizeRatingSourceKey(raw: String?): String? = when (raw?.trim()?.lowercase()) {
+        "imdb" -> "imdb"
+        "themoviedb", "tmdb" -> "tmdb"
+        "rottentomatoes", "rotten_tomatoes", "rt", "critic" -> "rottentomatoes"
+        "douban", "douban_movie" -> "douban"
+        "bangumi", "bgm" -> "bangumi"
+        "anilist" -> "anilist"
+        "community" -> "community"
+        else -> null
+    }
+
+    private fun orderRatingBadges(map: Map<String, String>): List<MediaRatingBadgeDto> {
+        val order = listOf("imdb", "tmdb", "rottentomatoes", "douban", "bangumi", "anilist")
+        val out = mutableListOf<MediaRatingBadgeDto>()
+        for (src in order) {
+            val label = map[src]
+            if (!label.isNullOrBlank()) out += MediaRatingBadgeDto(src, label)
+        }
+        val hasNamedTenScale = out.any { it.source != "rottentomatoes" }
+        if (!hasNamedTenScale) {
+            map["community"]?.takeIf { it.isNotBlank() }?.let { out.add(0, MediaRatingBadgeDto("community", it)) }
+        }
+        return out
+    }
+
+    /**
+     * 异步并发聚合免配置多元评分（IMDb / TMDB / 烂番茄影评新鲜度 / 豆瓣 / Bangumi），带会话级内存缓存。
+     */
+    suspend fun fetchMultiSourceRatings(
+        item: MediaCardItem,
+        criticRating: Double = 0.0,
+        serverRatings: List<MediaRatingBadgeDto> = emptyList(),
+        serverItemId: String? = null,
+        serverName: String? = null,
+    ): List<MediaRatingBadgeDto> {
+        val typeName = canonicalMediaType(item.type)
+        val cacheKey = buildString {
+            append(typeName).append('|')
+            append(item.tmdbId?.let { "tmdb:$it" } ?: item.imdbId?.takeIf { it.isNotBlank() }?.let { "imdb:$it" }
+                ?: item.doubanId?.takeIf { it.isNotBlank() }?.let { "douban:$it" } ?: item.resolvedId)
+        }
+        multiRatingsCache[cacheKey]?.takeIf { it.isNotEmpty() }?.let { return it }
+
+        val scores = LinkedHashMap<String, String>()
+        seedRatingsForCard(item, criticRating, serverRatings).forEach { scores[it.source] = it.label }
+
+        var tmdbId = item.tmdbId?.toString()
+            ?: (if (item.source.equals("themoviedb", true) || item.source.equals("tmdb", true)) item.mediaId?.substringAfterLast(':') else null)
+        var imdbId = item.imdbId?.takeIf { it.isNotBlank() }
+            ?: (if (item.source.equals("imdb", true)) item.mediaId?.substringAfterLast(':') else null)
+        var doubanId = item.doubanId?.takeIf { it.isNotBlank() }
+            ?: (if (item.source.equals("douban", true)) item.mediaId?.substringAfterLast(':') else null)
+        val bangumiId = item.bangumiId?.toString()
+            ?: (if (item.source.equals("bangumi", true)) item.mediaId?.substringAfterLast(':') else null)
+        var title = item.title.trim()
+        var year = item.year.trim()
+        var genres = item.genres
+
+        if (!tmdbId.isNullOrBlank() && (!scores.containsKey("tmdb") || imdbId.isNullOrBlank())) {
+            val resp = authedRequest(
+                segments = listOf("media", tmdbId),
+                query = listOf("media_source" to "themoviedb", "type_name" to typeName),
+            ).getOrNull()
+            val obj = if (resp != null && resp.status in 200..299) extractObject(resp.body) else null
+            if (obj != null) {
+                val v = obj.dbl("vote_average") ?: 0.0
+                if (v > 0.0 && !scores.containsKey("tmdb")) {
+                    scores["tmdb"] = String.format(java.util.Locale.US, "%.1f", v.coerceAtMost(10.0))
+                }
+                if (imdbId.isNullOrBlank()) imdbId = obj.str("imdb_id")?.takeIf { it.isNotBlank() }
+                if (doubanId.isNullOrBlank()) doubanId = obj.str("douban_id")?.takeIf { it.isNotBlank() }
+                if (title.isBlank()) title = obj.str("title").orEmpty()
+                if (year.isBlank()) year = obj.str("year").orEmpty()
+                if (genres.isEmpty()) genres = parseMediaCard(obj)?.genres.orEmpty()
+            }
+        }
+
+        val isAnime = item.source.equals("bangumi", true) || item.source.equals("anilist", true) ||
+            genres.any { it.contains("动画") || it.equals("Animation", true) }
+
+        coroutineScope {
+            val imdbDef = async {
+                val id = imdbId?.trim()
+                if (!scores.containsKey("imdb") && !id.isNullOrBlank() && id.startsWith("tt", true)) {
+                    val r = authedRequest(
+                        segments = listOf("media", id),
+                        query = listOf("media_source" to "imdb", "type_name" to typeName),
+                    ).getOrNull()
+                    val v = if (r != null && r.status in 200..299) extractObject(r.body)?.dbl("vote_average") ?: 0.0 else 0.0
+                    if (v > 0.0) String.format(java.util.Locale.US, "%.1f", v.coerceAtMost(10.0)) else null
+                } else null
+            }
+            val doubanDef = async {
+                if (scores.containsKey("douban")) return@async null
+                val id = doubanId?.trim()
+                if (!id.isNullOrBlank() && id != "0") {
+                    val r = authedRequest(
+                        segments = listOf("media", id),
+                        query = listOf("media_source" to "douban", "type_name" to typeName),
+                    ).getOrNull()
+                    val v = if (r != null && r.status in 200..299) extractObject(r.body)?.dbl("vote_average") ?: 0.0 else 0.0
+                    return@async if (v > 0.0) String.format(java.util.Locale.US, "%.1f", v.coerceAtMost(10.0)) else null
+                }
+                if (title.isBlank()) return@async null
+                recognizeRatingBySource(title, year, typeName, "douban")
+            }
+            val bangumiDef = async {
+                if (scores.containsKey("bangumi")) return@async null
+                val id = bangumiId?.trim()
+                if (!id.isNullOrBlank() && id != "0") {
+                    val r = authedRequest(
+                        segments = listOf("media", id),
+                        query = listOf("media_source" to "bangumi", "type_name" to typeName),
+                    ).getOrNull()
+                    val v = if (r != null && r.status in 200..299) extractObject(r.body)?.dbl("vote_average") ?: 0.0 else 0.0
+                    return@async if (v > 0.0) String.format(java.util.Locale.US, "%.1f", v.coerceAtMost(10.0)) else null
+                }
+                if (!isAnime || title.isBlank()) return@async null
+                recognizeRatingBySource(title, year, typeName, "bangumi")
+            }
+            val srvDef = async {
+                val sid = serverItemId?.trim()
+                if (!scores.containsKey("rottentomatoes") && !sid.isNullOrBlank()) {
+                    fetchMediaServerItemDetail(sid, serverName, enrichMetadata = false)
+                } else null
+            }
+
+            imdbDef.await()?.let { scores.putIfAbsent("imdb", it) }
+            doubanDef.await()?.let { scores.putIfAbsent("douban", it) }
+            bangumiDef.await()?.let { scores.putIfAbsent("bangumi", it) }
+            srvDef.await()?.let { srv ->
+                srv.ratings.forEach { b ->
+                    normalizeRatingSourceKey(b.source)?.let { k -> if (b.label.isNotBlank()) scores.putIfAbsent(k, b.label) }
+                }
+                if (srv.criticRating > 0.0) {
+                    scores.putIfAbsent("rottentomatoes", "${srv.criticRating.roundToInt().coerceIn(1, 100)}%")
+                }
+            }
+        }
+
+        val ordered = orderRatingBadges(scores)
+        if (ordered.isNotEmpty()) {
+            multiRatingsCache[cacheKey] = ordered
+        }
+        return ordered
+    }
+
+    private suspend fun recognizeRatingBySource(
+        title: String,
+        year: String,
+        expectedType: String,
+        mediaSource: String,
+    ): String? {
+        val queryTitle = if (year.length >= 4) "$title ${year.take(4)}" else title
+        val resp = authedRequest(
+            segments = listOf("media", "recognize"),
+            query = listOf("title" to queryTitle, "media_source" to mediaSource),
+        ).getOrNull() ?: return null
+        if (resp.status !in 200..299) return null
+        val media = extractObject(resp.body)?.get("media_info").asObj() ?: return null
+        val vote = media.dbl("vote_average") ?: 0.0
+        if (vote <= 0.0) return null
+        val gotType = media.str("type")?.let { canonicalMediaType(it) }
+        if (!gotType.isNullOrBlank() && gotType != expectedType) return null
+        val reqY = year.take(4).toIntOrNull()
+        val gotY = media.str("year")?.take(4)?.toIntOrNull()
+        if (reqY != null && gotY != null && kotlin.math.abs(reqY - gotY) > 1) return null
+        return String.format(java.util.Locale.US, "%.1f", vote.coerceAtMost(10.0))
     }
 
     /** 拉取影视演职员列表（自动路由 TMDB / 豆瓣 / Bangumi）。 */
@@ -2028,9 +2415,9 @@ class MoviePilotRepository(context: Context) {
         }
         baseMap["total_episode"] = JsonPrimitive(item.totalEpisode)
         if (item.startEpisode != null) baseMap["start_episode"] = JsonPrimitive(item.startEpisode) else baseMap.remove("start_episode")
-        baseMap["quality"] = JsonPrimitive(item.quality)
-        baseMap["resolution"] = JsonPrimitive(item.resolution)
-        baseMap["effect"] = JsonPrimitive(item.effect)
+        baseMap["quality"] = JsonPrimitive(normalizeSubscribeFilterOption("quality", item.quality))
+        baseMap["resolution"] = JsonPrimitive(normalizeSubscribeFilterOption("resolution", item.resolution))
+        baseMap["effect"] = JsonPrimitive(normalizeSubscribeFilterOption("effect", item.effect))
         baseMap["best_version"] = JsonPrimitive(if (item.bestVersion) 1 else 0)
         baseMap["sites"] = JsonArray(item.sites.map { JsonPrimitive(it) })
         baseMap["filter_groups"] = JsonArray(item.filterGroups.map { JsonPrimitive(it) })
@@ -4196,6 +4583,20 @@ class MoviePilotRepository(context: Context) {
             resolvedServerType = fetchMediaServers().firstOrNull { it.name.equals(resolvedServer, ignoreCase = true) }?.type.orEmpty()
         }
 
+        val serverRatings = obj["ratings"].asArr().orEmpty().mapNotNull { rEl ->
+            val rObj = rEl.asObj() ?: return@mapNotNull null
+            val src = normalizeRatingSourceKey(rObj.str("source")) ?: return@mapNotNull null
+            val value = rObj.dbl("value") ?: 0.0
+            if (value <= 0.0) return@mapNotNull null
+            val scale = rObj.str("scale")?.lowercase() ?: "ten"
+            val label = if (scale == "percent") {
+                "${value.roundToInt().coerceIn(1, 100)}%"
+            } else {
+                String.format(java.util.Locale.US, "%.1f", value.coerceAtMost(10.0))
+            }
+            MediaRatingBadgeDto(src, label)
+        }
+
         var detail = MediaServerItemDetailDto(
             itemId = obj.str("item_id") ?: itemId,
             server = resolvedServer,
@@ -4211,6 +4612,8 @@ class MoviePilotRepository(context: Context) {
             premiereDate = obj.str("premiere_date").orEmpty(),
             officialRating = obj.str("official_rating").orEmpty(),
             rating = obj.dbl("rating") ?: 0.0,
+            criticRating = obj.dbl("critic_rating") ?: 0.0,
+            ratings = serverRatings,
             durationMs = obj.lng("duration_ms"),
             poster = resolveImageUrl(obj.str("poster") ?: obj.str("image"), maxWidth = 600, useCookies = useCookies),
             backdrop = resolveImageUrl(obj.str("backdrop") ?: obj.str("backdrop_path"), maxWidth = 1280, useCookies = useCookies),
@@ -4977,14 +5380,21 @@ class MoviePilotRepository(context: Context) {
         return (resp.status in 200..299) to msg
     }
 
-    /** 返回当前同源鉴权头（Authorization + Cookie），专供 Media3 播放请求复用。 */
+    /** 返回当前同源鉴权头（Authorization + Cookie + Cloudflare Access 网关令牌），专供 Media3 / MPV 播放与字幕预取复用。 */
     fun buildPlaybackHeaders(targetUrl: String): Map<String, String> {
         val auth = _session.value as? SessionState.Authenticated ?: return emptyMap()
         if (!RustCoreBridge.containsUrl(auth.serverUrl, targetUrl)) return emptyMap()
         val map = mutableMapOf<String, String>()
         if (auth.token.isNotBlank()) map["Authorization"] = "Bearer ${auth.token}"
-        val cookie = transport.exportCookieHeader(targetUrl)
-        if (cookie.isNotBlank()) map["Cookie"] = cookie
+        val rawCookie = transport.exportCookieHeader(targetUrl)
+        val cfToken = cloudflareOAuth.accessTokenForUrl(targetUrl)
+        val mergedCookie = if (!cfToken.isNullOrBlank()) {
+            RustCoreBridge.mergeCloudflareAccessCookie(rawCookie, cfToken)
+        } else {
+            rawCookie
+        }
+        if (mergedCookie.isNotBlank()) map["Cookie"] = mergedCookie
+        if (!cfToken.isNullOrBlank()) map["cf-access-token"] = cfToken
         return map
     }
 
@@ -5004,10 +5414,13 @@ class MoviePilotRepository(context: Context) {
         return enabled to rawHost.ifEmpty { "https://movie-pilot.org" }
     }
 
-    private fun resolveSameOriginUrl(serverUrl: String, raw: String): String {
-        if (raw.startsWith("http://") || raw.startsWith("https://")) return raw
+    internal fun resolveSameOriginUrl(serverUrl: String, raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return ""
+        RustCoreBridge.rebaseInstanceApiUrl(serverUrl, trimmed)?.let { return it }
+        if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) return trimmed
         val base = serverUrl.trimEnd('/')
-        return if (raw.startsWith("/")) "$base$raw" else "$base/$raw"
+        return if (trimmed.startsWith("/")) "$base$trimmed" else "$base/$trimmed"
     }
 
     // ==================== 手动整理（1:1 对齐 iOS target-path / history / preview / manual） ====================
@@ -5710,6 +6123,65 @@ class MoviePilotRepository(context: Context) {
             val unplayedIdx = episodes.indexOfFirst { !it.played }
             if (unplayedIdx >= 0) return unplayedIdx
             return 0
+        }
+
+        private val SUBSCRIBE_QUALITY_ALIASES = mapOf(
+            "全部" to "",
+            "all" to "",
+            "蓝光原盘" to "Blu-?Ray.+VC-?1|Blu-?Ray.+AVC|UHD.+blu-?ray.+HEVC|MiniBD",
+            "藍光原盤" to "Blu-?Ray.+VC-?1|Blu-?Ray.+AVC|UHD.+blu-?ray.+HEVC|MiniBD",
+            "blu-ray original" to "Blu-?Ray.+VC-?1|Blu-?Ray.+AVC|UHD.+blu-?ray.+HEVC|MiniBD",
+            "bluray original" to "Blu-?Ray.+VC-?1|Blu-?Ray.+AVC|UHD.+blu-?ray.+HEVC|MiniBD",
+            "remux" to "Remux",
+            "bluray" to "Blu-?Ray",
+            "blu-ray" to "Blu-?Ray",
+            "uhd" to "UHD|UltraHD",
+            "web-dl" to "WEB-?DL|WEB-?RIP",
+            "webdl" to "WEB-?DL|WEB-?RIP",
+            "hdtv" to "HDTV",
+            "h265" to "[Hx].?265|HEVC",
+            "h.265" to "[Hx].?265|HEVC",
+            "hevc" to "[Hx].?265|HEVC",
+            "h264" to "[Hx].?264|AVC",
+            "h.264" to "[Hx].?264|AVC",
+            "avc" to "[Hx].?264|AVC",
+        )
+
+        private val SUBSCRIBE_RESOLUTION_ALIASES = mapOf(
+            "全部" to "",
+            "all" to "",
+            "4k" to "4K|2160p|x2160",
+            "1080p" to "1080[pi]|x1080",
+            "720p" to "720[pi]|x720",
+        )
+
+        private val SUBSCRIBE_EFFECT_ALIASES = mapOf(
+            "全部" to "",
+            "all" to "",
+            "杜比视界" to "Dolby[\\s.]+Vision|DOVI|[\\s.]+DV[\\s.]+",
+            "杜比視界" to "Dolby[\\s.]+Vision|DOVI|[\\s.]+DV[\\s.]+",
+            "dolby vision" to "Dolby[\\s.]+Vision|DOVI|[\\s.]+DV[\\s.]+",
+            "dovi" to "Dolby[\\s.]+Vision|DOVI|[\\s.]+DV[\\s.]+",
+            "dv" to "Dolby[\\s.]+Vision|DOVI|[\\s.]+DV[\\s.]+",
+            "杜比全景声" to "Dolby[\\s.]*\\+?Atmos|Atmos",
+            "杜比全景聲" to "Dolby[\\s.]*\\+?Atmos|Atmos",
+            "dolby atmos" to "Dolby[\\s.]*\\+?Atmos|Atmos",
+            "atmos" to "Dolby[\\s.]*\\+?Atmos|Atmos",
+            "hdr" to "[\\s.]+HDR[\\s.]+|HDR10|HDR10\\+",
+            "sdr" to "[\\s.]+SDR[\\s.]+",
+        )
+
+        /** 将订阅质量、分辨率、特效的界面短标签展开为与 Web `constants.ts` 一致的正则，保留自定义正则。 */
+        fun normalizeSubscribeFilterOption(field: String, raw: String): String {
+            val trimmed = raw.trim()
+            if (trimmed.isEmpty()) return ""
+            val aliases = when (field) {
+                "quality" -> SUBSCRIBE_QUALITY_ALIASES
+                "resolution" -> SUBSCRIBE_RESOLUTION_ALIASES
+                "effect" -> SUBSCRIBE_EFFECT_ALIASES
+                else -> return raw
+            }
+            return aliases[trimmed.lowercase()] ?: raw
         }
     }
 }
